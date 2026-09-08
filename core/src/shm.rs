@@ -103,13 +103,40 @@ fn map_device_shared(fd: i64, offset: u64, len: u64, at: u64,
 #[cfg(nk_lkl)]
 fn release_device(idx: usize) {
     let flags = crate::sync::irq_save();
+    let root = crate::user::current_ttbr0_pub();
     let region = unsafe {
-        (&mut *(&raw mut DEVICES)).get_mut(idx).and_then(Option::take)
+        (&mut *(&raw mut DEVICES)).get_mut(idx).and_then(|slot| {
+            if slot.as_ref().is_some_and(|r| paging::table_of(r.root) == paging::table_of(root)) {
+                slot.take()
+            } else {
+                None
+            }
+        })
     };
     unsafe { crate::sync::irq_restore(flags); }
     if let Some(region) = region {
         unsafe { paging::unmap_user_nofree(region.root, region.at, region.len); }
         lkl::syscall(215, [region.linux as i64, region.len as i64, 0, 0, 0, 0]);
+    }
+}
+
+pub fn overlaps_device(root: u64, at: u64, len: u64) -> bool {
+    #[cfg(nk_lkl)]
+    {
+        let flags = crate::sync::irq_save();
+        let overlaps = unsafe {
+            (&*(&raw const DEVICES)).iter().flatten().any(|r| {
+                paging::table_of(r.root) == paging::table_of(root)
+                    && at < r.at + r.len && r.at < at + len
+            })
+        };
+        unsafe { crate::sync::irq_restore(flags); }
+        overlaps
+    }
+    #[cfg(not(nk_lkl))]
+    {
+        let _ = (root, at, len);
+        false
     }
 }
 

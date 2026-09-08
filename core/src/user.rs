@@ -788,6 +788,9 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: i64, offset: u64,
     }
     let executable = prot & 4 != 0;
     let writable = prot & 2 != 0;
+    if fixed && crate::shm::overlaps_device(current_ttbr0(), at, len) {
+        return -95;
+    }
 
     if shared {
         if fixed {
