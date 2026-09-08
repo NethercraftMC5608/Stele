@@ -109,15 +109,19 @@ pub fn report() {
             let s = &**slot;
             let (count, waiters) = (s.count.load(SeqCst), s.waiters.load(SeqCst));
             if waiters != 0 || count != 0 {
+                let taker = s.taker.load(SeqCst);
+                let giver = s.giver.load(SeqCst);
                 crate::println!(
-                    "          sem   {:<3} count {:<4} waiters {:#018b} ups {} downs {} last taken by {} given by {}",
+                    "          sem   {:<3} count {:<4} waiters {:#018b} ups {} downs {} last taken by uid {} slot {} given by uid {} slot {}",
                     s.id,
                     count,
                     waiters,
                     s.ups.load(SeqCst),
                     s.downs.load(SeqCst),
-                    s.taker.load(SeqCst) as i64,
-                    s.giver.load(SeqCst) as i64
+                    taker as i64,
+                    if taker == u64::MAX { -1 } else { (taker & 0xffff) as i64 },
+                    giver as i64,
+                    if giver == u64::MAX { -1 } else { (giver & 0xffff) as i64 }
                 );
             }
         }
@@ -196,7 +200,7 @@ impl Semaphore {
             let count = self.count.load(SeqCst);
             if count > 0 {
                 self.count.store(count - 1, SeqCst);
-                self.taker.store(sched::current_id() as u64, SeqCst);
+                self.taker.store(sched::current_uid() as u64, SeqCst);
                 unsafe { irq_restore(flags) };
                 return;
             }
@@ -213,7 +217,7 @@ impl Semaphore {
         let flags = irq_save();
         self.count.fetch_add(1, SeqCst);
         self.ups.fetch_add(1, SeqCst);
-        self.giver.store(sched::current_id() as u64, SeqCst);
+        self.giver.store(sched::current_uid() as u64, SeqCst);
         // Exactly one waiter, not all of them.
         //
         // Waking all of them and letting the losers re-check looks harmless
