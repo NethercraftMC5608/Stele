@@ -44,6 +44,40 @@ pub fn syscall(no: i64, args: [i64; 6]) -> i64 {
     unsafe { lkl_syscall(no, params.as_mut_ptr()) }
 }
 
+#[no_mangle]
+pub extern "C" fn nk_device_mmap_allowed() -> i32 {
+    (!crate::sched::in_user_syscall()) as i32
+}
+
+pub fn map_device_pages(fd: i64, offset: u64, len: u64, writable: bool,
+                        executable: bool, prot_none: bool)
+    -> Result<(u64, alloc::vec::Vec<u64>), i64> {
+    if len == 0 || len & 4095 != 0 || offset & 4095 != 0 || offset > i64::MAX as u64 {
+        return Err(-22);
+    }
+    let prot = if prot_none { 0 } else { 1 | ((writable as i64) << 1) | ((executable as i64) << 2) };
+    let address = syscall(222, [0, len as i64, prot, 1, fd, (offset / 4096) as i64]);
+    if address < 0 {
+        return Err(address);
+    }
+    let mut pages = alloc::vec::Vec::new();
+    if pages.try_reserve_exact((len / 4096) as usize).is_err() {
+        syscall(215, [address, len as i64, 0, 0, 0, 0]);
+        return Err(-12);
+    }
+    for off in (0..len).step_by(4096) {
+        let pa = syscall(247, [address + off as i64, writable as i64, 0, 0, 0, 0]);
+        if pa < 0 || pa as u64 & 4095 != 0
+            || (pa as u64) < crate::paging::LINUX_PHYS_BASE
+            || pa as u64 >= crate::paging::LINUX_PHYS_BASE + crate::paging::LINUX_PHYS_SIZE {
+            syscall(215, [address, len as i64, 0, 0, 0, 0]);
+            return Err(if pa < 0 { pa } else { -95 });
+        }
+        pages.push(pa as u64);
+    }
+    Ok((address as u64, pages))
+}
+
 /// These helpers accept kernel-owned buffers only. They must never receive
 /// an unchecked address from an EL0 exception frame.
 pub fn write_file(path: &core::ffi::CStr, bytes: &[u8]) -> Result<(), i64> {

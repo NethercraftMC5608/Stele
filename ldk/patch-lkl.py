@@ -405,6 +405,97 @@ SYSCALL_DEFINE1(share_files, long, pid)
 """
 
 
+DEVICE_PAGE_C = r'''
+extern int nk_device_mmap_allowed(void);
+
+SYSCALL_DEFINE2(device_page, unsigned long, addr, unsigned long, write)
+{
+    struct mm_struct *mm = current->mm;
+    struct vm_area_struct *vma;
+    pgd_t *pgd;
+    p4d_t *p4d;
+    pud_t *pud;
+    pmd_t *pmd;
+    pte_t *pte;
+    spinlock_t *ptl;
+    vm_fault_t fault;
+    long ret = -EFAULT;
+
+    if (!nk_device_mmap_allowed())
+        return -EPERM;
+    if (!mm || (addr & ~PAGE_MASK))
+        return -EINVAL;
+    mmap_read_lock(mm);
+    vma = find_vma(mm, addr);
+    if (!vma || addr < vma->vm_start || !vma->vm_file ||
+        !(vma->vm_flags & VM_SHARED))
+        goto out;
+    if (!S_ISCHR(file_inode(vma->vm_file)->i_mode) &&
+        !S_ISBLK(file_inode(vma->vm_file)->i_mode))
+        goto out;
+    if (write && !(vma->vm_flags & VM_WRITE))
+        goto out;
+    fault = handle_mm_fault(vma, addr, write ? FAULT_FLAG_WRITE : 0, NULL);
+    if (fault & VM_FAULT_ERROR) {
+        ret = (fault & VM_FAULT_OOM) ? -ENOMEM : -EFAULT;
+        goto out;
+    }
+    if (fault & VM_FAULT_RETRY)
+        goto out;
+    pgd = pgd_offset(mm, addr);
+    if (pgd_none(*pgd) || pgd_bad(*pgd))
+        goto out;
+    p4d = p4d_offset(pgd, addr);
+    if (p4d_none(*p4d) || p4d_bad(*p4d))
+        goto out;
+    pud = pud_offset(p4d, addr);
+    if (pud_none(*pud) || pud_bad(*pud))
+        goto out;
+    pmd = pmd_offset(pud, addr);
+    if (pmd_none(*pmd) || pmd_bad(*pmd))
+        goto out;
+    pte = pte_offset_map_lock(mm, pmd, addr, &ptl);
+    if (!pte)
+        goto out;
+    if (pte_present(*pte))
+        ret = pfn_to_phys(pte_pfn(*pte));
+    pte_unmap_unlock(pte, ptl);
+out:
+    mmap_read_unlock(mm);
+    return ret;
+}
+'''
+
+
+def device_pages():
+    edit('arch/lkl/include/uapi/asm/unistd.h',
+         '#define __NR_share_files\t\t(__NR_arch_specific_syscall + 2)',
+         '#define __NR_share_files\t\t(__NR_arch_specific_syscall + 2)\n'
+         '#define __NR_device_page (__NR_arch_specific_syscall + 3)',
+         '__NR_device_page')
+    edit('arch/lkl/include/asm/unistd.h',
+         '__SYSCALL(__NR_share_files, sys_share_files)',
+         '__SYSCALL(__NR_share_files, sys_share_files)\n'
+         '__SYSCALL(__NR_device_page, sys_device_page)',
+         '__NR_device_page')
+    edit('arch/lkl/kernel/syscalls.c',
+         'static asmlinkage long sys_share_files(long pid);',
+         'static asmlinkage long sys_share_files(long pid);\n'
+         'static asmlinkage long sys_device_page(unsigned long addr, unsigned long write);\n'
+         '#include <linux/mm.h>\n#include <linux/mman.h>',
+         'static asmlinkage long sys_device_page')
+    path = 'arch/lkl/kernel/syscalls.c'
+    s = open(path).read()
+    marker = '\nextern int nk_device_mmap_allowed(void);'
+    if marker in s:
+        start = s.index(marker)
+        end = s.index('\n}\n', start) + len('\n}\n')
+        s = s[:start] + DEVICE_PAGE_C + s[end:]
+    else:
+        s += DEVICE_PAGE_C
+    open(path, 'w').write(s)
+
+
 if __name__ == '__main__':
     shim = sys.argv[1] if len(sys.argv) > 1 else '/shim'
     arm64_open_flags()
@@ -412,4 +503,5 @@ if __name__ == '__main__':
     host_user_access()
     host0_signals()
     thread_files()
+    device_pages()
     console_driver(shim)

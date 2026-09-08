@@ -17,8 +17,7 @@
 //! `msync` writes them back sooner.
 //!
 //! What this is not: coherence with later file writes through other
-//! descriptors, `MAP_SHARED` on a device or DRM dumb buffer (those pages are
-//! Linux's, not nk's -- pinning them is separate work), or demand paging.
+//! descriptors, or demand paging.
 //! Every page is still mapped eagerly at `mmap` time.
 
 use crate::frames;
@@ -61,6 +60,58 @@ struct Region {
 }
 
 static mut REGIONS: Vec<Region> = Vec::new();
+
+#[cfg(nk_lkl)]
+struct DeviceRegion {
+    linux: u64,
+    len: u64,
+    root: u64,
+    at: u64,
+}
+
+#[cfg(nk_lkl)]
+static mut DEVICES: Vec<Option<DeviceRegion>> = Vec::new();
+
+#[cfg(nk_lkl)]
+const DEVICE_REGION: usize = 1usize << (usize::BITS - 1);
+
+#[cfg(nk_lkl)]
+fn map_device_shared(fd: i64, offset: u64, len: u64, at: u64,
+                     writable: bool, executable: bool, prot_none: bool) -> Result<usize, i64> {
+    let (linux, pages) = lkl::map_device_pages(fd, offset, len, writable, executable, prot_none)?;
+    let root = crate::user::current_ttbr0_pub();
+    for (i, pa) in pages.iter().enumerate() {
+        unsafe {
+            paging::map_user_permissions(root, at + i as u64 * 4096, *pa, 4096,
+                                         executable, writable);
+        }
+    }
+    if prot_none {
+        unsafe { paging::protect_user_none(root, at, len); }
+    }
+    let flags = crate::sync::irq_save();
+    let idx = unsafe {
+        let devices = &mut *(&raw mut DEVICES);
+        let idx = devices.len();
+        devices.push(Some(DeviceRegion { linux, len, root, at }));
+        idx
+    };
+    unsafe { crate::sync::irq_restore(flags); }
+    Ok(DEVICE_REGION | idx)
+}
+
+#[cfg(nk_lkl)]
+fn release_device(idx: usize) {
+    let flags = crate::sync::irq_save();
+    let region = unsafe {
+        (&mut *(&raw mut DEVICES)).get_mut(idx).and_then(Option::take)
+    };
+    unsafe { crate::sync::irq_restore(flags); }
+    if let Some(region) = region {
+        unsafe { paging::unmap_user_nofree(region.root, region.at, region.len); }
+        lkl::syscall(215, [region.linux as i64, region.len as i64, 0, 0, 0, 0]);
+    }
+}
 
 /// Identity of a region: the key, or an error that is already an errno.
 ///
@@ -105,6 +156,10 @@ pub fn map_shared(
     let rc = lkl::syscall(80, [fd, st.as_mut_ptr() as i64, 0, 0, 0, 0]);
     if rc < 0 {
         return Err(rc);
+    }
+    let mode = u32::from_le_bytes(st[16..20].try_into().unwrap()) & 0o170000;
+    if matches!(mode, 0o020000 | 0o060000) {
+        return map_device_shared(fd, offset, len, at, writable, executable, prot_none);
     }
     let size = file_size(&st);
 
@@ -385,6 +440,10 @@ fn writeback(idx: usize, fd_hint: i64) {
 /// pages and close the owned fd.
 #[cfg(nk_lkl)]
 pub fn release(idx: usize, fd_hint: i64) {
+    if idx & DEVICE_REGION != 0 {
+        release_device(idx & !DEVICE_REGION);
+        return;
+    }
     writeback(idx, fd_hint);
     unsafe {
         let regions = &mut *(&raw mut REGIONS);
