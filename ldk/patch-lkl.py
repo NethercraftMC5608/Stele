@@ -496,6 +496,141 @@ def device_pages():
     open(path, 'w').write(s)
 
 
+def cpu_strand_fix():
+    """Release LKL CPU on host task exit and prevent stranding on inert idle.
+
+    del_host_task() takes the CPU with lkl_cpu_get() on entry. On exit handover,
+    Linux's scheduler falls back to the idle task (swapper / host0) when no other
+    task is runnable. host0 is inert on nk -- the boot task leaves LKL after
+    lkl_start_kernel and never returns to execute LKL's idle loop. Stock
+    __switch_to() transfers CPU ownership to host0 and longjmps back via
+    TIF_SCHED_JB without del_host_task() calling lkl_cpu_put(), stranding
+    cpu.sem at count 0 forever.
+
+    Fix:
+    1. In del_host_task(), wake idle_host_task so the handover has a live
+       target, and release the CPU (lkl_cpu_drop()) after unregistration.
+       drop() never parks in the scheduler the way lkl_cpu_put() does --
+       this thread is going away and nobody will wake it.
+    2. In __switch_to(), do not transfer cpu.owner to an unbacked host task
+       (idle or host0) when a dying task unwinds via TIF_SCHED_JB. Live
+       switches, including new_host_task's switch to host0, are untouched:
+       they are told apart by prev->exit_state.
+    """
+    edit('arch/lkl/include/asm/cpu.h',
+         'void lkl_cpu_change_owner(lkl_thread_t owner);',
+         'void lkl_cpu_change_owner(lkl_thread_t owner);\n'
+         'void lkl_cpu_drop(void);',
+         'void lkl_cpu_drop(void);')
+
+    edit('arch/lkl/kernel/cpu.c',
+         'void lkl_cpu_change_owner(lkl_thread_t owner)\n'
+         '{\n'
+         '\tlkl_ops->mutex_lock(cpu.lock);\n'
+         '\tif (cpu.count > 1)\n'
+         '\t\tlkl_bug("bad count while changing owner\\n");\n'
+         '\tcpu.owner = owner;\n'
+         '\tlkl_ops->mutex_unlock(cpu.lock);\n'
+         '}',
+         'void lkl_cpu_change_owner(lkl_thread_t owner)\n'
+         '{\n'
+         '\tlkl_ops->mutex_lock(cpu.lock);\n'
+         '\tif (cpu.count > 1)\n'
+         '\t\tlkl_bug("bad count while changing owner\\n");\n'
+         '\tcpu.owner = owner;\n'
+         '\tlkl_ops->mutex_unlock(cpu.lock);\n'
+         '}\n'
+         '\n'
+         '/* Release the CPU from an exiting host thread: like lkl_cpu_put()\n'
+         ' * but never parks in the scheduler -- the caller is going away and\n'
+         ' * nobody will wake it. A no-op when ownership already moved on. */\n'
+         'void lkl_cpu_drop(void)\n'
+         '{\n'
+         '\tlkl_ops->mutex_lock(cpu.lock);\n'
+         '\tif (!cpu.count || !cpu.owner ||\n'
+         '\t    !lkl_ops->thread_equal(cpu.owner, lkl_ops->thread_self())) {\n'
+         '\t\tlkl_ops->mutex_unlock(cpu.lock);\n'
+         '\t\treturn;\n'
+         '\t}\n'
+         '\tif (--cpu.count > 0) {\n'
+         '\t\tlkl_ops->mutex_unlock(cpu.lock);\n'
+         '\t\treturn;\n'
+         '\t}\n'
+         '\tif (cpu.sleepers) {\n'
+         '\t\tcpu.sleepers--;\n'
+         '\t\tlkl_ops->sem_up(cpu.sem);\n'
+         '\t}\n'
+         '\tcpu.owner = 0;\n'
+         '\tlkl_ops->mutex_unlock(cpu.lock);\n'
+         '}',
+         'void lkl_cpu_drop(void)')
+
+    edit('arch/lkl/kernel/syscalls.c',
+         '\tif (!need_resched() && idle_host_task)\n'
+         '\t\twake_up_process(idle_host_task);',
+         '\tif (idle_host_task)\n'
+         '\t\twake_up_process(idle_host_task);',
+         '\tif (idle_host_task)\n\t\twake_up_process(idle_host_task);')
+
+    edit('arch/lkl/kernel/syscalls.c',
+         '\nstatic struct task_struct *host0;',
+         '\nstruct task_struct *host0;',
+         '\nstruct task_struct *host0;')
+
+    edit('arch/lkl/kernel/syscalls.c',
+         '\tswitch_to_host_task(task);\n'
+         '\thost_task_id--;\n'
+         '\tset_ti_thread_flag(ti, TIF_SCHED_JB);\n'
+         '\tlkl_ops->jmp_buf_set(&ti->sched_jb, exit_task);\n',
+         '\tswitch_to_host_task(task);\n'
+         '\thost_task_id--;\n'
+         '\twakeup_idle_host_task();\n'
+         '\tset_ti_thread_flag(ti, TIF_SCHED_JB);\n'
+         '\tlkl_ops->jmp_buf_set(&ti->sched_jb, exit_task);\n'
+         '\tlkl_cpu_drop();\n',
+         'wakeup_idle_host_task();\n\tset_ti_thread_flag(ti, TIF_SCHED_JB);')
+
+    edit('arch/lkl/kernel/threads.c',
+         'static struct task_struct *abs_prev = &init_task;',
+         'extern struct task_struct *host0;\n'
+         'static struct task_struct *abs_prev = &init_task;',
+         'extern struct task_struct *host0;')
+
+    edit('arch/lkl/kernel/threads.c',
+         '\tBUG_ON(!_next->tid);\n'
+         '\tlkl_cpu_change_owner(_next->tid);\n'
+         '\n'
+         '\tif (test_bit(TIF_SCHED_JB, &_prev_flags)) {\n'
+         '\t\t/* Atomic. Must be done before wakeup next */\n'
+         '\t\tclear_ti_thread_flag(_prev, TIF_SCHED_JB);\n'
+         '\t\t_prev_jb = _prev->sched_jb;\n'
+         '\t}\n'
+         '\n'
+         '\tlkl_ops->sem_up(_next->sched_sem);',
+         '\t/* A dying task unwinding via TIF_SCHED_JB must not hand the CPU\n'
+         '\t * to an unbacked host task: nobody there will ever put() it.\n'
+         '\t * Live switches (prev->exit_state == 0) are untouched. */\n'
+         '\tbool orphaned = prev->exit_state != 0 &&\n'
+         '\t\t(is_idle_task(next) || next == host0);\n'
+         '\n'
+         '\tif (!orphaned) {\n'
+         '\t\tBUG_ON(!_next->tid);\n'
+         '\t\tlkl_cpu_change_owner(_next->tid);\n'
+         '\t}\n'
+         '\n'
+         '\tif (test_bit(TIF_SCHED_JB, &_prev_flags)) {\n'
+         '\t\t/* Atomic. Must be done before wakeup next */\n'
+         '\t\tclear_ti_thread_flag(_prev, TIF_SCHED_JB);\n'
+         '\t\t_prev_jb = _prev->sched_jb;\n'
+         '\t}\n'
+         '\n'
+         '\tif (!orphaned)\n'
+         '\t\tlkl_ops->sem_up(_next->sched_sem);',
+         'bool orphaned = prev->exit_state')
+
+    say('del_host_task releases CPU and __switch_to guards unbacked handover')
+
+
 if __name__ == '__main__':
     shim = sys.argv[1] if len(sys.argv) > 1 else '/shim'
     arm64_open_flags()
@@ -505,3 +640,4 @@ if __name__ == '__main__':
     thread_files()
     device_pages()
     console_driver(shim)
+    cpu_strand_fix()
