@@ -264,7 +264,23 @@ pub extern "C" fn rust_el0_sync(frame: &mut Frame) {
         // address is an unmapped page; an alignment fault is the pc itself.
         println!("!! fault in user space: esr {:#x} ec {:#b} il {} iss {:#x} far {:#x}", esr, ec, (esr >> 25) & 1, esr & 0x1ffffff, far);
         println!("   pc {:#x}  sp {:#x}  lr {:#x}", frame.elr, frame.sp, frame.x[30]);
-        println!("   x0 {:#x} x1 {:#x} x2 {:#x} x3 {:#x}", frame.x[0], frame.x[1], frame.x[2], frame.x[3]);
+        // Read the faulting instructions through the kernel map, not by
+        // dereferencing EL0 addresses: EL1 has no business reading the
+        // user's half directly, and AT checks EL0 permissions first.
+        match crate::paging::user_to_phys(frame.elr & !3) {
+            Some(pa) => unsafe {
+                let w = core::ptr::read_volatile(pa as *const u32);
+                println!("   insn at pc: {:#010x}", w);
+            },
+            None => println!("   insn at pc: unreadable (pc unmapped for EL0)"),
+        }
+        match crate::paging::user_to_phys(frame.x[30].wrapping_sub(4) & !3) {
+            Some(pa) => unsafe {
+                let w = core::ptr::read_volatile(pa as *const u32);
+                println!("   insn before lr: {:#010x}", w);
+            },
+            None => println!("   insn before lr: unreadable (lr unmapped for EL0)"),
+        }
         // Which task faulted, in whose tables. Threads share an address space
         // and a fault in one stops only that task; without the id a fault in
         // a server thread reads like the death of the main process.
