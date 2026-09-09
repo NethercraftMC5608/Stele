@@ -30,8 +30,16 @@ use crate::sched;
 /// to forward to.
 pub fn forward(nr: u64, args: &[u64; 6]) -> Option<i64> {
     count_entry(nr);
+    let mut args_copy = *args;
+    // On a machine without an entropy device (virtio-rng), Linux's random pool
+    // is never initialized (crng_ready() remains false). Plain getrandom() with
+    // flags == 0 blocks indefinitely on crng_init_wait. Supply GRND_INSECURE (0x4)
+    // when unseeded flags == 0 so Linux returns unseeded pseudo-random bytes immediately.
+    if nr == 278 && args_copy[2] == 0 {
+        args_copy[2] = 4; // GRND_INSECURE
+    }
     let was = sched::set_user_syscall(true);
-    let ret = lkl::syscall(nr as i64, args.map(|a| a as i64));
+    let ret = lkl::syscall(nr as i64, args_copy.map(|a| a as i64));
     sched::set_user_syscall(was);
     count_exit(nr);
     Some(ret)
