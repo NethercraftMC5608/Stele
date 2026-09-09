@@ -309,7 +309,11 @@ pub fn spawn(name: &'static str, entry: extern "C" fn(usize), arg: usize) -> usi
         // ever equal one handed out for the last occupant of the slot.
         let generation = tasks[slot].generation.wrapping_add(1);
 
-        let stack = frames::alloc_contiguous(STACK_PAGES).expect("out of memory for a task stack");
+        let stack = frames::alloc_contiguous(STACK_PAGES).unwrap_or_else(|| {
+            let (used, total) = frames::stats();
+            panic!("out of memory for a task stack: frames total={} free={} requested={}",
+                total, total - used, STACK_PAGES);
+        });
         let top = stack as usize + STACK_PAGES * PAGE;
 
         // The frame cpu_switch will pop: twelve callee-saved registers, laid
