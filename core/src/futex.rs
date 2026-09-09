@@ -42,6 +42,10 @@ struct Waiter {
     /// Set by a waker before it makes the task ready, so a wake that arrives
     /// between the value check and the block is not lost.
     woken: bool,
+    deadline: Option<(bool, i64)>,
+    expired: bool,
+    uid: usize,
+    token: u64,
 }
 
 static mut WAITERS: [Waiter; MAX_WAITERS] = [Waiter {
@@ -51,7 +55,65 @@ static mut WAITERS: [Waiter; MAX_WAITERS] = [Waiter {
     bits: 0,
     live: false,
     woken: false,
+    deadline: None,
+    expired: false,
+    uid: 0,
+    token: 0,
 }; MAX_WAITERS];
+
+static mut NEXT_TOKEN: u64 = 0;
+
+fn clock_ns(realtime: bool) -> Result<i64, i64> {
+    let mut ts = [0i64; 2];
+    let was = sched::set_user_syscall(false);
+    let rc = crate::lkl::syscall(113, [if realtime { 0 } else { 1 }, ts.as_mut_ptr() as i64, 0, 0, 0, 0]);
+    sched::set_user_syscall(was);
+    if rc < 0 { return Err(rc); }
+    Ok(ts[0].saturating_mul(1_000_000_000).saturating_add(ts[1]))
+}
+
+static mut TIMER_TASK: Option<usize> = None;
+static mut TIMER_DUE: bool = false;
+
+pub fn tick() {
+    unsafe {
+        if let Some(task) = TIMER_TASK {
+            TIMER_DUE = true;
+            sched::wake_on(task, 0);
+        }
+    }
+}
+
+extern "C" fn timer_thread(_: usize) {
+    loop {
+        let flags = irq_save();
+        if !unsafe { core::mem::replace(&mut *(&raw mut TIMER_DUE), false) } {
+            sched::block_on(flags, 0);
+            continue;
+        }
+        let snapshot = unsafe { *(&raw const WAITERS) };
+        let needed = snapshot.iter().any(|s| s.live && !s.woken && !s.expired && s.deadline.is_some());
+        unsafe { irq_restore(flags) };
+        if !needed { continue; }
+        let mono = clock_ns(false);
+        let real = clock_ns(true);
+        let flags = irq_save();
+        unsafe {
+            for (s, old) in (*(&raw mut WAITERS)).iter_mut().zip(snapshot.iter()) {
+                if !s.live || s.woken || s.expired || s.token != old.token || sched::uid(s.task) != s.uid { continue; }
+                if let Some((realtime, end)) = s.deadline {
+                    let now = if realtime { real } else { mono };
+                    if matches!(now, Ok(now) if now >= end) {
+                        s.expired = true;
+                        s.deadline = None;
+                        sched::wake_on(s.task, 0);
+                    }
+                }
+            }
+            irq_restore(flags);
+        }
+    }
+}
 
 /// The address space a futex belongs to.
 fn space() -> u64 {
@@ -61,10 +123,26 @@ fn space() -> u64 {
 }
 
 /// # futex(uaddr, op, val, timeout, uaddr2, val3)
-pub fn futex(uaddr: u64, op: u64, val: u32, _timeout: u64, _uaddr2: u64, val3: u32) -> i64 {
-    match op & !(PRIVATE | CLOCK_REALTIME) {
-        WAIT => wait(uaddr, val, !0),
-        WAIT_BITSET => wait(uaddr, val, val3),
+pub fn futex(uaddr: u64, op: u64, val: u32, timeout: u64, _uaddr2: u64, val3: u32) -> i64 {
+    let cmd = op & !(PRIVATE | CLOCK_REALTIME);
+    let mut deadline = None;
+    if timeout != 0 && (cmd == WAIT || cmd == WAIT_BITSET) {
+        let mut bytes = [0u8; 16];
+        if uaccess::copy_from_user(&mut bytes, timeout).is_err() { return uaccess::EFAULT; }
+        let sec = i64::from_le_bytes(bytes[..8].try_into().unwrap());
+        let ns = i64::from_le_bytes(bytes[8..].try_into().unwrap());
+        if sec < 0 || !(0..1_000_000_000).contains(&ns) { return -22; }
+        let mut end = sec.saturating_mul(1_000_000_000).saturating_add(ns);
+        if cmd == WAIT {
+            end = match clock_ns(false) { Ok(now) => now.saturating_add(end), Err(e) => return e };
+        }
+        deadline = Some((op & CLOCK_REALTIME != 0, end));
+    }
+    if op & CLOCK_REALTIME != 0 && cmd != WAIT_BITSET { return -38; }
+    if uaddr & 3 != 0 { return -22; }
+    match cmd {
+        WAIT => wait(uaddr, val, !0, deadline),
+        WAIT_BITSET => wait(uaddr, val, val3, deadline),
         WAKE => wake(uaddr, val, !0),
         WAKE_BITSET => wake(uaddr, val, val3),
         other => {
@@ -81,10 +159,17 @@ pub fn futex(uaddr: u64, op: u64, val: u32, _timeout: u64, _uaddr2: u64, val3: u
 /// classic way to build a `pthread_join` that hangs once a week. Interrupts
 /// are masked across both, and `block_on` puts them back only after the task
 /// is marked blocked.
-fn wait(uaddr: u64, val: u32, bits: u32) -> i64 {
+fn wait(uaddr: u64, val: u32, bits: u32, deadline: Option<(bool, i64)>) -> i64 {
     if bits == 0 {
         return -22; // -EINVAL: a wait no wake could ever match
     }
+    let elapsed = match deadline {
+        Some((realtime, end)) => match clock_ns(realtime) {
+            Ok(now) => now >= end,
+            Err(e) => return e,
+        },
+        None => false,
+    };
     let flags = irq_save();
 
     let mut buf = [0u8; 4];
@@ -99,6 +184,14 @@ fn wait(uaddr: u64, val: u32, bits: u32) -> i64 {
         return -11; // -EAGAIN
     }
 
+    if elapsed {
+        unsafe { irq_restore(flags) };
+        return -110;
+    }
+    if deadline.is_some() && unsafe { (*(&raw const TIMER_TASK)).is_none() } {
+        let task = sched::spawn("futex-time", timer_thread, 0);
+        unsafe { TIMER_TASK = Some(task) };
+    }
     let me = sched::current_id();
     let slot = unsafe {
         let w = &mut *(&raw mut WAITERS);
@@ -106,6 +199,7 @@ fn wait(uaddr: u64, val: u32, bits: u32) -> i64 {
             irq_restore(flags);
             return -12; // -ENOMEM: nk is out of waiters, and says so
         };
+        NEXT_TOKEN = NEXT_TOKEN.checked_add(1).expect("futex wait token exhausted");
         w[slot] = Waiter {
             space: space(),
             addr: uaddr,
@@ -113,6 +207,10 @@ fn wait(uaddr: u64, val: u32, bits: u32) -> i64 {
             bits,
             live: true,
             woken: false,
+            deadline,
+            expired: false,
+            uid: sched::current_uid(),
+            token: NEXT_TOKEN,
         };
         slot
     };
@@ -126,13 +224,19 @@ fn wait(uaddr: u64, val: u32, bits: u32) -> i64 {
     }
 
     let flags = irq_save();
-    unsafe { (*(&raw mut WAITERS))[slot].live = false };
+    let result = unsafe {
+        let s = &mut (*(&raw mut WAITERS))[slot];
+        s.live = false;
+        s.deadline = None;
+        if s.woken { 0 } else if s.expired { -110 } else { -4 }
+    };
     unsafe { irq_restore(flags) };
-    0
+    result
 }
 
 /// Wake at most `n` waiters on `uaddr` whose bits overlap `bits`.
 fn wake(uaddr: u64, n: u32, bits: u32) -> i64 {
+    if bits == 0 { return -22; }
     let flags = irq_save();
     let here = space();
     let mut woken = 0;
@@ -142,8 +246,9 @@ fn wake(uaddr: u64, n: u32, bits: u32) -> i64 {
             if woken >= n {
                 break;
             }
-            if s.live && !s.woken && s.space == here && s.addr == uaddr && s.bits & bits != 0 {
+            if s.live && !s.woken && !s.expired && sched::uid(s.task) == s.uid && s.space == here && s.addr == uaddr && s.bits & bits != 0 {
                 s.woken = true;
+                s.deadline = None;
                 sched::wake(s.task);
                 woken += 1;
             }

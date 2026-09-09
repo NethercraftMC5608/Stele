@@ -88,6 +88,8 @@ pub fn ticks() -> u64 {
 
 pub fn on_tick() {
     TICKS.fetch_add(1, Ordering::Relaxed);
+    #[cfg(nk_lkl)]
+    crate::futex::tick();
 }
 
 /// Milliseconds since the timer started. Derived from the tick count rather
