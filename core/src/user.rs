@@ -243,8 +243,18 @@ pub extern "C" fn rust_el0_sync(frame: &mut Frame) {
         // and an unmapped instruction fetch is the same first touch.
         let abort = matches!(ec, 0b100000 | 0b100001 | 0b100100 | 0b100101);
         let translation = matches!(esr & 0x3f, 0x04..=0x07);
-        if abort && translation && crate::reserve::fault_in(far) {
-            return;
+        if abort && translation {
+            // A data abort names its page in FAR; an instruction abort
+            // names the faulting address only when FAR is valid (ISS[24]).
+            // An unfaulted JIT/text page under MAP_NORESERVE arrives here
+            // with FAR holding a stale data address, so fault the PC too.
+            let far_valid = esr & (1 << 24) != 0;
+            if crate::reserve::fault_in(far) {
+                return;
+            }
+            if matches!(ec, 0b100000 | 0b100001) && (far != frame.elr || !far_valid) && crate::reserve::fault_in(frame.elr) {
+                return;
+            }
         }
         println!();
         // ESR decoded: EC (top 6 bits), IL (bit 25: 32 or 16-bit insn),
@@ -254,6 +264,7 @@ pub extern "C" fn rust_el0_sync(frame: &mut Frame) {
         // address is an unmapped page; an alignment fault is the pc itself.
         println!("!! fault in user space: esr {:#x} ec {:#b} il {} iss {:#x} far {:#x}", esr, ec, (esr >> 25) & 1, esr & 0x1ffffff, far);
         println!("   pc {:#x}  sp {:#x}  lr {:#x}", frame.elr, frame.sp, frame.x[30]);
+        println!("   x0 {:#x} x1 {:#x} x2 {:#x} x3 {:#x}", frame.x[0], frame.x[1], frame.x[2], frame.x[3]);
         // Which task faulted, in whose tables. Threads share an address space
         // and a fault in one stops only that task; without the id a fault in
         // a server thread reads like the death of the main process.
@@ -268,6 +279,7 @@ pub extern "C" fn rust_el0_sync(frame: &mut Frame) {
                 crate::sched::linux_pid(me)
             );
             crate::paging::dump_walk(ttbr0, far);
+            crate::paging::dump_walk_pc(ttbr0, far, frame.elr);
         }
         // The process is what should die here, not the machine. nk has
         // nothing else to run yet, so it stops -- but reporting it as a user

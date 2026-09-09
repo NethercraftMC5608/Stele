@@ -748,6 +748,17 @@ pub fn dump_walk(ttbr0: u64, va: u64) {
     }
 }
 
+/// Walk the page tables a second time for the faulting PC, alongside FAR.
+/// Instruction aborts on unfaulted MAP_NORESERVE pages arrive with FAR
+/// holding a stale data address; without this the report shows one mapped
+/// page and names the wrong culprit.
+pub fn dump_walk_pc(ttbr0: u64, far: u64, pc: u64) {
+    if pc != far {
+        crate::println!("    dump_walk(pc):");
+        dump_walk(ttbr0, pc);
+    }
+}
+
 /// Translate a user virtual address, exactly as EL0 would see it.
 ///
 /// Through the hardware rather than by walking the tables in software. `AT
