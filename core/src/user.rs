@@ -904,6 +904,22 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: i64, offset: u64,
 
     let mut pages: Vec<*mut u8> = Vec::new();
     let mut iov: Vec<IoVec> = Vec::new();
+    // File size distinguishes EOF tail (must stay zero) from a short read
+    // within the file (must be retried). `preadv` past EOF returns 0/short,
+    // not an errno, so the old `rc < 0` check alone cannot tell them apart.
+    #[cfg(nk_lkl)]
+    let file_size: u64 = if !anonymous {
+        let mut st = [0u8; 128];
+        let rc = crate::lkl::syscall(80, [fd, st.as_mut_ptr() as i64, 0, 0, 0, 0]);
+        if rc < 0 {
+            return rc;
+        }
+        u64::from_le_bytes(st[48..56].try_into().unwrap())
+    } else {
+        0
+    };
+    #[cfg(not(nk_lkl))]
+    let file_size: u64 = 0;
     let mut off = 0u64;
     while off < len {
         let want = core::cmp::min(BATCH as u64, (len - off) / PAGE as u64) as usize;
@@ -920,18 +936,70 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: i64, offset: u64,
             pages.push(page);
         }
         if !anonymous {
-            // A short read is not an error: a mapping may legitimately run
-            // past the end of the file, and those pages must read as zero,
-            // which they already do.
+            // A short read past EOF is not an error: those pages must read
+            // as zero, which they already do. A short read *within* the
+            // file is retried: per-page loop until full, error, or EOF hit.
             #[cfg(nk_lkl)]
-            let rc = crate::lkl::syscall(69, [fd, iov.as_ptr() as i64, want as i64,
-                match offset.checked_add(off) { Some(v) if v <= i64::MAX as u64 => v as i64, _ => -1 },
-                0, 0]);
+            {
+                let base = match offset.checked_add(off) {
+                    Some(v) if v <= i64::MAX as u64 => v,
+                    _ => {
+                        for page in pages { unsafe { frames::free(page); } }
+                        return -22;
+                    }
+                };
+                // Retry within-file short reads to the exact byte: preadv
+                // fills the iovec array sequentially, so resume at byte
+                // `done` with the first iovec shortened by the intra-page
+                // remainder. Bytes never re-read, never skipped.
+                let fend = offset.saturating_add(len).min(file_size);
+                let mut done = 0usize;
+                let total = want * PAGE as usize;
+                loop {
+                    let start_page = done / PAGE as usize;
+                    let intra = done % PAGE as usize;
+                    let mut win: Vec<IoVec> = Vec::new();
+                    for (j, e) in iov.iter().enumerate().skip(start_page) {
+                        if j == start_page {
+                            win.push(IoVec { base: e.base + intra as u64, len: e.len - intra as u64 });
+                        } else {
+                            win.push(IoVec { base: e.base, len: e.len });
+                        }
+                    }
+                    if win.is_empty() {
+                        break;
+                    }
+                    let rc = crate::lkl::syscall(69, [fd, win.as_ptr() as i64, win.len() as i64,
+                        (base + done as u64) as i64, 0, 0]);
+                    if rc < 0 {
+                        for page in pages { unsafe { frames::free(page); } }
+                        return rc;
+                    }
+                    if rc == 0 {
+                        break;
+                    }
+                    done += rc as usize;
+                    if done >= total {
+                        break;
+                    }
+                    if base + done as u64 >= fend {
+                        break;
+                    }
+                    if rc as usize % PAGE as usize != 0 {
+                        crate::println!(
+                            "  mmapshort fd {} off {:#x} done {}/{} elr {:#x}",
+                            fd, base, done, total, elr
+                        );
+                    }
+                }
+            }
             #[cfg(not(nk_lkl))]
-            let rc = -38;
-            if rc < 0 {
-                for page in pages { unsafe { frames::free(page); } }
-                return rc;
+            {
+                let rc = -38;
+                if rc < 0 {
+                    for page in pages { unsafe { frames::free(page); } }
+                    return rc;
+                }
             }
         }
         if prot & 4 != 0 {
