@@ -47,36 +47,16 @@ pub const fn to_high(pa: u64) -> u64 {
     pa | KERNEL_VA_BASE
 }
 
-/// A page-table entry. Only the bits nk sets are named.
-mod pte {
-    pub const VALID: u64 = 1 << 0;
-    pub const TABLE: u64 = 1 << 1; // at L0-L2: 1 = next-level table, 0 = block
-    pub const AF: u64 = 1 << 10; // access flag; a miss on this faults
-    pub const SH_INNER: u64 = 3 << 8; // inner shareable
-    pub const UXN: u64 = 1 << 54; // never executable at EL0
-    pub const PXN: u64 = 1 << 53; // never executable at EL1
+/// A page-table entry, per architecture.
+///
+/// This was an inline `mod pte` of AArch64 descriptor bits. It is now a
+/// re-export of whichever architecture is being built, because the two
+/// disagree in ways a shared constant cannot express: AArch64 marks a table
+/// with a dedicated TABLE bit and x86-64 has none, writability is the
+/// *absence* of AP[2] on one and the presence of the W bit on the other, and
+/// bit 6 is EL0-reach on one and Dirty on the other.
+use crate::pte;
 
-    /// Not global: this translation belongs to one ASID only.
-    ///
-    /// Every mapping nk made was global, which is the default and is wrong
-    /// for user space: a global entry is valid in every address space, so two
-    /// processes with pages at the same address share whichever the TLB saw
-    /// first. It was invisible because nk flushed the whole TLB on every
-    /// switch -- which is both slower and less correct than saying what is
-    /// actually private.
-    pub const NG: u64 = 1 << 11;
-
-    /// AP[2:1] at bits 7:6. EL0 can only reach a page that says so; there is
-    /// no separate user page table, only this bit.
-    pub const AP_RW_ANY: u64 = 1 << 6; // read/write at EL1 and EL0
-    pub const AP_RO_ANY: u64 = 3 << 6; // read-only at EL1 and EL0
-
-    /// AttrIndx, an index into MAIR_EL1 rather than a description of the
-    /// memory -- the attributes themselves live in that register.
-    pub const fn attr(idx: u64) -> u64 {
-        idx << 2
-    }
-}
 
 /// MAIR_EL1 slot 0: Device-nGnRnE. Registers. No caching, no reordering, no
 /// merging, no early write acknowledgement.
@@ -130,14 +110,92 @@ static mut L2_LOW: Table = Table([0; 512]);
 /// # Safety
 /// The MMU is on and the frame allocator is up.
 unsafe fn next_table(entry: *mut u64) -> *mut u64 {
+    next_table_for(entry, false)
+}
+
+/// `next_table`, told whether what will finally be mapped is user memory.
+///
+/// x86-64 resolves permissions as the conjunction of every level, so a user
+/// leaf is unreachable unless *each* entry above it also says USER. The
+/// kernel's own identity map is supervisor-only, and splitting one of its
+/// blocks correctly preserves that -- so a user page mapped underneath it
+/// ends up present, correct at the leaf, and still unreadable from ring 3.
+///
+/// Opening the intermediate levels is therefore part of making a user
+/// mapping, not part of splitting a block: the split must stay faithful to
+/// what it replaced, and only the caller knows a user page is coming.
+/// AArch64 needs none of this, since it decides at the leaf.
+unsafe fn next_table_for(entry: *mut u64, user: bool) -> *mut u64 {
+    // A *block* is present but is not a table: its output is memory, not
+    // page-table entries. Descending one writes PTEs into whatever it maps
+    // and returns a pointer into that same memory -- which is how a user
+    // mapping quietly corrupted RAM and then jumped into it.
+    //
+    // This only bites on x86-64, where the kernel's own identity map is made
+    // of 2MB blocks and user space is mapped through the same root. AArch64
+    // reaches here with the low gigabyte already split into tables, so a
+    // present entry really was one. The split below is what makes a fresh 4KB
+    // mapping possible underneath a region the boot code mapped coarsely.
+    if *entry & pte::VALID != 0 && pte::is_block(*entry) {
+        split_block(entry);
+    }
     if *entry & pte::VALID == 0 {
         let page = crate::frames::alloc().expect("out of memory for a page table");
-        *entry = (page as u64) | pte::VALID | pte::TABLE;
+        *entry = pte::table_pointer(page as u64);
         // The walk is done by hardware reading memory this CPU just wrote.
         // Without the barrier the walker may not see it.
-        core::arch::asm!("dsb ishst", options(nostack));
+        crate::arch::memory_barrier();
+    } else if user {
+        // An entry that already exists may be supervisor-only -- either the
+        // kernel's own, or the table a split just made from it. Open it.
+        let opened = *entry | pte::user_table_bits();
+        if opened != *entry {
+            *entry = opened;
+            crate::arch::memory_barrier();
+            crate::arch::tlb_flush_all();
+        }
     }
-    (*entry & 0x0000_ffff_ffff_f000) as *mut u64
+    (*entry & ADDR) as *mut u64
+}
+
+/// Replace a large-page leaf with a table of smaller leaves covering the same
+/// memory with the same permissions.
+///
+/// Needed because nk maps the machine coarsely at boot and then has to make a
+/// 4KB mapping inside one of those blocks. The alternative -- refusing -- is
+/// what `map_user` used to do by accident, by descending the block instead.
+///
+/// # Safety
+/// `entry` is a present block descriptor at level 1 or level 2.
+unsafe fn split_block(entry: *mut u64) {
+    let old = *entry;
+    let base = old & ADDR;
+    // The flags, minus the address and minus the bit that made it a block.
+    let flags = old & !ADDR & !pte::block_marker();
+    let table = crate::frames::alloc().expect("out of memory to split a block");
+    let t = table as *mut u64;
+    // Only level-2 (2MB) blocks are ever split: the x86 boot map is built
+    // from them and `map_normal` makes them, so a 1GB block would have to
+    // come from somewhere that does not exist. A 1GB block split with this
+    // stride would map the same 2MB 512 times.
+    let stride = 4096u64;
+    for i in 0..512u64 {
+        *t.add(i as usize) = pte::page_leaf(base + i * stride, flags);
+    }
+    // The parent keeps the permissions the block had, rather than taking the
+    // ones `table_pointer` hands a *user* table.
+    //
+    // On x86-64 permissions are the conjunction of every level, so a table
+    // pointer must be permissive enough for the leaves beneath it -- which is
+    // why `table_pointer` sets USER|WRITABLE. Applying that here would have
+    // taken a 2MB slice of the kernel's own identity map and made it
+    // reachable from ring 3, because the *leaves* inherited the block's
+    // supervisor-only flags but the parent no longer said so. The split must
+    // be invisible: same memory, same permissions, finer granularity.
+    let parent_perms = flags & pte::table_perm_mask();
+    *entry = (table as u64) | pte::VALID | parent_perms;
+    crate::arch::memory_barrier();
+    crate::arch::tlb_flush_all();
 }
 
 /// Map `size` bytes of normal memory at `va` onto `pa`, in 2MB blocks.
@@ -166,24 +224,19 @@ pub unsafe fn map_normal(va: u64, pa: u64, size: u64) {
         // a gigabyte. Nothing currently overlaps, and this says so out loud
         // rather than discovering it as a fault somewhere else entirely.
         assert!(
-            *l1e & pte::VALID == 0 || *l1e & pte::TABLE != 0,
+            *l1e & pte::VALID == 0 || !pte::is_block(*l1e),
             "{v:#x} lands inside an existing 1GB block"
         );
         let l2 = next_table(l1e);
         let l2e = l2.add(((v >> L2_SHIFT) & 511) as usize);
-        *l2e = (pa + off) | pte::VALID | pte::AF | pte::SH_INNER | pte::attr(ATTR_NORMAL)
-            | pte::UXN
-            | pte::PXN;
+        *l2e = pte::block_leaf(
+            pa + off,
+            pte::AF | pte::SH_INNER | pte::attr(ATTR_NORMAL) | pte::UXN | pte::PXN,
+        );
         off += BLOCK_2MB;
     }
 
-    core::arch::asm!(
-        "dsb ishst",
-        "tlbi vmalle1is",
-        "dsb ish",
-        "isb",
-        options(nostack)
-    );
+    crate::arch::tlb_flush_all();
 }
 
 /// Where Linux's own virtual addresses live, when Linux is managing memory.
@@ -232,19 +285,21 @@ pub const LINUX_PHYS_SIZE: u64 = 64 << 20;
 /// # Safety
 /// The frame allocator is up and no process exists yet.
 pub unsafe fn reserve_linux_window() {
-    let l0 = &raw mut L0 as *mut u64;
+    // The *live* kernel root: on AArch64 that is the static `L0`, on x86-64
+    // it is the table the boot code loaded into CR3.
+    let l0 = table_of(kernel_address_space()) as *mut u64;
     let mut va = LINUX_VA_BASE;
     while va < LINUX_VA_BASE + LINUX_VA_SIZE {
         let l1 = next_table(l0.add(((va >> L0_SHIFT) & 511) as usize));
         let l1e = l1.add(((va >> L1_SHIFT) & 511) as usize);
         assert!(
-            *l1e & pte::VALID == 0 || *l1e & pte::TABLE != 0,
+            *l1e & pte::VALID == 0 || !pte::is_block(*l1e),
             "Linux's window overlaps a block mapping at {va:#x}"
         );
         next_table(l1e);
         va += 1 << L1_SHIFT;
     }
-    core::arch::asm!("dsb ishst", "isb", options(nostack));
+    crate::arch::memory_barrier();
 }
 
 /// Map physical pages into Linux's window.
@@ -274,18 +329,19 @@ pub unsafe fn map_linux(va: u64, pa: u64, size: u64) -> bool {
         let l1 = next_table(l0.add(((v >> L0_SHIFT) & 511) as usize));
         let l2 = next_table(l1.add(((v >> L1_SHIFT) & 511) as usize));
         let l3 = next_table(l2.add(((v >> L2_SHIFT) & 511) as usize));
-        *l3.add(((v >> L3_SHIFT) & 511) as usize) = (pa + off)
-            | pte::VALID
-            | pte::TABLE
-            | pte::AF
-            | pte::SH_INNER
-            | pte::attr(ATTR_NORMAL)
-            // No AP bits at all: AP[1] clear is EL1 only and AP[2] clear is
-            // writable, which is exactly what Linux's own memory should be.
-            | pte::UXN;
+        // Kernel-only and writable, which is what Linux's own memory must
+        // be. `pte::KERNEL_RW` rather than "no permission bits": on AArch64
+        // those are the same thing (AP[1] clear is EL1-only, AP[2] clear is
+        // writable, so the constant is zero), but on x86-64 absent bits mean
+        // supervisor-only *and read-only* -- and Linux then takes a
+        // protection fault on the first write to its own vmalloc arena.
+        *l3.add(((v >> L3_SHIFT) & 511) as usize) = pte::page_leaf(
+            pa + off,
+            pte::AF | pte::SH_INNER | pte::attr(ATTR_NORMAL) | pte::KERNEL_RW | pte::UXN,
+        );
         off += 4096;
     }
-    core::arch::asm!("dsb ishst", "tlbi vmalle1is", "dsb ish", "isb", options(nostack));
+    crate::arch::tlb_flush_all();
     true
 }
 
@@ -317,13 +373,18 @@ pub unsafe fn unmap_linux(va: u64, size: u64) {
         let l3 = (e2 & ADDR) as *mut u64;
         *l3.add(((v >> L3_SHIFT) & 511) as usize) = 0;
     }
-    core::arch::asm!("dsb ishst", "tlbi vmalle1is", "dsb ish", "isb", options(nostack));
+    crate::arch::tlb_flush_all();
 }
 
 const L3_SHIFT: u64 = 12;
 
 /// Mask for the output address in a descriptor or a TTBR value.
-const ADDR: u64 = 0x0000_ffff_ffff_f000;
+/// Mask for the output address in a descriptor or page-table root.
+///
+/// Re-exported from the arch module rather than spelled out: AArch64 keeps 52
+/// bits and x86-64's 4KB entries keep [51:12], so a file-local constant here
+/// silently applied AArch64's mask on x86-64.
+use pte::ADDR;
 
 /// The table a TTBR value points at, without its ASID.
 ///
@@ -340,8 +401,12 @@ pub const fn table_of(ttbr: u64) -> u64 {
 /// bit 0, and telling them apart matters wherever tables are walked or freed:
 /// a block's output address is memory, and following it as a table reads a
 /// gigabyte of RAM as page-table entries.
-const fn is_table(entry: u64) -> bool {
-    entry & 3 == 3
+fn is_table(entry: u64) -> bool {
+    // Routed through the arch helper: on AArch64 the TABLE bit marks a table
+    // at every non-leaf level; on x86-64 there is no such bit and a table is
+    // a present entry with PS clear. Testing `& 3 == 3` on x86-64 would read
+    // a 2MB huge leaf as a table and walk two megabytes of RAM as PTEs.
+    crate::pte::is_table(entry)
 }
 
 /// A fresh address space for a process.
@@ -377,6 +442,31 @@ fn next_asid() -> u64 {
     }
 }
 
+/// A fresh user address space, sharing the kernel's mappings.
+///
+/// x86-64 copies only the root. The kernel's entries are 1GB *blocks* in the
+/// boot table, so a process that shares the root by value already sees the
+/// identity map and Linux's window; there is no equivalent of the AArch64
+/// problem below, where user space and the devices share a gigabyte and the
+/// lower levels therefore have to be private.
+#[cfg(target_arch = "x86_64")]
+pub fn new_address_space() -> u64 {
+    unsafe {
+        let root = crate::frames::alloc().expect("no memory for an address space") as *mut u64;
+        core::ptr::copy_nonoverlapping(
+            table_of(kernel_address_space()) as *const u64,
+            root,
+            512,
+        );
+        // No ASID: on AArch64 TTBR0[63:48] carries one, but on x86-64 CR3 has
+        // no such field and any bits above the address make it non-canonical
+        // -- which is a #GP with error 0 the moment the value is used, a long
+        // way from the line that built it.
+        root as u64
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
 pub fn new_address_space() -> u64 {
     unsafe {
         let l0 = crate::frames::alloc().expect("no memory for an address space") as *mut u64;
@@ -425,6 +515,7 @@ pub unsafe fn map_user(ttbr0: u64, va: u64, pa: u64, size: u64, exec: bool) {
 ///
 /// The caller guarantees `pa..pa+size` is normal cacheable memory it owns.
 /// Device memory must never come here: `dc cvau` on Device-nGnRnE faults.
+#[cfg(target_arch = "aarch64")]
 pub unsafe fn clean_icache_range(pa: u64, size: u64) {
     let ctr: u64;
     core::arch::asm!("mrs {}, ctr_el0", out(reg) ctr, options(nostack, nomem));
@@ -455,27 +546,36 @@ pub unsafe fn map_user_permissions(ttbr0: u64, va: u64, pa: u64, size: u64, exec
     let mut off = 0;
     while off < size {
         let v = va + off;
-        let l1 = next_table(l0.add(((v >> L0_SHIFT) & 511) as usize));
-        let l2 = next_table(l1.add(((v >> L1_SHIFT) & 511) as usize));
-        let l3 = next_table(l2.add(((v >> L2_SHIFT) & 511) as usize));
-        // At level 3 the TABLE bit does not mean "table" -- it is what makes
-        // the descriptor a page rather than a reserved encoding. A level-3
-        // entry without it is simply invalid, and the fault says nothing
-        // about why.
+        // `true`: a user page is coming, so every level above it has to be
+        // reachable from ring 3 on x86-64.
+        let l1 = next_table_for(l0.add(((v >> L0_SHIFT) & 511) as usize), true);
+        let l2 = next_table_for(l1.add(((v >> L1_SHIFT) & 511) as usize), true);
+        let l3 = next_table_for(l2.add(((v >> L2_SHIFT) & 511) as usize), true);
+        // PXN and UXN are one bit on x86-64 and two on AArch64.
+        //
+        // AArch64 can say "not executable at EL1, executable at EL0", which
+        // is what a user page wants: PXN always, UXN only when the page is
+        // not meant to run. x86-64 has a single NX, so setting the kernel's
+        // half of that pair marks the page non-executable for *everyone* --
+        // and the process faults on its first instruction fetch, with a page
+        // that is plainly present and plainly user-readable.
+        //
+        // So PXN is only applied where it means something on its own.
+        let exec_perms = if exec {
+            if cfg!(target_arch = "aarch64") { pte::PXN } else { 0 }
+        } else {
+            pte::PXN | pte::UXN
+        };
         let perms = (if writable { pte::AP_RW_ANY } else { pte::AP_RO_ANY })
-            | pte::PXN
             | pte::NG
-            | if exec { 0 } else { pte::UXN };
-        *l3.add(((v >> L3_SHIFT) & 511) as usize) = (pa + off)
-            | pte::VALID
-            | pte::TABLE
-            | pte::AF
-            | pte::SH_INNER
-            | pte::attr(ATTR_NORMAL)
-            | perms;
+            | exec_perms;
+        *l3.add(((v >> L3_SHIFT) & 511) as usize) = pte::page_leaf(
+            pa + off,
+            pte::AF | pte::SH_INNER | pte::attr(ATTR_NORMAL) | perms,
+        );
         off += 4096;
     }
-    core::arch::asm!("dsb ishst", "tlbi vmalle1is", "dsb ish", "isb", options(nostack));
+    crate::arch::tlb_flush_all();
 }
 
 /// Remove a user mapping and free the pages behind it.
@@ -525,7 +625,7 @@ pub unsafe fn unmap_user(ttbr0: u64, va: u64, size: u64) -> usize {
         crate::frames::free((e3 & ADDR) as *mut u8);
         freed += 1;
     }
-    core::arch::asm!("dsb ishst", "tlbi vmalle1is", "dsb ish", "isb", options(nostack));
+    crate::arch::tlb_flush_all();
     freed
 }
 
@@ -565,7 +665,7 @@ pub unsafe fn unmap_user_nofree(ttbr0: u64, va: u64, size: u64) {
         }
         *slot = 0;
     }
-    core::arch::asm!("dsb ishst", "tlbi vmalle1is", "dsb ish", "isb", options(nostack));
+    crate::arch::tlb_flush_all();
 }
 
 /// Copy an address space: every page the process owns, with the permissions
@@ -622,9 +722,9 @@ pub unsafe fn copy_user_address_space(parent: u64) -> Option<u64> {
             // AP_RO_ANY is *both* AP bits, and AP_RW_ANY is one of them, so
             // "read-only" is the pair being present rather than the field
             // being non-zero -- a writable page has bit 6 set too.
-            let writable = e3 & (1 << 7) == 0;
+            let writable = pte::writable(e3);
             map_user_permissions(child, va, page as u64, 4096, exec, writable);
-            if e3 & (1 << 6) == 0 { protect_user_none(child, va, 4096); }
+            if !pte::user_accessible(e3) { protect_user_none(child, va, 4096); }
         }
     }
 
@@ -664,9 +764,9 @@ pub unsafe fn copy_user_address_space(parent: u64) -> Option<u64> {
                     };
                     core::ptr::copy_nonoverlapping((e3 & ADDR) as *const u8, page, 4096);
                     let exec = e3 & pte::UXN == 0;
-                    let writable = e3 & (1 << 7) == 0;
+                    let writable = pte::writable(e3);
                     map_user_permissions(child, va, page as u64, 4096, exec, writable);
-                    if e3 & (1 << 6) == 0 {
+                    if !pte::user_accessible(e3) {
                         protect_user_none(child, va, 4096);
                     }
                 }
@@ -723,7 +823,7 @@ pub unsafe fn protect_user(ttbr0: u64, va: u64, size: u64, exec: bool, writable:
             }
         }
     }
-    core::arch::asm!("dsb ishst", "tlbi vmalle1is", "dsb ish", "isb", options(nostack));
+    crate::arch::tlb_flush_all();
     true
 }
 
@@ -734,15 +834,15 @@ pub fn dump_walk(ttbr0: u64, va: u64) {
         let e0 = *l0.add(((va >> L0_SHIFT) & 511) as usize);
         crate::println!("    L0[{}] = {:#018x}", (va >> L0_SHIFT) & 511, e0);
         if e0 & pte::VALID == 0 { return; }
-        let l1 = (e0 & 0x0000_ffff_ffff_f000) as *const u64;
+        let l1 = (e0 & ADDR) as *const u64;
         let e1 = *l1.add(((va >> L1_SHIFT) & 511) as usize);
         crate::println!("    L1[{}] = {:#018x}", (va >> L1_SHIFT) & 511, e1);
-        if e1 & pte::VALID == 0 || e1 & pte::TABLE == 0 { return; }
-        let l2 = (e1 & 0x0000_ffff_ffff_f000) as *const u64;
+        if !pte::is_table(e1) { return; }
+        let l2 = (e1 & ADDR) as *const u64;
         let e2 = *l2.add(((va >> L2_SHIFT) & 511) as usize);
         crate::println!("    L2[{}] = {:#018x}", (va >> L2_SHIFT) & 511, e2);
-        if e2 & pte::VALID == 0 || e2 & pte::TABLE == 0 { return; }
-        let l3 = (e2 & 0x0000_ffff_ffff_f000) as *const u64;
+        if !pte::is_table(e2) { return; }
+        let l3 = (e2 & ADDR) as *const u64;
         let e3 = *l3.add(((va >> L3_SHIFT) & 511) as usize);
         crate::println!("    L3[{}] = {:#018x}", (va >> L3_SHIFT) & 511, e3);
     }
@@ -777,6 +877,7 @@ pub fn dump_walk_pc(ttbr0: u64, far: u64, pc: u64) {
 /// different questions, and a read-only user page answers yes to the first
 /// and no to the second. Copying a syscall's results back through the read
 /// check would let a process ask the kernel to write into its own text.
+#[cfg(target_arch = "aarch64")]
 pub fn user_to_phys_write(va: u64) -> Option<u64> {
     let par: u64;
     unsafe {
@@ -795,6 +896,7 @@ pub fn user_to_phys_write(va: u64) -> Option<u64> {
     Some((par & 0x0000_ffff_ffff_f000) | (va & 0xfff))
 }
 
+#[cfg(target_arch = "aarch64")]
 pub fn user_to_phys(va: u64) -> Option<u64> {
     let par: u64;
     unsafe {
@@ -815,6 +917,56 @@ pub fn user_to_phys(va: u64) -> Option<u64> {
     Some((par & 0x0000_ffff_ffff_f000) | (va & 0xfff))
 }
 
+/// Translate a user virtual address by walking the tables.
+///
+/// AArch64 asks the MMU directly with `AT s1e0r/w`, which applies EL0's
+/// permissions and reports the answer in PAR_EL1. x86-64 has no such
+/// instruction, so the walk is done in software against the current CR3 --
+/// and the permission the hardware would have applied has to be checked here
+/// instead: present at every level, and user-reachable at every level, since
+/// x86-64 permissions are the conjunction of all four.
+#[cfg(target_arch = "x86_64")]
+fn user_walk(va: u64, need_write: bool) -> Option<u64> {
+    unsafe {
+        let root = table_of(crate::arch::current_page_table());
+        let mut table = root as *const u64;
+        // L0, L1, L2: must be tables the user can reach.
+        for shift in [L0_SHIFT, L1_SHIFT, L2_SHIFT] {
+            let e = *table.add(((va >> shift) & 511) as usize);
+            if !pte::is_table(e) || !pte::user_accessible(e) {
+                return None;
+            }
+            if need_write && !pte::writable(e) {
+                return None;
+            }
+            table = (e & ADDR) as *const u64;
+        }
+        let e3 = *table.add(((va >> L3_SHIFT) & 511) as usize);
+        if e3 & pte::VALID == 0 || !pte::user_accessible(e3) {
+            return None;
+        }
+        if need_write && !pte::writable(e3) {
+            return None;
+        }
+        Some((e3 & ADDR) | (va & 0xfff))
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+pub fn user_to_phys_write(va: u64) -> Option<u64> {
+    user_walk(va, true)
+}
+
+#[cfg(target_arch = "x86_64")]
+pub fn user_to_phys(va: u64) -> Option<u64> {
+    user_walk(va, false)
+}
+
+/// x86-64 instruction and data caches are coherent, so there is nothing to
+/// clean. AArch64's are not, which is why the other arm of this exists.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn clean_icache_range(_pa: u64, _size: u64) {}
+
 /// Map the machine and switch the MMU on.
 ///
 /// `ram_base`/`ram_size` come from the device tree. Everything below 1GB is
@@ -825,6 +977,7 @@ pub fn user_to_phys(va: u64) -> Option<u64> {
 ///
 /// # Safety
 /// Called once, on the boot CPU, with the MMU off.
+#[cfg(target_arch = "aarch64")]
 pub unsafe fn init(ram_base: u64, ram_size: u64) {
     let l1_ptr = &raw mut L1 as *mut Table as u64;
 
@@ -991,8 +1144,31 @@ pub unsafe fn init(ram_base: u64, ram_size: u64) {
     println!("          ttbr1 on: {:#x} aliases {:#x} (magic {:#x})", to_high(low), low, b);
 }
 
+/// On x86-64 the MMU is already on.
+///
+/// boot-x86_64.s builds a 4GB identity map and sets CR0.PG before any Rust
+/// runs -- long mode cannot be entered with paging off, so there is no
+/// "switch it on" step to perform here. The arm above exists because
+/// AArch64 genuinely starts with the MMU disabled and every access
+/// Device-nGnRnE until this runs.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn init(_ram_base: u64, _ram_size: u64) {}
+
 /// Kernel threads always use the kernel root, never a process's mappings.
+#[cfg(target_arch = "aarch64")]
 pub fn kernel_address_space() -> u64 { &raw const L0 as u64 }
+
+/// On x86-64 the kernel root is the table boot-x86_64.s built and loaded
+/// into CR3, not nk's static `L0` -- that one is an AArch64 artefact the CPU
+/// never looks at here. Writing into it instead of the live table produced
+/// mappings the hardware could not see, while consuming frames.
+#[cfg(target_arch = "x86_64")]
+pub fn kernel_address_space() -> u64 {
+    unsafe extern "C" {
+        static pml4: u8;
+    }
+    &raw const pml4 as u64
+}
 
 /// Reclaim the private user subtree, then the copied root. The remaining
 /// root entries belong to the kernel and must not be freed.
@@ -1085,8 +1261,9 @@ pub unsafe fn protect_user_none(root: u64, va: u64, size: u64) -> bool {
     for v in (va..va+size).step_by(4096) {
         let mut table = table_of(root) as *mut u64;
         for shift in [39,30,21] { table = (*table.add(((v>>shift)&511) as usize) & ADDR) as *mut u64; }
-        *table.add(((v>>12)&511) as usize) &= !(1<<6);
+        let slot = table.add(((v>>12)&511) as usize);
+        *slot = pte::clear_user_access(*slot);
     }
-    core::arch::asm!("dsb ishst", "tlbi vmalle1is", "dsb ish", "isb", options(nostack));
+    crate::arch::tlb_flush_all();
     true
 }

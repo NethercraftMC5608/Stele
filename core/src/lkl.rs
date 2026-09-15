@@ -28,6 +28,11 @@ pub fn boot() -> bool {
         return false;
     }
     crate::println!("  linux:  starting the kernel");
+    // From here Linux owns the machine; see `sched::LKL_ACTIVE`. Set before
+    // the call, not after: the kernel is live the moment it returns, and a
+    // task picked onto an AP in between would already be a second host
+    // thread inside LKL.
+    crate::sched::set_lkl_active();
     // Memory comes from nk's frame allocator through the host's page_alloc,
     // so this is how much of nk's RAM Linux is allowed to take.
     let rc = unsafe { lkl_start_kernel(c"mem=64M loglevel=8".as_ptr() as *const u8) };
@@ -174,6 +179,49 @@ pub fn open_console() -> bool {
         syscall(57, [fd, 0, 0, 0, 0, 0]);
     }
     true
+}
+
+/// Mount the kernel's own filesystems: `/proc`, `/sys`, `/dev/shm`.
+///
+/// Nothing in nk needs these, and nearly everything a program does. A libc
+/// asks `/proc/self/maps` what it may map, a shell reads `/proc/<pid>` to
+/// answer `ps`, and Rust's `std::fs` reports a missing `/proc` as the same
+/// ENOENT any other absent file would produce -- which is a true error about
+/// a filesystem that was simply never mounted, and reads as a broken port.
+///
+/// Failures are reported and not fatal: a kernel built without procfs is a
+/// kernel that boots, and one missing mount should not stop the machine.
+pub fn mount_kernel_filesystems() {
+    const MOUNT: i64 = 40;
+    // Each entry is (source, target, type). The source is a label for
+    // everything here -- these filesystems have no backing device.
+    let mounts: [(&core::ffi::CStr, &core::ffi::CStr, &core::ffi::CStr); 3] = [
+        (c"proc", c"/proc", c"proc"),
+        (c"sysfs", c"/sys", c"sysfs"),
+        (c"tmpfs", c"/dev/shm", c"tmpfs"),
+    ];
+    let mut done = 0;
+    for (source, target, kind) in mounts {
+        let _ = mkdir(target, 0o755);
+        let rc = syscall(
+            MOUNT,
+            [
+                source.as_ptr() as i64,
+                target.as_ptr() as i64,
+                kind.as_ptr() as i64,
+                0,
+                0,
+                0,
+            ],
+        );
+        // -EBUSY means it is already mounted, which is success for this.
+        if rc == 0 || rc == -16 {
+            done += 1;
+        } else {
+            crate::println!("  mount:  {:?} -> {:?} failed: {}", kind, target, rc);
+        }
+    }
+    crate::println!("  mount:  {} of {} kernel filesystems", done, mounts.len());
 }
 
 /// Give the calling task a copy of another task's open descriptors.

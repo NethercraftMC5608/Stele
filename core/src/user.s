@@ -10,6 +10,12 @@
 
 .section ".text", "ax"
 
+// The vector save/restore below is the one place nk touches FPSIMD itself,
+// and the build target is soft-float: the instructions have to be enabled for
+// this file explicitly rather than for the whole kernel.
+.arch_extension fp
+.arch_extension simd
+
 // The frame is irq_entry's, with one more slot: 31 registers, ELR, SPSR, and
 // the user stack pointer at 264.
 .global el0_sync_entry
@@ -39,8 +45,20 @@ el0_sync_entry:
     // SP_EL0 now means "current task" again, not "user stack".
     bl      nk_enter_kernel
 
+    // The vector unit belongs to this task and to no other: save it before
+    // any kernel code can touch it. The first task to notice its absence was
+    // Skia's gradient search, whose stop index came back from a preemption
+    // holding another task's lane.
+    bl      nk_fp_addr
+    bl      nk_fp_save_asm
+
     mov     x0, sp
     bl      rust_el0_sync
+
+    // Give the task its vectors back before it returns. The calls clobber
+    // x0-x18 and x30; every one of those is loaded from the frame below.
+    bl      nk_fp_addr
+    bl      nk_fp_restore_asm
 
     // A signal may have redirected the frame: elr is the handler, sp the
     // signal stack, x0-x2 the handler arguments. The restore below is
@@ -104,7 +122,16 @@ el0_irq_entry:
     // SP_EL0 now means "current task" again, not "user stack".
     bl      nk_enter_kernel
 
+    // The vector unit belongs to this task and to no other. A timer IRQ in
+    // the middle of a SIMD loop is exactly how Skia's raster pipeline lost
+    // its registers to whoever ran next.
+    bl      nk_fp_addr
+    bl      nk_fp_save_asm
+
     bl      rust_el0_irq
+
+    bl      nk_fp_addr
+    bl      nk_fp_restore_asm
 
     ldp     x1,  x2,  [sp, #16 * 16]
     msr     spsr_el1, x1
@@ -149,6 +176,12 @@ enter_user:
     msr     elr_el1, x0             // where to start
     mov     x3, #0                  // EL0t, DAIF clear: interrupts on in user
     msr     spsr_el1, x3
+
+    // The new program gets the task's vector state as saved -- zeroed for a
+    // fresh task, the parent's copy for a forked child, the interrupted
+    // state when this is a signal handler returning early.
+    bl      nk_fp_addr
+    bl      nk_fp_restore_asm
 
     // Every register zero, and x0 above all.
     //
@@ -205,6 +238,7 @@ enter_user:
 // life of the task, which one exec would not notice and a shell would.
 .global enter_user_fresh
 enter_user_fresh:
+    msr     daifset, #0xf
     mov     sp, x3
     b       enter_user
 
@@ -217,12 +251,18 @@ enter_user_fresh:
 // found on the stack.
 .global resume_user
 resume_user:
+    msr     daifset, #0xf
     mov     sp, x2                  // the child's own kernel stack, wound back
+    mov     x20, x0                 // frame pointer across the FP restore
     msr     ttbr0_el1, x1
     dsb     ishst
     tlbi    vmalle1
     dsb     ish
     isb
+
+    bl      nk_fp_addr
+    bl      nk_fp_restore_asm
+    mov     x0, x20
 
     ldp     x2,  x3,  [x0, #16 * 16]
     msr     spsr_el1, x2
@@ -246,6 +286,61 @@ resume_user:
     // x0 and x1 last: x0 is the frame pointer until this instruction.
     ldp     x0,  x1,  [x0, #16 * 0]
     eret
+
+// nk_fp_save_asm(dst in x0) / nk_fp_restore_asm(src in x0)
+//
+// The vector unit, all of it: 32 128-bit registers plus FPCR and FPSR, laid
+// out to match `sched::FpSave` (q0..q31 at 0, FPCR at 0x200, FPSR at 0x208).
+// Called from the exception vectors with x0 = nk_fp_addr(); nothing else runs
+// in between, and the caller reloads every GP register from its frame after,
+// so the x16/x17 scratch here costs nothing.
+.global nk_fp_save_asm
+nk_fp_save_asm:
+    mrs     x16, fpcr
+    mrs     x17, fpsr
+    stp     q0,  q1,  [x0, #0x000]
+    stp     q2,  q3,  [x0, #0x020]
+    stp     q4,  q5,  [x0, #0x040]
+    stp     q6,  q7,  [x0, #0x060]
+    stp     q8,  q9,  [x0, #0x080]
+    stp     q10, q11, [x0, #0x0a0]
+    stp     q12, q13, [x0, #0x0c0]
+    stp     q14, q15, [x0, #0x0e0]
+    stp     q16, q17, [x0, #0x100]
+    stp     q18, q19, [x0, #0x120]
+    stp     q20, q21, [x0, #0x140]
+    stp     q22, q23, [x0, #0x160]
+    stp     q24, q25, [x0, #0x180]
+    stp     q26, q27, [x0, #0x1a0]
+    stp     q28, q29, [x0, #0x1c0]
+    stp     q30, q31, [x0, #0x1e0]
+    str     x16, [x0, #0x200]
+    str     x17, [x0, #0x208]
+    ret
+
+.global nk_fp_restore_asm
+nk_fp_restore_asm:
+    ldp     q0,  q1,  [x0, #0x000]
+    ldp     q2,  q3,  [x0, #0x020]
+    ldp     q4,  q5,  [x0, #0x040]
+    ldp     q6,  q7,  [x0, #0x060]
+    ldp     q8,  q9,  [x0, #0x080]
+    ldp     q10, q11, [x0, #0x0a0]
+    ldp     q12, q13, [x0, #0x0c0]
+    ldp     q14, q15, [x0, #0x0e0]
+    ldp     q16, q17, [x0, #0x100]
+    ldp     q18, q19, [x0, #0x120]
+    ldp     q20, q21, [x0, #0x140]
+    ldp     q22, q23, [x0, #0x160]
+    ldp     q24, q25, [x0, #0x180]
+    ldp     q26, q27, [x0, #0x1a0]
+    ldp     q28, q29, [x0, #0x1c0]
+    ldp     q30, q31, [x0, #0x1e0]
+    ldr     x16, [x0, #0x200]
+    ldr     x17, [x0, #0x208]
+    msr     fpcr, x16
+    msr     fpsr, x17
+    ret
 
 // The program itself, in the kernel image, because nk has no filesystem to
 // load one from yet. Position-independent -- it is copied to whatever address

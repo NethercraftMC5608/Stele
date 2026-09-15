@@ -15,17 +15,34 @@ use core::arch::global_asm;
 /// filesystem to unpack it into.
 static mut INITRD: Option<(u64, u64)> = None;
 
+pub mod arch;
+pub mod pte;
+#[cfg(target_arch = "aarch64")]
+pub mod pte_arm;
+#[cfg(target_arch = "x86_64")]
+pub mod pte_x86;
 #[cfg(nk_lkl)]
 pub mod console;
 pub mod cpio;
 pub mod dt;
 #[cfg(nk_lkl)]
 pub mod elf;
+pub mod nethos_abi;
+#[cfg(target_arch = "aarch64")]
 pub mod exceptions;
 pub mod frames;
 #[cfg(nk_lkl)]
 pub mod futex;
+#[cfg(target_arch = "aarch64")]
 pub mod gic;
+#[cfg(target_arch = "x86_64")]
+pub mod interrupts_x86;
+#[cfg(target_arch = "x86_64")]
+pub mod lapic;
+#[cfg(target_arch = "x86_64")]
+pub mod tss_x86;
+#[cfg(target_arch = "x86_64")]
+pub use interrupts_x86 as gic;
 pub mod heap;
 pub mod hostops;
 #[cfg(nk_lkl)]
@@ -39,12 +56,17 @@ pub mod paging;
 pub mod psci;
 pub mod reserve;
 pub mod sched;
+pub mod smp;
+pub mod schedpolicy;
+pub mod schedtest;
+pub mod schedtrace;
 pub mod selftest;
 pub mod shm;
 pub mod signal;
 pub mod stack;
 pub mod stub;
 pub mod sync;
+pub mod syscall_nr;
 #[cfg(nk_lkl)]
 pub mod syscall;
 pub mod uaccess;
@@ -52,18 +74,407 @@ pub mod uaccess;
 pub mod useraccess;
 pub mod user;
 pub mod timer;
+#[cfg(target_arch = "aarch64")]
+#[cfg(target_arch = "aarch64")]
 pub mod uart;
+#[cfg(target_arch = "x86_64")]
+pub mod uart_x86;
+#[cfg(target_arch = "x86_64")]
+pub use uart_x86 as uart;
 
 // The assembly lives in a real .s file rather than inline in a string, so it
 // can be read and diffed as assembly. global_asm! means rustc's own assembler
 // handles it and no separate binutils cross-toolchain is needed to build the
 // kernel at all -- rustup and nothing else.
+//
+// One boot file per architecture. They are not variations on a theme: the
+// aarch64 one is handed a device tree and drops from EL2 to EL1, the x86-64
+// one is a Multiboot2 image that has to build page tables and enter long
+// mode before any Rust can run at all.
+#[cfg(target_arch = "aarch64")]
 global_asm!(include_str!("boot.s"));
+#[cfg(target_arch = "aarch64")]
 global_asm!(include_str!("user.s"));
+// att_syntax because the file is written in AT&T assembly, and `global_asm!`
+// defaults to Intel on x86. Without it the first `mov $x, %reg` is a parse
+// error about an unknown token, which names the column and not the cause.
+#[cfg(target_arch = "x86_64")]
+global_asm!(include_str!("boot-x86_64.s"), options(att_syntax));
+#[cfg(target_arch = "x86_64")]
+global_asm!(include_str!("user-x86_64.s"), options(att_syntax));
+// The ring-3 smoke test, copied verbatim to USER_BASE by `user::spawn`.
+//
+// Not an ELF: spawn copies one page and jumps to its first byte, so the
+// program has to be position-independent within that page. build.rs writes
+// the file into OUT_DIR -- which has no fixed location, so the path is
+// spliced in with `concat!` rather than named in the assembly, because
+// `.incbin` wants a quoted literal.
+#[cfg(target_arch = "x86_64")]
+global_asm!(
+    ".section \".rodata\"",
+    ".balign 4096",
+    ".global __user_blob_start",
+    "__user_blob_start:",
+    concat!(".incbin \"", env!("NK_USER_BLOB_PATH"), "\""),
+    ".global __user_blob_end",
+    "__user_blob_end:",
+    // The built-in fixture aarch64 keeps in user.s: an ELF assembled by hand
+    // so a standalone build has something to run. There is no x86-64 one, so
+    // these are empty -- `spawn_from_rootfs` names them, and an initrd's
+    // /nk-init takes priority over the fixture anyway.
+    ".global __user_elf_start",
+    "__user_elf_start:",
+    ".global __user_elf_end",
+    "__user_elf_end:",
+    options(att_syntax)
+);
+#[cfg(target_arch = "x86_64")]
+global_asm!(include_str!("interrupts-x86_64.s"), options(att_syntax));
 
-/// Where boot.s hands over. `dtb` is whatever x0 held at reset: on QEMU's
-/// `virt` that is the physical address of the flattened device tree, which is
-/// the whole of what this kernel is told about the machine.
+#[cfg(target_arch = "x86_64")]
+pub mod bootinfo_x86;
+
+/// Where boot-x86_64.s hands over.
+///
+/// `magic` names the protocol the loader spoke: 0x36d76289 for Multiboot2,
+/// 0x50564800 ("PVH\0") for PVH, which is what QEMU's -kernel uses. `info`
+/// is the physical address of the data structure describing the machine:
+/// a Multiboot2 tag list for the first, an hvm_start_info for the second.
+#[cfg(target_arch = "x86_64")]
+#[no_mangle]
+pub extern "C" fn rust_main(magic: u64, info: u64) -> ! {
+    unsafe { uart_x86::console().init() };
+    println!();
+    println!("NETHOS kernel (nk) {} -- x86_64", env!("CARGO_PKG_VERSION"));
+    println!("  magic: {:#x}  info: {:#x}", magic, info);
+    let proto = match magic as u32 {
+        0x36d76289 => "Multiboot2 (GRUB / real hardware)",
+        0x50564800 => "PVH (QEMU -kernel)",
+        _ => "unknown loader",
+    };
+    println!("  boot:  {}", proto);
+
+    let boot = match magic as u32 {
+        0x50564800 => unsafe { bootinfo_x86::parse_pvh(info) },
+        _ => None,
+    };
+
+    let Some(boot) = boot else {
+        panic!("could not parse boot information from loader");
+    };
+
+    let mut usable = 0u64;
+    for &(s, e) in &boot.ram_regions[..boot.ram_region_count] {
+        println!("  memory: {:#x}..{:#x} ({} MiB)", s, e, (e - s) >> 20);
+        usable += e - s;
+    }
+    println!("  usable: {} MiB across {} region(s)", usable >> 20, boot.ram_region_count);
+
+    if let Some((s, e)) = boot.initrd {
+        println!("  initrd: {:#x}..{:#x} ({} KiB)", s, e, (e - s) >> 10);
+        unsafe { INITRD = Some((s, e)) };
+    }
+
+    // Hand free RAM above the kernel to the page allocator.
+    extern "C" {
+        static __image_end: u8;
+    }
+    let image_end = &raw const __image_end as usize;
+    let ram_start = (image_end + 4095) & !4095;
+
+    // Everything that is in RAM but must not be handed out, lowest first.
+    // Adding a range and hoping nothing lands on the initrd or on Linux's
+    // window does not fail where the mistake is: it fails later, in whatever
+    // was given the page, with someone else's bytes in it.
+    #[cfg(nk_lkl)]
+    let linux = (
+        paging::LINUX_PHYS_BASE as usize,
+        (paging::LINUX_PHYS_BASE + paging::LINUX_PHYS_SIZE) as usize,
+    );
+    #[cfg(not(nk_lkl))]
+    let linux = (0usize, 0usize);
+    let initrd = unsafe { INITRD }
+        .map(|(s, e)| (s as usize, e as usize))
+        .unwrap_or((0, 0));
+
+    // Only memory the boot page tables actually map may be handed out.
+    //
+    // boot-x86_64.s identity-maps the first 4GB, so a frame above that has no
+    // virtual address at all: using one as a page table faults inside the
+    // walker, and using one as a user page maps something that is not there.
+    // A 6GB machine reports a region at 4GB..6GB, and every page of it is
+    // unusable until nk maps high memory.
+    const MAPPED_LIMIT: usize = 4 * 1024 * 1024 * 1024;
+
+    let mut reserved = [initrd, linux];
+    reserved.sort_unstable();
+
+    let mut highest_end = 0usize;
+    for &(rs, re) in &boot.ram_regions[..boot.ram_region_count] {
+        // The kernel image sits in the lowest region; skip past it there.
+        let lo = (rs as usize).max(ram_start);
+        let hi = (re as usize).min(MAPPED_LIMIT);
+        if lo >= hi {
+            continue;
+        }
+        highest_end = highest_end.max(hi);
+        let mut at = lo;
+        for (xs, xe) in reserved {
+            if xe <= at || xs >= hi {
+                continue;
+            }
+            if xs > at {
+                unsafe { frames::add(at, xs.min(hi)) };
+            }
+            at = at.max(xe);
+        }
+        if at < hi {
+            unsafe { frames::add(at, hi) };
+        }
+    }
+
+    // LKL's linear map is a *physical* address compiled into the archive
+    // (CONFIG_LKL_MEMORY_START), because its __pa() is the identity. A
+    // machine too small to contain it cannot run Linux at all, and saying so
+    // here beats a driver reading memory that was never there.
+    #[cfg(nk_lkl)]
+    assert!(
+        linux.1 <= highest_end,
+        "Linux's window {:#x}..{:#x} does not fit in mapped RAM ending at {highest_end:#x}",
+        linux.0,
+        linux.1,
+    );
+
+    let (used, total) = frames::stats();
+    println!("  frames: {}/{} available", total - used, total);
+    #[cfg(nk_lkl)]
+    println!(
+        "  linux:  {:#x}..{:#x} ({} MiB) reserved for LKL",
+        linux.0,
+        linux.1,
+        (linux.1 - linux.0) >> 20,
+    );
+
+    // Reserve 192MB for the kernel heap, matching the aarch64 heap bump.
+    unsafe { heap::init(192) };
+
+    // Before any process exists, because every address space nk creates
+    // copies the top of the kernel's tables and Linux must be in all of them.
+    #[cfg(nk_lkl)]
+    unsafe {
+        paging::reserve_linux_window()
+    };
+
+    sched::init();
+
+    // Interrupts: IDT loaded, PIC remapped, then the PIT started. The order
+    // matters -- a tick that arrives before the IDT is loaded lands on the
+    // BIOS's vector table.
+    unsafe { interrupts_x86::init() };
+    // The TSS must exist before ring 3 does: an interrupt taken in ring 3
+    // with no RSP0 to switch to triple-faults and resets the machine silently.
+    unsafe {
+        // __stack_top is where boot-x86_64.s set RSP, so it is the real top of
+        // the boot task's stack -- rounding the *current* RSP up to a page
+        // would name a point part way down it, and every trap would then land
+        // inside the boot task's own live frames.
+        unsafe extern "C" {
+            static __stack_top: u8;
+        }
+        let top = &raw const __stack_top as u64;
+        tss_x86::init(top);
+        sched::set_boot_stack_top(top);
+    }
+    unsafe { timer::init(0) };
+    // `syscall` is an invalid opcode until EFER.SCE says otherwise, and the
+    // MSRs that say where it lands (LSTAR), what it runs as (STAR) and which
+    // flags it clears (FMASK) are equally unset at reset. Without this the
+    // first system call from ring 3 raises #UD at the `syscall` itself --
+    // which reads as a corrupt program rather than a kernel that never
+    // enabled the instruction.
+    unsafe {
+        extern "C" {
+            fn x86_syscall_init();
+        }
+        x86_syscall_init();
+        println!("  syscall: SCE enabled, LSTAR/STAR/FMASK programmed");
+    }
+
+    // Before the scheduler runs: the policy measures in microseconds and the
+    // tick is 10 ms, so without a calibrated cycle counter every latency it
+    // reports is either 0 or 10 ms and every slice comparison is meaningless.
+    timer::calibrate();
+    schedtrace::start();
+
+    // The local APIC, before any AP: it is what sends the INIT/STARTUP pair
+    // and the reschedule IPI, and its timer is what gives each AP a tick.
+    // Enabling it on the boot CPU does not disturb the 8259 -- device
+    // interrupts keep arriving through the PIC exactly as before.
+    unsafe {
+        lapic::init();
+        lapic::calibrate_timer();
+    }
+
+    println!();
+    println!("Stage 1 up on x86-64. Unmasking interrupts.");
+    sched::enable();
+    unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
+
+    // Secondary CPUs, once interrupts are live on this one: an AP signals
+    // readiness through shared memory, but the BSP's wait is bounded by the
+    // TSC rather than a tick, so this order is a convenience rather than a
+    // requirement. No-op unless NK_SMP was set at build time.
+    smp::bring_up();
+
+    println!("Interrupts unmasked. nk x86-64 running.");
+
+    // Prove the IDT entries are reached and returned from, rather than merely
+    // loaded. `int3` is the one vector that can be raised deliberately without
+    // breaking anything: it runs the same stub, the same frame build and the
+    // same `iretq` as a hardware interrupt, so arriving at the line after it
+    // is evidence the whole entry path works. Loading a table and never taking
+    // an interrupt through it would have looked identical up to this point.
+    unsafe { interrupts_x86::selftest() };
+
+    // And that hardware interrupts arrive, not only software ones. int3 proves
+    // the gate and the return path; only a tick proves the PIT is running, the
+    // PIC is unmasked and routed, and the EOI is accepted -- an unacknowledged
+    // PIC delivers exactly one interrupt and then goes quiet, which looks the
+    // same as a timer that was never programmed.
+    {
+        let start = timer::ticks();
+        let mut spins = 0u64;
+        while timer::ticks() == start && spins < 200_000_000 {
+            core::hint::spin_loop();
+            spins += 1;
+        }
+        let now = timer::ticks();
+        if now > start {
+            // One tick could be a single latched interrupt; keep waiting to
+            // show the PIC is re-arming after the EOI rather than delivering
+            // once and going quiet.
+            let mut spins2 = 0u64;
+            while timer::ticks() < now + 5 && spins2 < 1_000_000_000 {
+                core::hint::spin_loop();
+                spins2 += 1;
+            }
+            println!("  timer:  ticking ({} -> {} -> {}, {} ms elapsed)",
+                start, now, timer::ticks(), timer::time_ns() / 1_000_000);
+        } else {
+            println!("  timer:  !! no tick after {} spins -- PIT or PIC not delivering", spins);
+        }
+    }
+
+    // Exercise the context switch and timer: two threads alternating
+    extern "C" fn test_worker(id: usize) {
+        let names = ["ping", "pong"];
+        // RSP0 is repointed at this task's own kernel stack on every switch;
+        // verified once by printing it from both tasks and seeing two
+        // different stack tops, each matching its own.
+        debug_assert_eq!(
+            unsafe { tss_x86::kernel_stack() },
+            sched::kernel_stack_top() as u64,
+            "RSP0 does not name the running task's kernel stack",
+        );
+        for i in 1..=5 {
+            println!("  [x86] {} #{}", names[id], i);
+            sched::yield_now();
+        }
+        println!("  [x86] {} done", names[id]);
+    }
+
+    sched::spawn("ping", test_worker, 0);
+    sched::spawn("pong", test_worker, 1);
+
+    println!("Spawned ping/pong. Running scheduler.");
+    // Let the two demo tasks finish before Linux starts, so their output is
+    // not interleaved with the kernel's boot log.
+    for _ in 0..64 {
+        sched::yield_now();
+    }
+
+    // The scheduler's own torture tests, before Linux exists to complicate
+    // the picture. Behind an environment flag because they deliberately
+    // saturate the machine for several seconds, which is not something an
+    // ordinary boot should do.
+    if option_env!("NK_SCHEDTEST").is_some() {
+        schedtest::run();
+    }
+
+
+    // The whole Linux kernel, when it is linked in. Same order as aarch64:
+    // the timer thread and the IRQ thread must exist before the kernel that
+    // will use them, and the watchdog before a boot that might not finish.
+    #[cfg(nk_lkl)]
+    {
+        hostops::start_timer_thread();
+        lklirq::start();
+        sched::spawn("watchdog", watchdog, 0);
+        if lkl::boot() {
+            println!();
+            println!("Linux is up on nk (x86-64). Asking it something:");
+            println!();
+            // LKL's numbers, not x86-64's: `ldk lkl` builds with ARCH=lkl on
+            // both hosts, so the table is asm-generic wherever nk runs. 172 is
+            // getpid there; the x86-64 host number for getpid is 39, and
+            // using it here would have called something else entirely.
+            println!("  getpid()  -> {}", lkl::syscall(172, [0; 6]));
+            println!("  gettid()  -> {}", lkl::syscall(178, [0; 6]));
+            println!("  getuid()  -> {}", lkl::syscall(174, [0; 6]));
+            check_lkl_cpu_addr();
+            lkl::mount_kernel_filesystems();
+
+            // The initrd, into Linux's rootfs, before anything looks for a
+            // program there.
+            if let Some((s, e)) = unsafe { INITRD } {
+                let archive =
+                    unsafe { core::slice::from_raw_parts(s as *const u8, (e - s) as usize) };
+                match user::unpack_initrd(archive) {
+                    Ok(n) => println!("  initrd: {} entries unpacked into Linux's rootfs", n),
+                    Err(e) => println!("  initrd: {} -- ignored", e),
+                }
+            }
+
+            // Ring 3.
+            //
+            // After Linux, not before: the initial stack guard comes from
+            // `getrandom`, and the program itself is read back through the
+            // VFS, so both need a kernel that exists. In its own task because
+            // `user::run` never returns.
+            //
+            // A real ELF from the rootfs, not the hand-written blob that
+            // first proved the transition: `spawn_from_rootfs` is the path
+            // aarch64 uses, so an ordinary statically linked binary is what
+            // gets run rather than something shaped to avoid the loader.
+            println!();
+            match user::spawn_from_rootfs() {
+                Ok(p) => {
+                    println!("  ring3:  entering ring 3 with /nk-init");
+                    // `user::launch`, not a bare `sched::spawn` of `run`:
+                    // launch's entry attaches the task to Linux first, which
+                    // is what gives it a pid, a descriptor table and a
+                    // console. Running `run` directly skipped all three, and
+                    // the process reported `pid 0` -- a task Linux had never
+                    // been told about, whose first file operation would have
+                    // been made by nobody.
+                    user::launch(p, None);
+                }
+                Err(e) => println!("  ring3:  no init to run: {e}"),
+            }
+        } else {
+            println!("  linux:  did not start");
+        }
+    }
+
+    loop {
+        sched::yield_now();
+    }
+}
+
+/// Where boot.s hands over on aarch64. `dtb` is whatever x0 held at reset:
+/// on QEMU's `virt` that is the physical address of the flattened device
+/// tree, which is the whole of what this kernel is told about the machine.
+#[cfg(target_arch = "aarch64")]
 #[no_mangle]
 pub extern "C" fn rust_main(dtb: *const u8) -> ! {
     println!();
@@ -125,7 +536,7 @@ pub extern "C" fn rust_main(dtb: *const u8) -> ! {
     // loaded -- a real init is a couple of megabytes and an ELF is read whole
     // before any of it is mapped -- as well as every bounce buffer a syscall
     // needs. Sixteen was chosen when the largest thing on it was a page table.
-    heap::init(64);
+    heap::init(192);
     selftest::run();
 
     let gic = fdt.find_compatible("arm,gic-v3").expect("no GICv3 in the device tree");
@@ -157,10 +568,21 @@ pub extern "C" fn rust_main(dtb: *const u8) -> ! {
 
     psci::init(&fdt);
 
+    // See the x86 path: the scheduler's units are microseconds, and nothing
+    // it measures means anything until the cycle counter's rate is known.
+    timer::calibrate();
+    schedtrace::start();
+
     println!();
     println!("Stage 1 up. Unmasking interrupts.");
     sched::enable();
     unsafe { core::arch::asm!("msr daifclr, #0xf", options(nomem, nostack)) };
+
+    // See the x86 path. Behind a flag: these saturate the machine for
+    // several seconds on purpose.
+    if option_env!("NK_SCHEDTEST").is_some() {
+        schedtest::run();
+    }
 
     // The whole Linux kernel, when it is linked in: nk stops being the
     // kernel and becomes the machine underneath one.
@@ -187,6 +609,30 @@ pub extern "C" fn rust_main(dtb: *const u8) -> ! {
             println!("  getpid()  -> {}", lkl::syscall(172, [0; 6]));
             println!("  gettid()  -> {}", lkl::syscall(178, [0; 6]));
             println!("  getuid()  -> {}", lkl::syscall(174, [0; 6]));
+            // After the syscalls, not before: lkl_cpu_init assigns lock,
+            // sem and shutdown_sem one after another from LKL's init
+            // thread, which runs concurrently with this one. Printed
+            // earlier, "cpu.sem 0x0" is a race with line 282, not a fact.
+            // "task 44 waits on sem 31" is only a name once 31 has one:
+            // LKL allocates the two back to back, so consecutive ids here
+            // confirm which is which in the graphs.
+            check_lkl_cpu_addr();
+            report_lkl_cpu_identity();
+            lkl::mount_kernel_filesystems();
+
+            // The futex layer must not ask Linux for the time: every
+            // clock_gettime is an LKL entry, which takes the cpu lock, and
+            // the futex paths run from contexts (the timer thread, and the
+            // syscall path of a task about to sleep) where queueing behind
+            // that lock wedges the whole machine -- the renderer reliably
+            // froze with futex-time as the cpu semaphore's last taker and
+            // every later syscall queued behind it. Linux reads that same
+            // time from the host op (host_time -> nk_time_ns), so the value
+            // is available without entering Linux at all; only the realtime
+            // offset -- a constant, nothing in the guest adjusts it -- has
+            // to be learned, once, here, while this boot task is the only
+            // natural entrant.
+            futex::capture_realtime_offset();
 
             // Every virtio transport that has anything behind it, handed to
             // Linux. arch/lkl has no bus to enumerate and no device tree, so
@@ -363,75 +809,144 @@ pub extern "C" fn rust_main(dtb: *const u8) -> ! {
 ///
 /// Used to be four rounds and then `stop()`: a four-second guillotine that
 /// killed every test longer than four seconds mid-syscall and presented as a
-/// kernel wedge. Now it waits for the init task and keeps a generous backstop
-/// so a real deadlock still ends with a wait graph rather than a killed QEMU.
+/// kernel wedge. Then a 600-second backstop with the same flaw at a longer
+/// scale: a desktop session's init *runs forever* (`exec sleep 86400` once
+/// the shell is up), so a flat backstop powered off every healthy session at
+/// exactly ten minutes -- measured as live windows dying while the shell
+/// inside them still worked. The clock cannot tell a working machine from a
+/// wedged one; syscalls can. So the machine is stopped only when init has
+/// exited (the boot-test shape, unchanged) or when no syscall at all was
+/// forwarded for `STALL_LIMIT` consecutive seconds -- a machine that quiet
+/// is stopped whatever the round counter says, and one that keeps making
+/// syscalls is allowed to run indefinitely.
 ///
-/// Two minutes was that backstop until the desktop: WebKit under TCG needs
-/// longer than that to reach a first paint, and the watchdog was stopping a
-/// boot that was making progress. The graph is also the bulk of the console
-/// -- and console output on this machine is a UART, so printing it every
-/// second is itself a large part of what the boot spends its time doing.
-/// So: a long backstop, and after the first half minute a graph only every
-/// thirtieth round. What the graph is for is a machine that has stopped, and
-/// a machine that has stopped looks the same thirty seconds later.
+/// The graph is also the bulk of the console -- and console output on this
+/// machine is a UART, so printing it every second is itself a large part of
+/// what the boot spends its time doing. So after the first half minute a
+/// graph only every thirtieth round -- except while stalled, when the wait
+/// graph is exactly what is wanted, immediately and every round after.
 #[cfg(nk_lkl)]
 extern "C" fn watchdog(_: usize) {
-    const BACKSTOP: u32 = 600;
+    const STALL_LIMIT: u32 = 120;
     let mut round = 0u32;
+    let mut last_activity = crate::syscall::activity();
+    let mut stalled: u32 = 0;
     loop {
+        // A yield loop, not `sleep_ticks`, and deliberately so: this task
+        // also runs `lkl_cpu_release_if_dying` once a round, which is what
+        // clears a CPU label left by a dead LKL thread. Parking the
+        // watchdog on the tick made it miss that entirely and the boot
+        // stopped at the first weston start, every time. `yield_now` halts
+        // when nothing else is runnable, so the idle cost of this is a
+        // wake per tick rather than a spin -- and when something *is*
+        // runnable, this loop is no longer what is keeping the CPU up.
         let until = timer::ticks() + timer::HZ;
         while timer::ticks() < until {
             sched::yield_now();
         }
-        if round >= 30 && round % 30 != 0 && round + 1 < BACKSTOP {
-            round += 1;
-            if sched::init_done() {
-                println!("  watchdog: init finished after {}s", round);
-                break;
-            }
-            continue;
-        }
-        println!();
-        #[cfg(nk_lkl)]
-        report_virtio();
-        #[cfg(nk_lkl)]
-        futex::report();
-        unsafe {
-            println!(
-                "  watchdog {} at {} ticks: armed={} due={} fired={} last_deadline={}",
-                round,
-                timer::ticks(),
-                hostops::N_ARMED,
-                hostops::N_DUE,
-                hostops::N_FIRED,
-                hostops::LAST_DEADLINE
-            );
-        }
-        sched::report();
-        sync::report();
-        crate::syscall::report();
-        unsafe {
-            if sched::LOST_WAKEUPS != 0 {
-                println!("          {} lost wakeups", sched::LOST_WAKEUPS);
-            }
-        }
-        // LKL-side spot check on the last backstop round only (see below):
-        // is the CPU still acquirable from a fresh entry?
-        if round + 1 == BACKSTOP {
-            let pid = crate::lkl::syscall(172, [0; 6]);
-            println!("          watchdog getpid -> {}", pid);
-        }
         round += 1;
+        let activity = crate::syscall::activity();
+        if activity == last_activity {
+            stalled += 1;
+        } else {
+            stalled = 0;
+        }
+        last_activity = activity;
+        // A scheduler switch can hand the CPU label to a Linux task whose
+        // host thread is already dead (change_owner(dead tid) inside LKL's
+        // __switch_to), and from then on nobody can release it: the dying
+        // thread's own exit saw a different owner, and every live caller
+        // fails the equality check for ever. The watchdog runs regardless,
+        // so once a second it clears a dead owner and wakes a sleeper; the
+        // machine heals instead of stopping with the graph above.
+        #[cfg(nk_lkl)]
+        crate::lkl_cpu_release_if_dying(stalled);
+        let (frames_used, frames_total) = crate::frames::stats();
+        if round <= 30 || round % 30 == 0 || stalled != 0 {
+            println!();
+            #[cfg(nk_lkl)]
+            report_virtio();
+            #[cfg(nk_lkl)]
+            report_lkl_cpu();
+            // A stall's first second is the only interesting one: dump the
+            // label's recent transitions then, and again as it deepens.
+            #[cfg(nk_lkl)]
+            if stalled == 1 || stalled == 10 || (stalled != 0 && stalled % 30 == 0) {
+                crate::lkl_cpu_trace_dump(220);
+                crate::lkl_switch_trace_dump(90);
+            }
+            #[cfg(nk_lkl)]
+            futex::report();
+            unsafe {
+                println!(
+                    "  watchdog {} at {} ticks: frames {}/{} armed={} due={} fired={} last_deadline={}",
+                    round,
+                    timer::ticks(),
+                    frames_used,
+                    frames_total,
+                    hostops::N_ARMED,
+                    hostops::N_DUE,
+                    hostops::N_FIRED,
+                    hostops::LAST_DEADLINE
+                );
+            }
+            sched::report();
+            sync::report();
+            crate::syscall::report();
+            crate::reserve::report();
+            crate::heap::report();
+            if round % 10 == 0 {
+                crate::heap::raw_report();
+            }
+            unsafe {
+                if sched::LOST_WAKEUPS != 0 {
+                    println!("          {} lost wakeups", sched::LOST_WAKEUPS);
+                }
+            }
+        }
         if sched::init_done() {
             println!("  watchdog: init finished after {}s", round);
             break;
         }
-        if round >= BACKSTOP {
-            println!("  watchdog: init still running after {}s -- stopping with the graph above", round);
+        if stalled >= STALL_LIMIT {
+            println!(
+                "  watchdog: no syscalls for {}s -- stopping with the graph above",
+                stalled
+            );
             break;
         }
     }
     stop();
+}
+
+/// Print the same reports the watchdog prints, on demand from the guest.
+///
+/// Syscall 999 from any process reaches here; the supervisor calls it the
+/// moment the shell goes silent, because a hung shell never stills the
+/// whole machine (weston and nethosd keep polling), so the watchdog's own
+/// trigger never fires and the wait graph -- the one thing that names the
+/// syscall the dead tasks are parked in -- is printed too late or never.
+pub fn manual_dump() {
+    println!();
+    println!("MANUAL_DUMP_BEGIN");
+    #[cfg(nk_lkl)]
+    {
+        crate::lkl_cpu_trace_dump(120);
+        crate::lkl_switch_trace_dump(60);
+        futex::report();
+    }
+    sched::report();
+    sync::report();
+    #[cfg(nk_lkl)]
+    crate::syscall::report();
+    crate::reserve::report();
+    crate::heap::report();
+    unsafe {
+        if sched::LOST_WAKEUPS != 0 {
+            println!("          {} lost wakeups", sched::LOST_WAKEUPS);
+        }
+    }
+    println!("MANUAL_DUMP_END");
 }
 
 /// Finish: say so, and ask the machine to switch itself off.
@@ -662,6 +1177,426 @@ fn map_vmemmap(ram_base: u64, ram_size: u64) {
 #[cfg(nk_lkl)]
 static mut PROBE: usize = 0;
 
+/// LKL's own CPU lock state, straight from its global.
+///
+/// When the machine wedges, the question that decides everything is "who
+/// holds the CPU": every later syscall queues behind that one fact. LKL
+/// keeps the answer in `cpu.count`/`cpu.owner`/`cpu.sleepers` (cpu.c), and
+/// the owner is `nk thread id + 1` because that is what nk's host ops hand
+/// out -- so the wait graph names the exact task that never came back.
+#[cfg(nk_lkl)]
+#[repr(C)]
+struct LklCpu {
+    lock: *mut u8,
+    shutdown_gate: u32,
+    irqs_pending: bool,
+    sleepers: u32,
+    count: u32,
+    owner: u64,
+    sem: *mut u8,
+    shutdown_sem: *mut u8,
+}
+
+/// The linked address of LKL's `cpu` global (a local symbol: `b cpu`, so it
+/// cannot be named from Rust). Derived with `llvm-nm` on the linked ELF.
+///
+/// This is a hazard: it is a hardcoded address for a symbol the linker is
+/// free to move, and it has gone stale at least once -- an unrelated change
+/// shifted it by 0x800 and nothing said so, because a stale address does not
+/// fault. It reads whatever now lives there as an `LklCpu`, and the wait
+/// graph reports an owner, count and sleeper tally that are entirely
+/// plausible and belong to a different structure.
+///
+/// `check_lkl_cpu_addr` compares it against the offset build.rs read out of
+/// the archive, so a stale constant is reported at boot instead of being
+/// believed.
+///
+/// Per-architecture: the same symbol in the same archive lands at a
+/// different address because nk's own sections are sized differently.
+#[cfg(all(nk_lkl, target_arch = "aarch64"))]
+const LKL_CPU_SEED: usize = 0x0000000040e29eb8;
+#[cfg(all(nk_lkl, target_arch = "x86_64"))]
+const LKL_CPU_SEED: usize = 0x0000000000f51360;
+
+/// Where `cpu` actually is, once `check_lkl_cpu_addr` has confirmed it.
+///
+/// The seed above is only a starting guess. Any edit to nk relinks the image
+/// and moves every file-local bss symbol with it, so a constant is stale the
+/// moment the next build runs -- and a stale one does not fault, it reports a
+/// wait graph belonging to whatever else now lives there. The search below
+/// finds the real one at boot and everything after reads it from here.
+#[cfg(nk_lkl)]
+static mut LKL_CPU_FOUND: usize = LKL_CPU_SEED;
+
+#[cfg(nk_lkl)]
+#[inline]
+fn lkl_cpu_addr() -> usize {
+    unsafe { *(&raw const LKL_CPU_FOUND) }
+}
+
+/// Does `addr` hold something shaped like LKL's `cpu`?
+///
+/// Called after `lkl_start_kernel`, so both semaphores are allocated and
+/// nk's own allocator is the one that made them: a pointer it does not
+/// recognise is not a semaphore, which is a far stronger test than "not
+/// null" and is what makes scanning for the structure safe.
+#[cfg(nk_lkl)]
+fn looks_like_lkl_cpu(addr: usize) -> bool {
+    if addr & 7 != 0 {
+        return false;
+    }
+    let c = unsafe { &*(addr as *const LklCpu) };
+    crate::sync::sem_id(c.sem as *const crate::sync::Semaphore).is_some()
+        && crate::sync::sem_id(c.shutdown_sem as *const crate::sync::Semaphore).is_some()
+        && c.sem != c.shutdown_sem
+        && c.count < 1_000_000
+        && c.sleepers < 1_000_000
+}
+
+/// Verify `LKL_CPU_ADDR` still names LKL's `cpu`.
+///
+/// build.rs records the symbol's offset within lkl.o's bss. The linked
+/// address must sit that far above the start of the bss region LKL's objects
+/// contributed -- not an exact test, since nk's own bss is in there too, but
+/// it catches the case that actually happens: the constant left behind by a
+/// relink while everything else moved.
+#[cfg(nk_lkl)]
+fn check_lkl_cpu_addr() {
+    let off = option_env!("NK_LKL_CPU_BSS_OFFSET")
+        .and_then(|o| usize::from_str_radix(o.trim_start_matches("0x"), 16).ok())
+        .unwrap_or(0);
+
+    // The seed first: when the constant is still right this costs one read.
+    if looks_like_lkl_cpu(LKL_CPU_SEED) {
+        unsafe { LKL_CPU_FOUND = LKL_CPU_SEED };
+        println!("  lkl cpu: address {LKL_CPU_SEED:#x} verified (bss offset {off:#x})");
+        return;
+    }
+
+    // It moved. Sweep outwards from the seed rather than over all of memory:
+    // the symbol travels with nk's bss, which grows and shrinks by kilobytes
+    // between builds, not megabytes -- and a bounded search cannot wander
+    // into a device window and read a register.
+    const REACH: usize = 8 << 20;
+    for delta in (8..REACH).step_by(8) {
+        for addr in [LKL_CPU_SEED.wrapping_add(delta), LKL_CPU_SEED.wrapping_sub(delta)] {
+            if looks_like_lkl_cpu(addr) {
+                unsafe { LKL_CPU_FOUND = addr };
+                println!(
+                    "  lkl cpu: seed {LKL_CPU_SEED:#x} was stale, found at {addr:#x} \
+                     (bss offset {off:#x}) -- update LKL_CPU_SEED"
+                );
+                return;
+            }
+        }
+    }
+    println!("  lkl cpu: !! no `cpu` found near {LKL_CPU_SEED:#x} -- re-derive with llvm-nm");
+}
+
+#[cfg(nk_lkl)]
+fn report_lkl_cpu() {
+    unsafe {
+        let c = &*(lkl_cpu_addr() as *const LklCpu);
+        let owner = c.owner;
+        let task = owner.wrapping_sub(1) as usize;
+        // The state of the owner decides everything after a wedge: a
+        // "blocked" owner is a task that may yet resume (leave it alone),
+        // "gone"/"finished" is a label nobody can release and the watchdog
+        // may repair. Printing it makes the graph self-explaining.
+        let state = match crate::sched::from_uid(task) {
+            None => "gone",
+            Some(t) if crate::sched::finished(t) => "finished",
+            Some(t) if crate::sched::blocked(t) => "blocked",
+            Some(_) => "live",
+        };
+        println!(
+            "  lkl cpu: count {} sleepers {} irqs_pending {} owner {} (uid {:#x}, {})",
+            c.count, c.sleepers, c.irqs_pending as u32, owner, task, state
+        );
+    }
+}
+
+/// Name LKL's two long-lived semaphores by the ids the wait graph prints.
+///
+/// The shapes that matter differ by which one a task is parked on: the CPU
+/// semaphore means "queued for Linux", a thread's `sched_sem` means "inside
+/// LKL's scheduler, waiting to be switched to". Without this line the two
+/// are the same small integer.
+#[cfg(nk_lkl)]
+fn report_lkl_cpu_identity() {
+    unsafe {
+        let c = &*(lkl_cpu_addr() as *const LklCpu);
+        println!(
+            "  lkl sems: cpu.sem {:#x} (id {:?}), shutdown_sem {:#x} (id {:?})",
+            c.sem as usize,
+            crate::sync::sem_id(c.sem as *const crate::sync::Semaphore),
+            c.shutdown_sem as usize,
+            crate::sync::sem_id(c.shutdown_sem as *const crate::sync::Semaphore),
+        );
+    }
+}
+
+/// One sample of LKL's CPU label, taken at every tick.
+///
+/// The dead-owner strand is installed by a single `__switch_to`, and the
+/// one-second watchdog sees only the corpse: owner already dead, every
+/// syscall parked. This ring keeps the transitions -- who held the label,
+/// who was executing when it changed, how many sleepers there were -- so
+/// the watchdog's stall dump contains the switch that did it.
+#[cfg(nk_lkl)]
+#[derive(Clone, Copy)]
+struct CpuTrace {
+    tick: u64,
+    count: u32,
+    owner: u64,
+    sleepers: u32,
+    irqs: u32,
+    cur: u64,
+}
+
+#[cfg(nk_lkl)]
+const CPU_TRACE_LEN: usize = 512;
+
+#[cfg(nk_lkl)]
+static mut CPU_TRACE: [CpuTrace; CPU_TRACE_LEN] = [CpuTrace {
+    tick: 0,
+    count: 0,
+    owner: 0,
+    sleepers: 0,
+    irqs: 0,
+    cur: 0,
+}; CPU_TRACE_LEN];
+#[cfg(nk_lkl)]
+static mut CPU_TRACE_HEAD: usize = 0;
+
+#[cfg(nk_lkl)]
+pub fn lkl_cpu_trace_sample() {
+    unsafe {
+        let c = &*(lkl_cpu_addr() as *const LklCpu);
+        let cur = crate::sched::current_uid() as u64;
+        let head = CPU_TRACE_HEAD;
+        let changed = if head == 0 {
+            true
+        } else {
+            let p = &(*(&raw const CPU_TRACE))[(head - 1) % CPU_TRACE_LEN];
+            p.count != c.count
+                || p.owner != c.owner
+                || p.sleepers != c.sleepers
+                || p.irqs != c.irqs_pending as u32
+                || p.cur != cur
+        };
+        if changed {
+            (*(&raw mut CPU_TRACE))[head % CPU_TRACE_LEN] = CpuTrace {
+                tick: crate::timer::ticks(),
+                count: c.count,
+                owner: c.owner,
+                sleepers: c.sleepers,
+                irqs: c.irqs_pending as u32,
+                cur,
+            };
+            CPU_TRACE_HEAD = head + 1;
+        }
+    }
+}
+
+#[cfg(nk_lkl)]
+pub fn lkl_cpu_trace_dump(n: usize) {
+    unsafe {
+        let head = CPU_TRACE_HEAD;
+        let count = n.min(head).min(CPU_TRACE_LEN);
+        println!("  lkl cpu trace (last {} of {} transitions):", count, head);
+        for i in (head - count)..head {
+            let e = &(*(&raw const CPU_TRACE))[i % CPU_TRACE_LEN];
+            println!(
+                "    t={} count {} sleepers {} irqs {} owner {} (uid {:#x}) cur {:#x}",
+                e.tick,
+                e.count,
+                e.sleepers,
+                e.irqs,
+                e.owner,
+                e.owner.wrapping_sub(1),
+                e.cur
+            );
+        }
+    }
+}
+
+/// One `__switch_to` or `switch_to_host_task` tid write, reported by LKL.
+///
+/// The CPU trace says *when* the dead label appeared; this says who put it
+/// there: prev/next pid and tid, and which nk task was executing at the
+/// time. A `prev_pid` of -1 is a tid assignment (the host task named by
+/// `next_pid` was repointed at `next_tid`), not a switch.
+#[cfg(nk_lkl)]
+#[derive(Clone, Copy)]
+struct SwitchTrace {
+    tick: u64,
+    prev_pid: i32,
+    prev_tid: u64,
+    next_pid: i32,
+    next_tid: u64,
+    cur: u64,
+}
+
+#[cfg(nk_lkl)]
+const SW_TRACE_LEN: usize = 768;
+
+#[cfg(nk_lkl)]
+static mut SW_TRACE: [SwitchTrace; SW_TRACE_LEN] = [SwitchTrace {
+    tick: 0,
+    prev_pid: 0,
+    prev_tid: 0,
+    next_pid: 0,
+    next_tid: 0,
+    cur: 0,
+}; SW_TRACE_LEN];
+#[cfg(nk_lkl)]
+static mut SW_TRACE_HEAD: usize = 0;
+
+#[cfg(nk_lkl)]
+#[no_mangle]
+pub extern "C" fn nk_lkl_switch_trace(
+    prev_pid: i32,
+    prev_tid: usize,
+    next_pid: i32,
+    next_tid: usize,
+) {
+    unsafe {
+        let head = SW_TRACE_HEAD;
+        (*(&raw mut SW_TRACE))[head % SW_TRACE_LEN] = SwitchTrace {
+            tick: crate::timer::ticks(),
+            prev_pid,
+            prev_tid: prev_tid as u64,
+            next_pid,
+            next_tid: next_tid as u64,
+            cur: crate::sched::current_uid() as u64,
+        };
+        SW_TRACE_HEAD = head + 1;
+    }
+}
+
+#[cfg(nk_lkl)]
+#[no_mangle]
+pub extern "C" fn nk_thread_alive(tid: usize) -> i32 {
+    if tid == 0 {
+        return 0;
+    }
+    match crate::sched::from_uid(tid - 1) {
+        Some(t) => (!crate::sched::finished(t)) as i32,
+        None => 0,
+    }
+}
+
+#[cfg(nk_lkl)]
+pub fn lkl_switch_trace_dump(n: usize) {
+    unsafe {
+        let head = SW_TRACE_HEAD;
+        let count = n.min(head).min(SW_TRACE_LEN);
+        println!("  lkl switch trace (last {} of {}):", count, head);
+        for i in (head - count)..head {
+            let e = &(*(&raw const SW_TRACE))[i % SW_TRACE_LEN];
+            let kind = if e.prev_pid < 0 { "tid=" } else { "sw " };
+            println!(
+                "    t={} {} prev pid {} tid {:#x} -> next pid {} tid {:#x} cur {:#x}",
+                e.tick, kind, e.prev_pid, e.prev_tid, e.next_pid, e.next_tid, e.cur
+            );
+        }
+    }
+}
+
+/// Release LKL's CPU when the host thread running on it dies, or repair a
+/// label that names a thread which can never run again.
+///
+/// `lkl_cpu_release` is a local symbol in the archive, so nk cannot call it,
+/// and `lkl_cpu_put_if_owned` refuses whenever the owner label does not match
+/// the caller -- which is exactly what a dying thread sees when the label
+/// names a dead incarnation's id (measured: count 1, owner a uid whose
+/// generation is long gone, irqs_pending 1, every later syscall queued
+/// behind cpu.sem for ever).
+///
+/// Two callers, with different rights:
+///
+///   * the Linux thread trampoline at thread exit (`stalled_seconds` 0):
+///     the caller *is* the owner and is about to stop existing, so this
+///     mirrors `lkl_cpu_drop` -- one count per call, never the whole
+///     nesting, because count > 1 means acquisitions with no other put.
+///   * the watchdog, once a second: the caller is nobody in particular,
+///     so it may only clear a label proven dead -- the task is gone or
+///     finished -- and only when count == 1. A blocked-but-live owner is
+///     deliberately left alone: if it ever wakes it resumes inside Linux,
+///     and letting a second host thread in would run Linux on two stacks
+///     at once, which is silent corruption rather than a wedge.
+///
+/// Interrupts are masked across the update: this is the only writer that
+/// runs without LKL's own mutex (which may itself be held by the dead
+/// context), and on one CPU a masked section is atomic against everything
+/// except the handler, which is also masked.
+#[cfg(nk_lkl)]
+pub fn lkl_cpu_release_if_dying(stalled_seconds: u32) {
+    extern "C" {
+        fn nk_sem_up(s: *mut u8);
+    }
+    unsafe {
+        let c = &mut *(lkl_cpu_addr() as *mut LklCpu);
+        let flags = crate::sync::irq_save();
+        if c.count != 0 && c.owner != 0 {
+            let owner_uid = c.owner as usize - 1;
+            if owner_uid == crate::sched::current_uid() {
+                // The dying thread itself: lkl_cpu_drop's body.
+                c.count -= 1;
+                if c.count == 0 {
+                    if c.sleepers != 0 {
+                        c.sleepers -= 1;
+                        if !c.sem.is_null() {
+                            nk_sem_up(c.sem);
+                        }
+                    }
+                    c.owner = 0;
+                }
+            } else {
+                let owner_state = crate::sched::from_uid(owner_uid);
+                let dead = match owner_state {
+                    None => true,
+                    Some(t) => crate::sched::finished(t),
+                };
+                if dead && c.count == 1 {
+                    let sleepers = c.sleepers;
+                    c.count = 0;
+                    if c.sleepers != 0 {
+                        c.sleepers -= 1;
+                        if !c.sem.is_null() {
+                            nk_sem_up(c.sem);
+                        }
+                    }
+                    c.owner = 0;
+                    crate::sync::irq_restore(flags);
+                    println!(
+                        "  lkl cpu: released dead owner uid {:#x} (sleepers {})",
+                        owner_uid, sleepers
+                    );
+                    return;
+                }
+                if dead {
+                    crate::sync::irq_restore(flags);
+                    println!(
+                        "  lkl cpu: DEAD owner uid {:#x} with count {} -- never flatten nesting, stopping",
+                        owner_uid, c.count
+                    );
+                    return;
+                }
+                let blocked = owner_state.map_or(false, |t| crate::sched::blocked(t));
+                if blocked && stalled_seconds == 10 {
+                    println!(
+                        "  lkl cpu: owner uid {:#x} live but blocked 10s -- not releasing; see the wait graph",
+                        owner_uid
+                    );
+                }
+            }
+        }
+        crate::sync::irq_restore(flags);
+    }
+}
+
 /// What the driver told the device, and what the device says back.
 ///
 /// A blocked probe is invisible from inside Linux -- the task that would have
@@ -677,13 +1612,35 @@ fn report_virtio() {
     }
     unsafe {
         println!(
-            "  virtio {:#x}: status {:#x} intr {:#x} qsel-num {} pfn {:#x} pagesz {}",
+            "  virtio {:#x}: status {:#x} intr {:#x}",
             base,
             crate::mmio::readl(base + 0x70), // Status
             crate::mmio::readl(base + 0x60), // InterruptStatus
-            crate::mmio::readl(base + 0x38), // QueueNum
-            crate::mmio::readl(base + 0x40), // QueuePFN (legacy)
-            crate::mmio::readl(base + 0x28), // GuestPageSize (legacy)
+        );
+        // Queue 0's ring indices: where a stalled request actually stopped.
+        // avail.idx > used.idx means Linux handed the device work it has not
+        // completed -- the stall is in the device or the notify. Equal means
+        // the device finished and the stall is on the Linux side: the
+        // completion interrupt or the wake-up behind it went missing. The
+        // distinction was guesswork without this line.
+        crate::mmio::writel(base + 0x30, 0); // QueueSel = 0
+        let ready = crate::mmio::readl(base + 0x44); // QueueReady (modern)
+        let desc = crate::mmio::readl(base + 0x80) as usize; // QueueDescLow
+        let avail = crate::mmio::readl(base + 0x90) as usize; // QueueDriverLow
+        let used = crate::mmio::readl(base + 0xa0) as usize; // QueueDeviceLow
+        let avail_idx = if avail != 0 {
+            core::ptr::read_volatile((avail + 2) as *const u16)
+        } else {
+            0
+        };
+        let used_idx = if used != 0 {
+            core::ptr::read_volatile((used + 2) as *const u16)
+        } else {
+            0
+        };
+        println!(
+            "          queue0 ready {} desc {:#x} avail {:#x} used {:#x} avail.idx {} used.idx {}",
+            ready, desc, avail, used, avail_idx, used_idx
         );
     }
 }
@@ -734,7 +1691,10 @@ unsafe fn claim_memory(fdt: &dt::Fdt, ram_start: usize, ram_end: usize) {
     extern "C" {
         static __image_end: u8;
     }
+    #[cfg(target_arch = "aarch64")]
     let image_start = 0x4008_0000usize; // where linker.ld links; see boot.s
+    #[cfg(target_arch = "x86_64")]
+    let image_start = 0x0010_0000usize; // 1MB; see linker-x86_64.ld
     let image_end = &raw const __image_end as usize;
 
     // The initial ramdisk sits in RAM like everything else and nothing else
@@ -774,19 +1734,21 @@ unsafe fn claim_memory(fdt: &dt::Fdt, ram_start: usize, ram_end: usize) {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
 fn current_el() -> u64 {
     let el: u64;
     unsafe { core::arch::asm!("mrs {}, CurrentEL", out(reg) el, options(nomem, nostack)) };
     el >> 2
 }
 
-/// Mask interrupts and stop. `wfi` rather than a spin so an emulated CPU is
-/// actually idle -- a busy loop here pins a host core for as long as the
-/// window is open.
+/// Mask interrupts and stop.
 pub fn halt() -> ! {
+    #[cfg(target_arch = "aarch64")]
     unsafe { core::arch::asm!("msr daifset, #0xf", options(nomem, nostack)) };
+    #[cfg(target_arch = "x86_64")]
+    unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
     loop {
-        unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };
+        crate::arch::halt();
     }
 }
 

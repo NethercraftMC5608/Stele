@@ -25,6 +25,7 @@ use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering:
 /// Mask interrupts and report the previous state. Public because every
 /// primitive that has to be safe against an interrupt handler needs it, and
 /// duplicating two instructions per user is how they drift.
+#[cfg(target_arch = "aarch64")]
 pub fn irq_save() -> u64 {
     let daif: u64;
     unsafe {
@@ -33,11 +34,94 @@ pub fn irq_save() -> u64 {
     daif
 }
 
+#[cfg(target_arch = "x86_64")]
+pub fn irq_save() -> u64 {
+    let rflags: u64;
+    unsafe {
+        core::arch::asm!(
+            "pushfq",
+            "pop {}",
+            "cli",
+            out(reg) rflags,
+            options(nomem, nostack)
+        );
+    }
+    rflags
+}
+
 /// # Safety
 /// `flags` came from `irq_save`.
+#[cfg(target_arch = "aarch64")]
 pub unsafe fn irq_restore(flags: u64) {
     core::arch::asm!("msr daif, {}", in(reg) flags, options(nomem, nostack));
 }
+
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn irq_restore(flags: u64) {
+    core::arch::asm!(
+        "push {}",
+        "popfq",
+        in(reg) flags,
+        options(nomem, nostack)
+    );
+}
+
+/// A ticket spinlock for cross-CPU exclusion of short critical sections.
+///
+/// `irq_save` masks the local CPU only. Two CPUs can both hold "the lock"
+/// that is just a masked interrupt, then mutate TASKS, the frame allocator,
+/// or the semaphore registry at once. This lock is the thing that actually
+/// excludes another CPU: tickets give FIFO order so no CPU starves, and the
+/// holder keeps interrupts masked so an interrupt handler on the same CPU
+/// cannot deadlock against the lock its own task holds.
+///
+/// Short sections only -- frame allocation, task table edits, registry
+/// updates. Never held across a block, a switch, or a syscall: spinning
+/// with interrupts masked is burning the whole CPU, and on one CPU it is
+/// also uncontended, so the cost model only matters once APs arrive.
+pub struct Spinlock {
+    next: AtomicU32,
+    now: AtomicU32,
+}
+
+impl Spinlock {
+    pub const fn new() -> Self {
+        Spinlock {
+            next: AtomicU32::new(0),
+            now: AtomicU32::new(0),
+        }
+    }
+
+    /// Take the lock, masking interrupts across the hold.
+    /// Returns the saved IRQ state for `unlock`.
+    pub fn lock(&self) -> u64 {
+        let flags = irq_save();
+        let ticket = self.next.fetch_add(1, SeqCst);
+        let mut spins = 0u32;
+        while self.now.load(SeqCst) != ticket {
+            spins += 1;
+            if spins & 0xfff == 0 {
+                core::hint::spin_loop();
+            }
+            // A lock that never turns is a deadlock, not a slow machine.
+            // Panicking names it; spinning forever hides it behind a hang
+            // whose cause has to be reconstructed from a dead stop.
+            assert!(spins < u32::MAX / 2, "spinlock deadlock: ticket {} never served", ticket);
+        }
+        crate::arch::memory_barrier();
+        flags
+    }
+
+    /// # Safety
+    /// `flags` came from `lock` on this lock, and the caller still holds it.
+    pub unsafe fn unlock(&self, flags: u64) {
+        crate::arch::memory_barrier();
+        self.now.fetch_add(1, SeqCst);
+        irq_restore(flags);
+    }
+}
+
+unsafe impl Sync for Spinlock {}
 
 /// Every semaphore and mutex gets a number, and every blocked task records
 /// which one it is waiting on.
@@ -48,10 +132,19 @@ pub unsafe fn irq_restore(flags: u64) {
 /// the cycle or names the thing nobody raised.
 static mut NEXT_ID: u32 = 1;
 
-const MAX_TRACKED: usize = 64;
+const MAX_TRACKED: usize = 256;
 static mut REGISTRY: [*const Semaphore; MAX_TRACKED] =
     [core::ptr::null(); MAX_TRACKED];
 static mut MUTEXES: [*const Mutex; MAX_TRACKED] = [core::ptr::null(); MAX_TRACKED];
+
+/// Marks an object's storage as belonging to a live object, or to one that
+/// `nk_sem_free`/`nk_mutex_free` has given back. The registry keeps raw
+/// pointers for ever -- it exists for the watchdog, not for allocation --
+/// so without this the report would happily dereference memory the kernel
+/// has handed to something else and print its bytes as semaphore state.
+/// That is exactly how a freed object reads as "corruption".
+const OBJ_LIVE: u64 = 0x5345_4d41_5048_4f52; // "SEMAPHOR"
+const OBJ_FREED: u64 = 0x4652_4545_4453_454d; // "FREEDSEM"
 
 fn next_id() -> u32 {
     unsafe {
@@ -77,6 +170,51 @@ pub fn track(s: &Semaphore) {
             }
         }
         irq_restore(flags);
+    }
+}
+
+/// Forget a semaphore that is about to be freed. Without this the report
+/// keeps dereferencing it, and the bytes the allocator leaves or reuses
+/// read as counters -- a "corrupt" semaphore that never existed.
+pub fn untrack(s: *const Semaphore) {
+    unsafe {
+        let flags = irq_save();
+        let n = &mut *(&raw mut REGISTRY);
+        for slot in n.iter_mut() {
+            if *slot == s {
+                *slot = core::ptr::null();
+                break;
+            }
+        }
+        irq_restore(flags);
+    }
+}
+
+pub fn untrack_mutex(m: *const Mutex) {
+    unsafe {
+        let flags = irq_save();
+        let n = &mut *(&raw mut MUTEXES);
+        for slot in n.iter_mut() {
+            if *slot == m {
+                *slot = core::ptr::null();
+                break;
+            }
+        }
+        irq_restore(flags);
+    }
+}
+
+/// The id of a tracked semaphore, by pointer. For the boot line that names
+/// LKL's `cpu.sem` and `cpu.shutdown_sem` -- "task waits on sem 31" is only
+/// useful once 31 has a name.
+pub fn sem_id(p: *const Semaphore) -> Option<u32> {
+    unsafe {
+        for slot in (*(&raw const REGISTRY)).iter() {
+            if !slot.is_null() && *slot == p {
+                return Some((**slot).id);
+            }
+        }
+        None
     }
 }
 
@@ -107,21 +245,36 @@ pub fn report() {
                 continue;
             }
             let s = &**slot;
-            let (count, waiters) = (s.count.load(SeqCst), s.waiters.load(SeqCst));
-            if waiters != 0 || count != 0 {
+            if !s.alive() {
+                crate::println!(
+                    "          sem   {:<3} STALE registry entry at {:#x} (freed)",
+                    s.id,
+                    *slot as u64
+                );
+                continue;
+            }
+            let (count, w0, w1) = (
+                s.count.load(SeqCst),
+                s.waiters[0].load(SeqCst),
+                s.waiters[1].load(SeqCst),
+            );
+            if w0 != 0 || w1 != 0 || count != 0 {
                 let taker = s.taker.load(SeqCst);
                 let giver = s.giver.load(SeqCst);
                 crate::println!(
-                    "          sem   {:<3} count {:<4} waiters {:#018b} ups {} downs {} last taken by uid {} slot {} given by uid {} slot {}",
+                    "          sem   {:<3}@{:#x} count {:<4} waiters [{:#018b}, {:#018b}] ups {} downs {} last taken by uid {} slot {} given by uid {} slot {} site {:#x}",
                     s.id,
+                    *slot as u64,
                     count,
-                    waiters,
+                    w0,
+                    w1,
                     s.ups.load(SeqCst),
                     s.downs.load(SeqCst),
                     taker as i64,
                     if taker == u64::MAX { -1 } else { (taker & 0xffff) as i64 },
                     giver as i64,
-                    if giver == u64::MAX { -1 } else { (giver & 0xffff) as i64 }
+                    if giver == u64::MAX { -1 } else { (giver & 0xffff) as i64 },
+                    s.site()
                 );
             }
         }
@@ -130,16 +283,24 @@ pub fn report() {
                 continue;
             }
             let m = &**slot;
-            let waiters = m.waiters.load(SeqCst);
-            if waiters != 0 || m.owner().is_some() {
+            if !m.alive() {
+                crate::println!(
+                    "          mutex {:<3} STALE registry entry at {:#x} (freed)",
+                    m.id,
+                    *slot as u64
+                );
+                continue;
+            }
+            let (w0, w1) = (m.waiters[0].load(SeqCst), m.waiters[1].load(SeqCst));
+            if w0 != 0 || w1 != 0 || m.owner().is_some() {
                 match m.owner() {
                     Some(o) => crate::println!(
-                        "          mutex {:<3} held by task {:<2} depth {}  waiters {:#018b}",
-                        m.id, o, m.depth.load(SeqCst), waiters
+                        "          mutex {:<3}@{:#x} held by task {:<2} depth {}  waiters [{:#018b}, {:#018b}]",
+                        m.id, *slot as u64, o, m.depth.load(SeqCst), w0, w1
                     ),
                     None => crate::println!(
-                        "          mutex {:<3} free            waiters {:#018b}",
-                        m.id, waiters
+                        "          mutex {:<3}@{:#x} free            waiters [{:#018b}, {:#018b}]",
+                        m.id, *slot as u64, w0, w1
                     ),
                 }
             }
@@ -163,8 +324,13 @@ pub fn report() {
 /// where every thread is blocked. Nothing reports it.
 pub struct Semaphore {
     pub id: u32,
+    /// Set by `nk_sem_alloc` once the box has an address, so the registry
+    /// can tell "this pointer is still the object it named".
+    self_ptr: AtomicU64,
+    /// `OBJ_LIVE` until `nk_sem_free`, then `OBJ_FREED`. See the constants.
+    magic: AtomicU64,
     count: AtomicI32,
-    waiters: AtomicU64,
+    waiters: [AtomicU64; 2],
     /// Lifetime totals. The watchdog prints them for any semaphore with a
     /// waiter: `ups` counted but the waiter still there means the wake went
     /// somewhere else (or nowhere); no `ups` at all means nobody left is in
@@ -179,38 +345,109 @@ pub struct Semaphore {
     /// stopped, not which one is standing on the thing they want.
     taker: AtomicU64,
     giver: AtomicU64,
+    /// Rotation cursor: the waiter woken last, so the next `up` resumes the
+    /// scan after it. See `up` for why lowest-bit wakes are not enough.
+    last_woken: AtomicU32,
+    /// Where nk_sem_alloc was called from (the return address at entry).
+    /// LKL allocates its semaphores from a dozen different call sites and
+    /// the wait graph only ever prints the small integer id, so "task 44
+    /// waiting on sem 88" names nothing. The raw address is resolved
+    /// against libnklkl.a on the host after the run.
+    site: AtomicU64,
+}
+
+/// The return address of the caller, for `site` above. `nomem, nostack`
+/// because reading a register is the whole of it.
+#[inline(never)]
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn caller_pc() -> u64 {
+    let r: u64;
+    unsafe { core::arch::asm!("mov {}, x30", out(reg) r, options(nomem, nostack)) };
+    r
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn caller_pc() -> u64 {
+    // The call instruction pushed the return address; it is the word at
+    // the top of the stack on entry to this function.
+    let r: u64;
+    unsafe { core::arch::asm!("mov {}, [rsp]", out(reg) r, options(nomem, nostack)) };
+    r
 }
 
 impl Semaphore {
     pub fn new(count: i32) -> Self {
         Semaphore {
             id: next_id(),
+            self_ptr: AtomicU64::new(0),
+            magic: AtomicU64::new(OBJ_LIVE),
             count: AtomicI32::new(count),
-            waiters: AtomicU64::new(0),
+            waiters: [AtomicU64::new(0), AtomicU64::new(0)],
             ups: AtomicU64::new(0),
             downs: AtomicU64::new(0),
             taker: AtomicU64::new(u64::MAX),
             giver: AtomicU64::new(u64::MAX),
+            last_woken: AtomicU32::new(0),
+            site: AtomicU64::new(0),
         }
     }
 
     pub fn down(&self) {
+        let me = sched::current_id();
+        let me_mask = 1u64 << (me % 64);
         loop {
             let flags = irq_save();
             let count = self.count.load(SeqCst);
             if count > 0 {
                 self.count.store(count - 1, SeqCst);
                 self.taker.store(sched::current_uid() as u64, SeqCst);
+                // Taking the token ends this task's interest in the
+                // semaphore, so drop the waiter bit even though the wake
+                // that raced the block means it was never re-armed.
+                // Leaving it set is how a later `up` finds a "waiter"
+                // that is not waiting and loses the wake on it.
+                self.waiters[me / 64].fetch_and(!me_mask, SeqCst);
                 unsafe { irq_restore(flags) };
                 return;
             }
-            self.waiters.fetch_or(1u64 << sched::current_id(), SeqCst);
+            self.waiters[me / 64].fetch_or(1u64 << (me % 64), SeqCst);
             self.downs.fetch_add(1, SeqCst);
-            // Marks this task blocked, restores `flags`, and switches away.
-            // An `up` arriving after the bit is set but before the switch
-            // finds the task already blocked and makes it ready again.
-            sched::block_on(flags, self.id);
+            // Marks this task blocked, restores `flags`, and switches away
+            // -- but only after re-checking the count under the scheduler
+            // lock. An `up` that landed after the waiter bit was set (and so
+            // while this task still read as Running, refusing its wake) is
+            // seen here as a token, and this task does not sleep through it.
+            // Without the re-check both partners of a ping-pong can block on
+            // each other, each having lost the other's wake.
+            sched::block_on_cond(flags, self.id, || self.count.load(SeqCst) > 0);
         }
+    }
+
+    /// Set the allocation call site. See the field.
+    pub fn set_site(&self, site: u64) {
+        self.site.store(site, SeqCst);
+    }
+
+    /// Set the address of the object this is, for the registry's identity
+    /// check. Called once, right after the box is placed.
+    pub fn set_self(&self, p: *const Semaphore) {
+        self.self_ptr.store(p as u64, SeqCst);
+    }
+
+    pub fn alive(&self) -> bool {
+        self.magic.load(SeqCst) == OBJ_LIVE
+    }
+
+    /// Called by `nk_sem_free` before the storage goes back. Any straggler
+    /// read after this must see a freed object, not whatever the allocator
+    /// puts in the same memory next.
+    pub fn poison(&self) {
+        self.magic.store(OBJ_FREED, SeqCst);
+    }
+
+    /// Where this semaphore was allocated, for the watchdog's wait graph.
+    pub fn site(&self) -> u64 {
+        self.site.load(SeqCst)
     }
 
     pub fn up(&self) {
@@ -227,19 +464,40 @@ impl Semaphore {
         // again. The bookkeeping inflates, the ups and downs stop matching,
         // and the result is a set of threads that are each certain somebody
         // else holds the thing they are waiting for.
-        let waiting = self.waiters.load(SeqCst);
-        let woken = if waiting != 0 {
-            let id = waiting.trailing_zeros();
-            self.waiters.fetch_and(!(1u64 << id), SeqCst);
-            Some(id as usize)
-        } else {
-            None
-        };
+        //
+        // And exactly one waiter in rotation, not the lowest-numbered one:
+        // lowest-bit wakes starve higher-numbered waiters when a lower one
+        // re-queues constantly -- measured on the render boot, a WebKit
+        // thread polling gettimeofday sat on the CPU semaphore's lowest bit
+        // while the network process queued behind it for seven million
+        // slices. The scan resumes after the last waiter woken, so every
+        // waiter is reached before any waiter is woken twice.
+        //
+        // A set bit is not proof of a waiter: the bit can be stale, left
+        // by a task that took a token after a racing wake or that was
+        // woken out of this `down` by a signal and now blocks elsewhere.
+        // Clearing the bit and stopping there would strand the token in
+        // `count` while a real waiter slept -- a lost wake with no trace.
+        // So clear, try to wake, and keep scanning only while the wake
+        // was refused.
+        let mut woken = None;
+        let start = self.last_woken.load(SeqCst) as usize;
+        for step in 1..=128usize {
+            let bit = (start + step) % 128;
+            let idx = bit / 64;
+            let mask = 1u64 << (bit % 64);
+            if self.waiters[idx].load(SeqCst) & mask != 0 {
+                self.waiters[idx].fetch_and(!mask, SeqCst);
+                if sched::wake_on(bit, self.id) {
+                    woken = Some(bit);
+                    break;
+                }
+            }
+        }
         unsafe { irq_restore(flags) };
         if let Some(id) = woken {
-            // Targeted: this task is blocked in *this* primitive, and a
-            // task blocked in some other one is none of our business.
-            sched::wake_on(id, self.id);
+            self.last_woken.store(id as u32, SeqCst);
+            sched::yield_now();
         }
     }
 }
@@ -254,21 +512,37 @@ const NO_OWNER: usize = usize::MAX;
 
 pub struct Mutex {
     pub id: u32,
+    /// See `Semaphore::magic`: the diagnostics registry holds the pointer
+    /// past the object's life, so the object says when it has ended.
+    magic: AtomicU64,
     owner: AtomicUsize,
     depth: AtomicU32,
     recursive: bool,
-    waiters: AtomicU64,
+    waiters: [AtomicU64; 2],
+    /// Rotation cursor, as in `Semaphore::last_woken`.
+    last_woken: AtomicU32,
 }
 
 impl Mutex {
     pub fn new(recursive: bool) -> Self {
         Mutex {
             id: next_id(),
+            magic: AtomicU64::new(OBJ_LIVE),
             owner: AtomicUsize::new(NO_OWNER),
             depth: AtomicU32::new(0),
             recursive,
-            waiters: AtomicU64::new(0),
+            waiters: [AtomicU64::new(0), AtomicU64::new(0)],
+            last_woken: AtomicU32::new(0),
         }
+    }
+
+    pub fn alive(&self) -> bool {
+        self.magic.load(SeqCst) == OBJ_LIVE
+    }
+
+    /// See `Semaphore::poison`.
+    pub fn poison(&self) {
+        self.magic.store(OBJ_FREED, SeqCst);
     }
 
     pub fn owner(&self) -> Option<usize> {
@@ -286,6 +560,9 @@ impl Mutex {
             if owner == NO_OWNER {
                 self.owner.store(me, SeqCst);
                 self.depth.store(1, SeqCst);
+                // See `Semaphore::down`: a taken lock ends the interest,
+                // and a stale bit here would eat a later unlock's wake.
+                self.waiters[me / 64].fetch_and(!(1u64 << (me % 64)), SeqCst);
                 unsafe { irq_restore(flags) };
                 return;
             }
@@ -298,8 +575,27 @@ impl Mutex {
                 unsafe { irq_restore(flags) };
                 return;
             }
-            self.waiters.fetch_or(1u64 << me, SeqCst);
-            sched::block_on(flags, self.id);
+            self.waiters[me / 64].fetch_or(1u64 << (me % 64), SeqCst);
+            // Predicate: `owner == NO_OWNER` (the unlock has landed).
+            // Protected by: `owner`, an atomic; the runqueue lock is the
+            //   thing that makes "check and sleep" atomic against the
+            //   waker, which reaches this mutex only through `wake_on`.
+            // Published: `unlock` stores NO_OWNER *before* it scans the
+            //   waiters bitmask and calls `wake_on`; the store is a SeqCst
+            //   RMW-free store and the waker's `wake_on` then acquires
+            //   RUNQUEUE, so the release/acquire pair makes the store
+            //   visible to anyone who gets the lock afterwards.
+            // Ordering: unlock's store happens-before its RUNQUEUE acquire,
+            //   which happens-before our RUNQUEUE acquire here.
+            // Why the re-check closes it: an unlock that lands between our
+            //   arming this bit and our choosing to sleep is seen right here
+            //   -- owner is NO_OWNER, so we never set Blocked and retry the
+            //   fast path. An unlock after we are Blocked finds us Blocked
+            //   in `wake_on` and wakes us. There is no interleaving in
+            //   which the unlock is neither seen nor woken on, which was
+            //   exactly the failure of the unconditional `block_on`: it set
+            //   Blocked *after* the wake had already been refused.
+            sched::block_on_cond(flags, self.id, || self.owner.load(SeqCst) == NO_OWNER);
         }
     }
 
@@ -312,20 +608,27 @@ impl Mutex {
         self.owner.store(NO_OWNER, SeqCst);
         // One waiter here too: only one of them can take the mutex, and
         // waking the rest to discover that is churn a single-CPU scheduler
-        // pays for in full.
-        let waiting = self.waiters.load(SeqCst);
-        let woken = if waiting != 0 {
-            let id = waiting.trailing_zeros();
-            self.waiters.fetch_and(!(1u64 << id), SeqCst);
-            Some(id as usize)
-        } else {
-            None
-        };
+        // pays for in full. In rotation, for the same starvation reason as
+        // `Semaphore::up` -- and like there, a refused wake (stale bit)
+        // must not end the scan, or the unlock lands on nobody.
+        let mut woken = None;
+        let start = self.last_woken.load(SeqCst) as usize;
+        for step in 1..=128usize {
+            let bit = (start + step) % 128;
+            let idx = bit / 64;
+            let mask = 1u64 << (bit % 64);
+            if self.waiters[idx].load(SeqCst) & mask != 0 {
+                self.waiters[idx].fetch_and(!mask, SeqCst);
+                if sched::wake_on(bit, self.id) {
+                    woken = Some(bit);
+                    break;
+                }
+            }
+        }
         unsafe { irq_restore(flags) };
         if let Some(id) = woken {
-            // Targeted: this task is blocked in *this* primitive, and a
-            // task blocked in some other one is none of our business.
-            sched::wake_on(id, self.id);
+            self.last_woken.store(id as u32, SeqCst);
+            sched::yield_now();
         }
     }
 }

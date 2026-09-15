@@ -43,6 +43,10 @@ unsigned long nk_thread_self(void);
 void nk_thread_exit(void);
 int nk_thread_join(unsigned long id);
 
+void nk_lkl_switch_trace(int prev_pid, unsigned long long prev_tid, int next_pid,
+			 unsigned long long next_tid);
+int nk_thread_alive(unsigned long long tid);
+
 unsigned long nk_tls_alloc(void (*destructor)(void *));
 void nk_tls_free(unsigned long key);
 int nk_tls_set(unsigned long key, void *value);
@@ -113,6 +117,21 @@ static lkl_thread_t host_thread_create(void (*f)(void *), void *arg)
 
 static void host_thread_detach(void) { }
 static void host_thread_exit(void) { nk_thread_exit(); }
+
+/*
+ * Every CPU-owner install and every host-task tid assignment, kept in an
+ * nk ring. The dead-owner strand is installed by one switch -- this is how
+ * the graph shows which, and which host thread was executing at the time.
+ */
+static void host_switch_trace(int prev_pid, unsigned long long prev_tid,
+			      int next_pid, unsigned long long next_tid)
+{
+	nk_lkl_switch_trace(prev_pid, prev_tid, next_pid, next_tid);
+}
+static int host_thread_alive(lkl_thread_t tid)
+{
+	return nk_thread_alive((unsigned long long)tid);
+}
 static int host_thread_join(lkl_thread_t tid)
 {
 	return nk_thread_join((unsigned long)tid - 1);
@@ -306,6 +325,9 @@ struct lkl_host_operations lkl_host_ops = {
 	.memcpy = memcpy,
 	.memset = memset,
 	.memmove = memmove,
+
+	.switch_trace = host_switch_trace,
+	.thread_alive = host_thread_alive,
 };
 
 /* Two of lkl.o's five undefined symbols. The other three are the compiler's

@@ -92,8 +92,16 @@ fn map_device_shared(fd: i64, offset: u64, len: u64, at: u64,
     let flags = crate::sync::irq_save();
     let idx = unsafe {
         let devices = &mut *(&raw mut DEVICES);
-        let idx = devices.len();
-        devices.push(Some(DeviceRegion { linux, len, root, at }));
+        // A released device slot is `None`; reuse it, for the same reason
+        // `REGIONS` reuses released slots.
+        let idx = match devices.iter().position(|s| s.is_none()) {
+            Some(slot) => slot,
+            None => {
+                devices.push(None);
+                devices.len() - 1
+            }
+        };
+        devices[idx] = Some(DeviceRegion { linux, len, root, at });
         idx
     };
     unsafe { crate::sync::irq_restore(flags); }
@@ -153,8 +161,8 @@ fn file_key(fd: i64) -> Result<(u64, u64), i64> {
     if rc < 0 {
         return Err(rc);
     }
-    let dev = u64::from_le_bytes(st[8..16].try_into().unwrap());
-    let ino = u64::from_le_bytes(st[16..24].try_into().unwrap());
+    let dev = u64::from_le_bytes(st[0..8].try_into().unwrap());
+    let ino = u64::from_le_bytes(st[8..16].try_into().unwrap());
     Ok((dev, ino))
 }
 
@@ -278,7 +286,7 @@ pub fn map_shared(
         // fds never leak into children -- and below the 1024 file limit, so
         // the duplication cannot fail for want of room.
         let owned = lkl::syscall(25, [fd, 0, 512, 0, 0, 0]);
-        regions.push(Region {
+        let region = Region {
             key,
             base: offset,
             fd: if owned < 0 { -1 } else { owned },
@@ -286,8 +294,21 @@ pub fn map_shared(
             pages,
             refs: 1,
             dirty: writable,
-        });
-        regions.len() - 1
+        };
+        // Reuse a released slot when there is one. Indices must stay stable
+        // while a mapping lives, but a region at refs 0 is never looked up
+        // again -- and a fresh slot per mapping grows the Vec without bound
+        // under WebKit's shared-memory churn.
+        match regions.iter().position(|r| r.refs == 0) {
+            Some(slot) => {
+                regions[slot] = region;
+                slot
+            }
+            None => {
+                regions.push(region);
+                regions.len() - 1
+            }
+        }
     };
 
     // Map the pool's pages into the caller: the same physical pages every
@@ -298,7 +319,7 @@ pub fn map_shared(
     // and clearing it turns a readable page into an EL0 permission fault
     // (DFSC 0b001111; measured 2026-09-08 on a wl_shm pool read).
     let root = crate::user::current_ttbr0_pub();
-    for (i, page) in unsafe { (&*(&raw const REGIONS))[idx].pages.iter().enumerate() } {
+    for (i, page) in unsafe { (&*(&raw const REGIONS))[idx].pages.iter().take((len / 4096) as usize).enumerate() } {
         unsafe {
             paging::map_user_permissions(
                 root,
@@ -338,19 +359,32 @@ pub fn map_anonymous_shared(len: u64, at: u64, writable: bool, executable: bool,
     let regions = unsafe { &mut *(&raw mut REGIONS) };
     // Anonymous regions share no key: (dev, ino) of nothing. Key them
     // (0, base-address-of-pool-entry) so they never collide with a file.
-    let key = (0u64, regions.len() as u64 | (1 << 63));
-    regions.push(Region {
-        key,
+    // The slot is chosen the same way `map_shared` chooses one: a released
+    // region's slot is dead and reused rather than growing the Vec.
+    let region = Region {
+        key: (0, 0),
         base: 0,
         fd: -1,
         size: u64::MAX,
         pages,
         refs: 1,
         dirty: false,
-    });
-    let idx = regions.len() - 1;
+    };
+    let idx = match regions.iter().position(|r| r.refs == 0) {
+        Some(slot) => {
+            regions[slot] = region;
+            slot
+        }
+        None => {
+            regions.push(region);
+            regions.len() - 1
+        }
+    };
+    // Keyed after placement: (0, index) is unique whether the slot was new
+    // or reused, and every live region's key stays distinct.
+    regions[idx].key = (0u64, idx as u64 | (1 << 63));
     let root = crate::user::current_ttbr0_pub();
-    for (i, page) in unsafe { (&*(&raw const REGIONS))[idx].pages.iter().enumerate() } {
+    for (i, page) in unsafe { (&*(&raw const REGIONS))[idx].pages.iter().take((len / 4096) as usize).enumerate() } {
         unsafe {
             paging::map_user_permissions(
                 root,
@@ -486,6 +520,12 @@ pub fn release(idx: usize, fd_hint: i64) {
         for p in r.pages.drain(..) {
             frames::free(p);
         }
+        // The Vec's own buffer is the region's bookkeeping, and `drain`
+        // leaves it attached to a slot that will never be used again: one
+        // leaked allocation per file ever mapped, which under WebKit's
+        // shared-memory churn is megabytes a second until the kernel heap
+        // (64 MiB) is gone and every later allocation fails. Drop it.
+        r.pages = Vec::new();
         if r.fd >= 0 {
             lkl::syscall(57, [r.fd, 0, 0, 0, 0, 0]);
             r.fd = -1;
@@ -523,6 +563,23 @@ pub fn release_anon(idx: usize) {
         for p in r.pages.drain(..) {
             frames::free(p);
         }
+        // See `release`: the slot stays for stable indices, but its buffer
+        // must not.
+        r.pages = Vec::new();
+    }
+}
+
+/// Retain a shared region (e.g. across fork).
+pub fn retain(idx: usize) {
+    #[cfg(nk_lkl)]
+    if idx & DEVICE_REGION != 0 {
+        return;
+    }
+    unsafe {
+        let regions = &mut *(&raw mut REGIONS);
+        if let Some(r) = regions.get_mut(idx) {
+            r.refs += 1;
+        }
     }
 }
 
@@ -533,6 +590,132 @@ pub fn release_anon(idx: usize) {
 pub fn map_shared(_fd: i64, _offset: u64, _len: u64, _at: u64, _writable: bool,
                   _executable: bool, _prot_none: bool) -> Result<usize, i64> {
     Err(-38)
+}
+
+#[cfg(not(nk_lkl))]
+pub fn grow_shared(_idx: usize, _at: u64, _new_len: u64, _writable: bool,
+                   _executable: bool, _prot_none: bool) -> Result<usize, i64> {
+    Err(-38)
+}
+
+/// Move a shared mapping to `at` at the new length, keeping the region's
+/// pages: `mremap` is a move of a mapping, not a re-read of the file. The
+/// bytes this or any other holder wrote through their mappings live in the
+/// region's frames -- the file on disk does not have them until writeback,
+/// so re-mapping from the fd would hand back a pool of silent zeros.
+///
+/// When the new length reaches past the region, the region is extended in
+/// place: fresh zeroed frames for the growth, filled from the file for as
+/// far as it is file-backed (a pool the client `ftruncate`d to grow reads
+/// back zeros there, which is what the tail of a grown pool is). Every
+/// holder's existing mapping keeps aliasing the same region, so the
+/// wl_shm contract holds: what one holder writes, the next resize maps.
+#[cfg(nk_lkl)]
+pub fn grow_shared(
+    idx: usize,
+    at: u64,
+    new_len: u64,
+    writable: bool,
+    executable: bool,
+    prot_none: bool,
+) -> Result<usize, i64> {
+    #[repr(C)]
+    struct IoVec {
+        base: u64,
+        len: u64,
+    }
+    let root = crate::user::current_ttbr0_pub();
+    let regions = unsafe { &mut *(&raw mut REGIONS) };
+    if idx >= regions.len() || regions[idx].refs == 0 {
+        return Err(-9); // -EBADF: no live region behind this mapping
+    }
+    let want = (new_len / 4096) as usize;
+    let old_pages = regions[idx].pages.len();
+    if want > old_pages {
+        // The file may have grown since the region was made (the pool
+        // client's ftruncate). Read the growth's file-backed prefix; the
+        // rest of the new frames stay zero, which past-EOF always is.
+        let owned = regions[idx].fd;
+        let mut st = [0u8; 128];
+        let rc = if owned >= 0 {
+            lkl::syscall(80, [owned, st.as_mut_ptr() as i64, 0, 0, 0, 0])
+        } else {
+            -1
+        };
+        let size = if rc >= 0 { file_size(&st) } else { regions[idx].size };
+        let base = regions[idx].base;
+        let mut extra: Vec<*mut u8> = Vec::with_capacity(want - old_pages);
+        for _ in old_pages..want {
+            let Some(page) = frames::alloc() else {
+                for p in extra {
+                    unsafe { frames::free(p) };
+                }
+                return Err(-12);
+            };
+            extra.push(page);
+        }
+        let file_end = base.saturating_add(new_len).min(size);
+        let mut done = 0usize; // bytes of the growth read so far
+        while base + ((old_pages + done) as u64) * 4096 < file_end {
+            let first = base + ((old_pages + done) as u64) * 4096;
+            let n = ((file_end - first).div_ceil(4096) as usize).min(256).min(want - old_pages - done);
+            let iov: Vec<IoVec> = extra[done..done + n]
+                .iter()
+                .map(|p| IoVec {
+                    base: *p as u64,
+                    len: 4096,
+                })
+                .collect();
+            let rc = lkl::syscall(69, [
+                owned,
+                iov.as_ptr() as i64,
+                iov.len() as i64,
+                first as i64,
+                0,
+                0,
+            ]);
+            if rc <= 0 {
+                break; // short or failed read: zeros, which past-EOF is
+            }
+            done += rc as usize / 4096;
+            if rc as usize % 4096 != 0 {
+                break;
+            }
+        }
+        // A tight window: the Vec may move while it grows, so nothing may
+        // walk this region's pages between extend and the map loop below.
+        regions[idx].pages.extend(extra);
+        regions[idx].size = size.max(regions[idx].size);
+    }
+    regions[idx].refs += 1;
+    if writable {
+        regions[idx].dirty = true;
+    }
+    for (i, page) in regions[idx].pages.iter().take(want).enumerate() {
+        unsafe {
+            paging::map_user_permissions(
+                root,
+                at + i as u64 * 4096,
+                *page as u64,
+                4096,
+                executable,
+                writable,
+            );
+        }
+    }
+    if !writable && !executable && prot_none {
+        unsafe {
+            paging::protect_user_none(root, at, new_len);
+        }
+    }
+    Ok(idx)
+}
+
+/// The file offset a region was mapped at. `mremap` re-maps the same file
+/// and offset, so the region lookup lands on the same pages -- including
+/// any a client has meanwhile grown the pool to hold.
+pub fn region_base(idx: usize) -> u64 {
+    unsafe { (&*(&raw const REGIONS)).get(idx).map_or(0, |r| r.base) }
 }
 
 #[cfg(not(nk_lkl))]

@@ -72,6 +72,62 @@ fn clock_ns(realtime: bool) -> Result<i64, i64> {
     Ok(ts[0].saturating_mul(1_000_000_000).saturating_add(ts[1]))
 }
 
+/// realtime - monotonic, in nanoseconds, learned once at boot.
+///
+/// Nothing in the guest adjusts the wall clock, so this is a constant. It is
+/// captured while the boot task is the only natural entrant because reading
+/// it costs an LKL entry, and an LKL entry takes the cpu lock: doing it
+/// lazily from a `clock_gettime` would queue every later syscall behind it.
+static mut REALTIME_OFFSET_NS: i64 = 0;
+static mut REALTIME_OFFSET_VALID: bool = false;
+
+/// Learn the realtime offset. Call once, from the boot task, after Linux is
+/// up and before user space exists.
+pub fn capture_realtime_offset() {
+    let (Ok(real), Ok(mono)) = (clock_ns(true), clock_ns(false)) else {
+        crate::println!("  futex: could not read the clocks; clock_gettime will go to Linux");
+        return;
+    };
+    unsafe {
+        REALTIME_OFFSET_NS = real.saturating_sub(mono);
+        REALTIME_OFFSET_VALID = true;
+    }
+    crate::println!(
+        "  futex: clock offsets captured at boot: monotonic {}s realtime {}s",
+        mono / 1_000_000_000,
+        real / 1_000_000_000,
+    );
+}
+
+/// Answer `clock_gettime` without entering Linux, when nk can.
+///
+/// `None` means "not answerable here" and the caller must forward: an
+/// unknown clock, or the offset never learned. Every LKL entry takes the cpu
+/// lock, so a process polling the clock in a loop otherwise serialises
+/// itself against the whole kernel.
+pub fn clock_for_syscall(clock: u64) -> Option<i64> {
+    // 0 = CLOCK_REALTIME, 1 = CLOCK_MONOTONIC. The coarse variants (5, 6)
+    // are the same answer with a weaker promise, which this satisfies.
+    let realtime = match clock {
+        0 | 5 => true,
+        1 | 6 => false,
+        _ => return None,
+    };
+    let mono = crate::timer::time_ns() as i64;
+    if mono == 0 {
+        return None;
+    }
+    if !realtime {
+        return Some(mono);
+    }
+    unsafe {
+        if !REALTIME_OFFSET_VALID {
+            return None;
+        }
+        Some(mono.saturating_add(REALTIME_OFFSET_NS))
+    }
+}
+
 static mut TIMER_TASK: Option<usize> = None;
 static mut TIMER_DUE: bool = false;
 
@@ -88,7 +144,17 @@ extern "C" fn timer_thread(_: usize) {
     loop {
         let flags = irq_save();
         if !unsafe { core::mem::replace(&mut *(&raw mut TIMER_DUE), false) } {
-            sched::block_on(flags, 0);
+            // Predicate: TIMER_DUE (a tick has something for this thread).
+            // Protected by: the runqueue lock, so the "already taken, now
+            //   sleep" decision cannot straddle the tick that re-sets it.
+            // Published: `tick()` stores TIMER_DUE = true before
+            //   `wake_on(TIMER_TASK)`, which acquires the lock, so the store
+            //   is ordered ahead of the wake.
+            // Why the re-check closes it: a tick between the take above and
+            //   the block would previously be refused (this task still read
+            //   as Running) and then slept through; here the re-check sees
+            //   the flag and loops to take it instead of sleeping.
+            sched::block_on_cond(flags, 0, || unsafe { *(&raw const TIMER_DUE) });
             continue;
         }
         let snapshot = unsafe { *(&raw const WAITERS) };
@@ -117,9 +183,7 @@ extern "C" fn timer_thread(_: usize) {
 
 /// The address space a futex belongs to.
 fn space() -> u64 {
-    let v: u64;
-    unsafe { core::arch::asm!("mrs {}, ttbr0_el1", out(reg) v, options(nomem, nostack)) };
-    crate::paging::table_of(v)
+    crate::paging::table_of(crate::arch::current_page_table())
 }
 
 /// # futex(uaddr, op, val, timeout, uaddr2, val3)
@@ -215,13 +279,22 @@ fn wait(uaddr: u64, val: u32, bits: u32, deadline: Option<(bool, i64)>) -> i64 {
         slot
     };
 
-    // Not blocked if a wake already happened: `woken` is set with interrupts
-    // masked, so this test cannot miss one.
-    if !unsafe { (*(&raw const WAITERS))[slot].woken } {
-        sched::block_on(flags, 0);
-    } else {
-        unsafe { irq_restore(flags) };
-    }
+    // Not blocked if a wake already happened.
+    //
+    // The old comment here claimed an interrupt mask was enough -- "`woken`
+    // is set with interrupts masked, so this test cannot miss one". That is
+    // true only against handlers on this CPU. A `futex_wake` on another CPU
+    // sets `woken` and calls `sched::wake`, which refuses a task that is not
+    // yet Blocked; this task would then set Blocked and sleep through it.
+    // Predicate: WAITERS[slot].woken.
+    // Protected by: the runqueue lock taken inside `block_on_cond`, which is
+    //   the same lock `wake` acquires, plus the slot itself.
+    // Published: `futex_wake` stores `woken = true` (and clears `deadline`)
+    //   before `sched::wake`, whose lock acquire orders the store ahead.
+    // Why the re-check closes it: a wake between the test above and the
+    //   sleep makes the predicate true here, so this task does not sleep;
+    //   a wake after it is Blocked is delivered by `sched::wake`.
+    sched::block_on_cond(flags, 0, || unsafe { (*(&raw const WAITERS))[slot].woken });
 
     let flags = irq_save();
     let result = unsafe {

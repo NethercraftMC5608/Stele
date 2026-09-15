@@ -417,10 +417,40 @@ pub fn deliver(frame: &mut crate::user::Frame) -> bool {
         // Default dispositions: the ones a shell cannot survive without.
         // `SIGCHLD`/`SIGCONT`/`SIGURG` are ignored; everything else with no
         // handler terminates. `SIGSTOP` is handled above.
+        //
+        // `SIGUSR1`/`SIGUSR2` are here for WebKit: JavaScriptCore uses
+        // `SIGUSR1` to suspend a thread for a GC stack scan, and there is a
+        // window between the send and the target installing its handler in
+        // which the default disposition would kill the whole process --
+        // measured, repeatedly, as `signal 10 (default terminate)` on a
+        // WebKit process mid-load. Ignoring them until a handler exists is
+        // what the sender assumed anyway, and Linux itself does the same
+        // for `SIGCHLD` for the same reason.
         sched::clear_signal_pending(me, bit(sig));
         match sig {
-            SIGCHLD | SIGCONT | SIGURG => return false,
-            _ => crate::user::sys_exit(-(sig as i32)),
+            SIGCHLD | SIGCONT | SIGURG | SIGUSR1 | SIGUSR2 => return false,
+            _ => {
+                crate::println!(
+                    "!! signal {} (default terminate) on task {} lpid {} pc {:#x} lr {:#x} sp {:#x} fp {:#x} from_pid {} code {}",
+                    sig, me, sched::linux_pid(me), frame.elr, frame.x[30], frame.sp, frame.x[29],
+                    sched::signal_sender(me, sig), sched::signal_code(me, sig)
+                );
+                for off in (0..=0x80).step_by(8) {
+                    let va = frame.sp.wrapping_add(off);
+                    if let Some(p) = crate::paging::user_to_phys(va & !7) {
+                        let w = unsafe { core::ptr::read_volatile(p as *const u64) };
+                        crate::println!("   sp+{:#x}: {:#x}", off, w);
+                    }
+                }
+                for off in (-0x40..=0x20).step_by(8) {
+                    let va = (frame.x[29] as i64 + off) as u64;
+                    if let Some(p) = crate::paging::user_to_phys(va & !7) {
+                        let w = unsafe { core::ptr::read_volatile(p as *const u64) };
+                        crate::println!("   fp{:+03}: {:#x}", off, w);
+                    }
+                }
+                crate::user::sys_exit(-(sig as i32));
+            }
         }
     }
     if act.handler == SIG_IGN {
@@ -633,9 +663,7 @@ fn trampoline_addr() -> Option<u64> {
     let page = crate::frames::alloc()? as u64;
     unsafe {
         core::ptr::copy_nonoverlapping(TRAMPOLINE_CODE.as_ptr(), page as *mut u8, TRAMPOLINE_CODE.len());
-        let mut cur: u64;
-        core::arch::asm!("mrs {}, ttbr0_el1", out(reg) cur, options(nomem, nostack));
-        cur = crate::paging::table_of(cur);
+        let cur = crate::paging::table_of(crate::arch::current_page_table());
         // Executable and read-only: `map_user_permissions` cleans the
         // icache for the freshly written bytes on the mapping path.
         crate::paging::map_user_permissions(cur, TRAMPOLINE_ADDR, page, 4096, true, false);

@@ -137,6 +137,17 @@ pub fn report() {
     println!("  heap:   {} of {} bytes used", used, total);
 }
 
+/// The same numbers through the raw console, for the crash path.
+///
+/// `report` goes through `println!`, which takes the console lock. The
+/// watchdog and the panic handler run precisely when a lock may already be
+/// held by the task that wedged, so they need a path that cannot deadlock on
+/// the way to saying what happened.
+pub fn raw_report() {
+    let (used, total) = stats();
+    println!("  heap:   {} of {} bytes used", used, total);
+}
+
 unsafe impl GlobalAlloc for Heap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let h = &mut *(&raw mut HEAP);

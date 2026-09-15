@@ -112,6 +112,18 @@ pub extern "C" fn rust_irq() {
         return;
     }
 
+    // A reschedule IPI from another CPU. EOI'd and acted on: the sender
+    // already set this CPU's need_resched, so the switch happens below at
+    // the same safe point a local wakeup uses. Nothing else to do -- the
+    // message *is* the flag.
+    if intid == crate::gic::SGI_RESCHED {
+        crate::gic::eoi(intid);
+        if crate::sched::preempt_enabled() && crate::sched::take_need_resched() {
+            crate::sched::schedule();
+        }
+        return;
+    }
+
     if intid == crate::timer::intid() {
         unsafe { crate::timer::rearm() };
         crate::timer::on_tick();
@@ -127,7 +139,14 @@ pub extern "C" fn rust_irq() {
         // stays active forever. The symptom is a timer that ticks exactly
         // once and a machine that then does nothing at all.
         crate::gic::eoi(intid);
-        if crate::sched::preempt_enabled() {
+        // Switch when the slice is up, or when a wakeup already decided
+        // something better should be running. Not on every tick: a task that
+        // has only just started and has nobody waiting for the CPU should
+        // keep it, because every avoidable switch costs cache and TLB state
+        // that has to be rebuilt.
+        if crate::sched::preempt_enabled()
+            && (crate::sched::take_need_resched() || crate::sched::slice_expired())
+        {
             crate::sched::schedule();
         }
         return;

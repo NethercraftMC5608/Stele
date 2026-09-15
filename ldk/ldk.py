@@ -601,11 +601,30 @@ def cmd_lkl(args):
     5,168 lines -- against 26,636 for arch/um and 179,127 for arch/arm64 --
     because it delegates rather than implements.
 
-    The output is `lkl.o`: the entire Linux kernel, for aarch64, as one
-    object. Its undefined symbols are the whole of what nk must supply.
+    The output is `lkl.o`: the entire Linux kernel, for the chosen
+    architecture, as one object. Its undefined symbols are the whole of what
+    nk must supply.
+
+    arch/lkl's "machine" is nk either way; what changes with --arch is the
+    instruction set the kernel is compiled to, and that comes from running
+    the container under the matching --platform rather than from a cross
+    toolchain. Each architecture gets its own source volume and output
+    directory, because the tree carries a .config and a full object tree and
+    the two builds must not overwrite each other's.
     """
-    say("Fetching lkl/linux (shallow; a few minutes the first time)")
-    subprocess.run(["docker", "volume", "create", LKL_VOLUME],
+    arch = getattr(args, "arch", "aarch64")
+    platform = "linux/arm64" if arch == "aarch64" else "linux/amd64"
+    volume = LKL_VOLUME if arch == "aarch64" else f"{LKL_VOLUME}-{arch}"
+    # A separate image per platform, built from the same Dockerfile. Docker
+    # resolves an image name to one architecture, so asking for the arm64
+    # image with --platform linux/amd64 does not emulate it -- it tries to
+    # pull an amd64 variant that was never pushed anywhere, and fails with
+    # "pull access denied" for an image that is plainly built locally.
+    image = IMAGE if arch == "aarch64" else f"{IMAGE}-amd64"
+    # -mno-outline-atomics is an aarch64 flag and gcc refuses it elsewhere.
+    kcflags = "-mno-outline-atomics" if arch == "aarch64" else ""
+    say(f"Fetching lkl/linux for {arch} (shallow; a few minutes the first time)")
+    subprocess.run(["docker", "volume", "create", volume],
                    check=True, stdout=subprocess.DEVNULL)
     script = """
 set -e
@@ -640,12 +659,38 @@ if [ ! -f .config ] || [ "$(cat .nk-config-hash 2>/dev/null)" != "$WANT" ]; then
   echo "$WANT" > .nk-config-hash
   echo "  configured: from arch/lkl defconfig plus kernel/lkl/nk.config"
 fi
+# KCFLAGS is architecture-specific; see the Python side. On aarch64 it is
 # -mno-outline-atomics: without it gcc emits calls to __aarch64_*_sync
 # helpers that live in libgcc, and nk has no libgcc. Inline atomics are
 # what a kernel wants anyway -- an out-of-line call per atomic on a
 # machine that has LSE instructions is a strange thing to pay for.
-make ARCH=lkl KCFLAGS="-mno-outline-atomics" -j$(nproc) >/tmp/build.log 2>&1 \
-    || { tail -30 /tmp/build.log; exit 1; }
+# Retried, because the compiler itself is unreliable here.
+#
+# Building the amd64 kernel on an arm64 host runs gcc under emulation, and
+# gcc segfaults there at random: a file that dies with signal 11 ("Error
+# 139") compiles cleanly on the next attempt, every time it has been
+# checked. That is the emulator, not the source, and it is frequent enough
+# that a 3,000-file kernel almost never gets through in one pass.
+#
+# make is incremental, so a retry resumes from the object that died rather
+# than starting again. A run that makes no progress in a whole pass is a
+# real failure and is reported as one.
+attempt=1
+while [ "$attempt" -le 8 ]; do
+    if make ARCH=lkl KCFLAGS="__KCFLAGS__" -j$(nproc) >/tmp/build.log 2>&1; then
+        break
+    fi
+    if ! grep -qE "Error 139|signal 11|internal compiler error" /tmp/build.log; then
+        tail -30 /tmp/build.log
+        exit 1
+    fi
+    echo "  compiler crashed under emulation; resuming (attempt $attempt)"
+    attempt=$((attempt + 1))
+done
+if [ ! -f lkl.o ]; then
+    tail -30 /tmp/build.log
+    exit 1
+fi
 cp arch/lkl/include/uapi/asm/host_ops.h /out/
 cp arch/lkl/include/uapi/lkl.h /out/ 2>/dev/null || true
 # Stripped of debug info: 344MB to 20MB, and nk links the whole thing.
@@ -658,10 +703,14 @@ echo "  the whole Linux kernel still wants, from nk:"
 ld -r -o /tmp/c.o /out/lkl.o /out/nk-host.o
 nm --undefined-only /tmp/c.o | awk '{print "    " $2}' | sort -u
 """
-    out = BUILD / "lkl"
+    script = script.replace("__KCFLAGS__", kcflags)
+    # aarch64 keeps build/lkl so every existing path and script still finds
+    # it; a second architecture gets its own directory beside it.
+    out = BUILD / ("lkl" if arch == "aarch64" else f"lkl-{arch}")
     out.mkdir(parents=True, exist_ok=True)
-    cmd = ["docker", "run", "--rm", "-v", f"{LKL_VOLUME}:/src",
-           "-v", f"{out}:/out", "-v", f"{KERNEL}:/shim", IMAGE, "sh", "-c", script]
+    cmd = ["docker", "run", "--rm", "--platform", platform,
+           "-v", f"{volume}:/src",
+           "-v", f"{out}:/out", "-v", f"{KERNEL}:/shim", image, "sh", "-c", script]
     subprocess.run(cmd, check=True)
     say(f"{(out / 'lkl.o').relative_to(ROOT)}")
     print()
@@ -734,6 +783,13 @@ def main():
     p.set_defaults(func=cmd_shim)
 
     p = sub.add_parser("lkl", help="fetch and build LKL: the whole Linux kernel as one object")
+    # The host architecture the kernel is compiled for. arch/lkl delegates
+    # the machine to nk, but the *code* is still native: the container runs
+    # under the matching --platform so the native compiler targets it, which
+    # is what the aarch64 build has always relied on and is simpler than
+    # carrying a cross toolchain.
+    p.add_argument("--arch", choices=["aarch64", "x86_64"], default="aarch64",
+                   help="target architecture (default aarch64)")
     p.set_defaults(func=cmd_lkl)
 
     p = sub.add_parser("report", help="coverage across every port")

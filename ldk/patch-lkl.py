@@ -588,7 +588,7 @@ def cpu_strand_fix():
          '\tset_ti_thread_flag(ti, TIF_SCHED_JB);\n'
          '\tlkl_ops->jmp_buf_set(&ti->sched_jb, exit_task);\n'
          '\tlkl_cpu_drop();\n',
-         'wakeup_idle_host_task();\n\tset_ti_thread_flag(ti, TIF_SCHED_JB);')
+          'lkl_cpu_drop();\n}')
 
     edit('arch/lkl/kernel/threads.c',
          'static struct task_struct *abs_prev = &init_task;',
@@ -626,9 +626,509 @@ def cpu_strand_fix():
          '\n'
          '\tif (!orphaned)\n'
          '\t\tlkl_ops->sem_up(_next->sched_sem);',
-         'bool orphaned = prev->exit_state')
+         'if (lkl_ops->switch_trace)')
 
     say('del_host_task releases CPU and __switch_to guards unbacked handover')
+
+    # The guard above skipped the handover without releasing: the dying task
+    # ran its final switch on a host thread that had entered Linux (count==1),
+    # the owner label had already been moved to the dying task's -- dead --
+    # tid by the switch that brought it in, and nothing ever put() the count
+    # back. Every later lkl_cpu_get parked on cpu.sem behind an owner that no
+    # longer existed: init blocked in read, the whole host pool idle, the
+    # render wedge. So the orphaned switch releases the whole count (the
+    # dying context consumes its nesting as it goes), and the idle loop's
+    # put is made tolerant of arriving without the CPU -- which it now does,
+    # because the release already cleared it.
+    edit('arch/lkl/include/asm/cpu.h',
+         'void lkl_cpu_drop(void);',
+         'void lkl_cpu_drop(void);\n'
+         'void lkl_cpu_release(void);\n'
+         'void lkl_cpu_put_if_owned(void);',
+         'void lkl_cpu_put_if_owned(void);')
+
+    edit('arch/lkl/kernel/cpu.c',
+         'void lkl_cpu_put(void)\n{',
+         '/* Release the CPU from the last context that ran on it, whoever\n'
+         ' * the owner label says. Only the dying task\'s final switch calls\n'
+         ' * this: the host thread is about to park on a semaphore only\n'
+         ' * stack-freeing can wake, and the count it entered Linux with has\n'
+         ' * no other taker. Clearing the whole count is deliberate -- a\n'
+         ' * dying context consumes any nesting it acquired on the way out.\n'
+         ' * A no-op when nothing is held. */\n'
+         'void lkl_cpu_release(void)\n'
+         '{\n'
+         '\tlkl_ops->mutex_lock(cpu.lock);\n'
+         '\tif (cpu.count) {\n'
+         '\t\tcpu.count = 0;\n'
+         '\t\tif (cpu.sleepers) {\n'
+         '\t\t\tcpu.sleepers--;\n'
+         '\t\t\tlkl_ops->sem_up(cpu.sem);\n'
+         '\t\t}\n'
+         '\t\tcpu.owner = 0;\n'
+         '\t}\n'
+         '\tlkl_ops->mutex_unlock(cpu.lock);\n'
+         '}\n'
+         '\n'
+         '/* lkl_cpu_put() that tolerates not owning the CPU: the idle loop\n'
+         ' * is woken after lkl_cpu_release() cleared the owner, and a put\n'
+         ' * then is the "unbalanced put" bug waiting to happen. */\n'
+         'void lkl_cpu_put_if_owned(void)\n'
+         '{\n'
+         '\tlkl_ops->mutex_lock(cpu.lock);\n'
+         '\tif (!cpu.count || !cpu.owner ||\n'
+         '\t    !lkl_ops->thread_equal(cpu.owner, lkl_ops->thread_self())) {\n'
+         '\t\tlkl_ops->mutex_unlock(cpu.lock);\n'
+         '\t\treturn;\n'
+         '\t}\n'
+         '\tif (--cpu.count > 0) {\n'
+         '\t\tlkl_ops->mutex_unlock(cpu.lock);\n'
+         '\t\treturn;\n'
+         '\t}\n'
+         '\tif (cpu.sleepers) {\n'
+         '\t\tcpu.sleepers--;\n'
+         '\t\tlkl_ops->sem_up(cpu.sem);\n'
+         '\t}\n'
+         '\tcpu.owner = 0;\n'
+         '\tlkl_ops->mutex_unlock(cpu.lock);\n'
+         '}\n'
+         '\n'
+         'void lkl_cpu_put(void)\n{',
+         'void lkl_cpu_release(void)')
+
+    edit('arch/lkl/kernel/threads.c',
+         '\tif (!orphaned) {\n'
+         '\t\tBUG_ON(!_next->tid);\n'
+         '\t\tlkl_cpu_change_owner(_next->tid);\n'
+         '\t}',
+         '\tif (orphaned) {\n'
+         '\t\t/* Skipping the handover is not enough: the count this\n'
+         '\t\t * host thread entered Linux with has no other taker, and\n'
+         '\t\t * the owner label may already name the dead tid the\n'
+         '\t\t * switch-in moved it to. Release before parking. */\n'
+         '\t\tlkl_cpu_release();\n'
+         '\t} else {\n'
+         '\t\tBUG_ON(!_next->tid);\n'
+         '\t\tlkl_cpu_change_owner(_next->tid);\n'
+         '\t}',
+         'if (lkl_ops->switch_trace)')
+
+    edit('arch/lkl/kernel/syscalls.c',
+         '\tfor (;;) {\n'
+         '\t\tlkl_cpu_put();\n'
+         '\t\tlkl_ops->sem_down(ti->sched_sem);',
+         '\tfor (;;) {\n'
+         '\t\tlkl_cpu_put_if_owned();\n'
+         '\t\tlkl_ops->sem_down(ti->sched_sem);',
+         'lkl_cpu_put_if_owned();')
+
+    say('orphaned switch releases the CPU and the idle loop tolerates a cleared owner')
+
+def cpu_handoff_wake():
+    """Restore the stock handover in __switch_to.
+
+    The guard above stopped `change_owner` on a dying task's final switch
+    and then `lkl_cpu_release()` cleared the count -- but it also skipped
+    `sem_up(_next->sched_sem)`, and that wake is the only thing that runs
+    the scheduler again. Every boot wedged at the same slice count (386k):
+    one task dead in dup3 waiting on its own sched_sem, a dozen host tasks
+    parked on theirs, cpu free, no syscalls in flight, nothing left to
+    wake anybody.
+
+    The dead-owner case the guard was written for is real, and is handled
+    where it belongs now: host-task TLS is generation-qualified so a
+    reused slot cannot adopt (or destroy) the previous occupant's Linux
+    task, and the watchdog releases a CPU label only when its owner is
+    provably dead. The handover itself stays stock: transfer the label,
+    wake the next host thread, and let it put() the count it inherits.
+    """
+    edit('arch/lkl/kernel/threads.c',
+         '\t/* A dying task unwinding via TIF_SCHED_JB must not hand the CPU\n'
+         '\t * to an unbacked host task: nobody there will ever put() it.\n'
+         '\t * Live switches (prev->exit_state == 0) are untouched. */\n'
+         '\tbool orphaned = prev->exit_state != 0 &&\n'
+         '\t\t(is_idle_task(next) || next == host0);\n'
+         '\n'
+         '\tif (orphaned) {\n'
+         '\t\t/* Skipping the handover is not enough: the count this\n'
+         '\t\t * host thread entered Linux with has no other taker, and\n'
+         '\t\t * the owner label may already name the dead tid the\n'
+         '\t\t * switch-in moved it to. Release before parking. */\n'
+         '\t\tlkl_cpu_release();\n'
+         '\t} else {\n'
+         '\t\tBUG_ON(!_next->tid);\n'
+         '\t\tlkl_cpu_change_owner(_next->tid);\n'
+         '\t}\n'
+         '\n'
+         '\tif (test_bit(TIF_SCHED_JB, &_prev_flags)) {\n'
+         '\t\t/* Atomic. Must be done before wakeup next */\n'
+         '\t\tclear_ti_thread_flag(_prev, TIF_SCHED_JB);\n'
+         '\t\t_prev_jb = _prev->sched_jb;\n'
+         '\t}\n'
+         '\n'
+         '\tif (!orphaned)\n'
+         '\t\tlkl_ops->sem_up(_next->sched_sem);',
+         '\tBUG_ON(!_next->tid);\n'
+         '\tlkl_cpu_change_owner(_next->tid);\n'
+         '\n'
+         '\tif (test_bit(TIF_SCHED_JB, &_prev_flags)) {\n'
+         '\t\t/* Atomic. Must be done before wakeup next */\n'
+         '\t\tclear_ti_thread_flag(_prev, TIF_SCHED_JB);\n'
+         '\t\t_prev_jb = _prev->sched_jb;\n'
+         '\t}\n'
+         '\n'
+         '\tlkl_ops->sem_up(_next->sched_sem);',
+         'if (lkl_ops->switch_trace)')
+
+    say('stock CPU handover with wake restored (scheduler can always run again)')
+
+def switch_trace():
+    """Record every CPU-owner install and host-task tid assignment.
+
+    The dead-owner strand is installed by a single `__switch_to` -- a
+    `change_owner(_next->tid)` where `_next` is a task whose `tid` names
+    an nk thread that is gone. nk cannot see `prev`/`next` from outside,
+    so the kernel reports them: pid and tid on each side, and each
+    `switch_to_host_task` tid write. nk keeps them in a ring and dumps it
+    with the stall graph.
+    """
+    edit('arch/lkl/include/uapi/asm/host_ops.h',
+         '\tstruct lkl_dev_pci_ops *pci_ops;\n};',
+         '\tstruct lkl_dev_pci_ops *pci_ops;\n'
+         '\n'
+         '\t/* nk: owner installs and tid assignments, for the stall ring */\n'
+         '\tvoid (*switch_trace)(int prev_pid, unsigned long long prev_tid,\n'
+         '\t\t\t     int next_pid, unsigned long long next_tid);\n'
+         '};',
+         'switch_trace')
+
+    edit('arch/lkl/kernel/threads.c',
+         '\tBUG_ON(!_next->tid);\n'
+         '\tlkl_cpu_change_owner(_next->tid);',
+         '\tBUG_ON(!_next->tid);\n'
+         '\tif (lkl_ops->switch_trace)\n'
+         '\t\tlkl_ops->switch_trace(prev->pid,\n'
+         '\t\t\t\t     (unsigned long long)_prev->tid,\n'
+         '\t\t\t\t     next->pid,\n'
+         '\t\t\t\t     (unsigned long long)_next->tid);\n'
+         '\tlkl_cpu_change_owner(_next->tid);',
+         'switch_trace(prev->pid,')
+
+    edit('arch/lkl/kernel/threads.c',
+         '\ttask_thread_info(task)->tid = lkl_ops->thread_self();\n',
+         '\ttask_thread_info(task)->tid = lkl_ops->thread_self();\n'
+         '\tif (lkl_ops->switch_trace)\n'
+         '\t\tlkl_ops->switch_trace(-1,\n'
+         '\t\t\t\t     (unsigned long long)lkl_ops->thread_self(),\n'
+         '\t\t\t\t     task->pid,\n'
+         '\t\t\t\t     (unsigned long long)task_thread_info(task)->tid);\n',
+         'switch_trace(-1,')
+
+    say('switch trace: owner installs and tid assignments recorded in an nk ring')
+
+def del_host_task_probe():
+    """Print the host-task exit protocol's vital signs.
+
+    The dead-owner strand is installed by `__switch_to` choosing a task
+    whose `tid` names an nk thread that is gone. Three questions decide
+    the fix, and none of them is visible from nk:
+
+      * was the chosen task still runnable (`on_rq`) and in what state,
+      * was its tid already a dead incarnation's,
+      * and -- in `del_host_task` -- did `do_exit` actually finish before
+        the TLS destructor returned? The whole protocol rests on the
+        task being TASK_DEAD and off the run queue at that point, and
+        nothing has ever checked it.
+    """
+    edit('arch/lkl/include/uapi/asm/host_ops.h',
+         '\t/* nk: owner installs and tid assignments, for the stall ring */\n'
+         '\tvoid (*switch_trace)(int prev_pid, unsigned long long prev_tid,\n'
+         '\t\t\t     int next_pid, unsigned long long next_tid);\n};',
+         '\t/* nk: owner installs and tid assignments, for the stall ring */\n'
+         '\tvoid (*switch_trace)(int prev_pid, unsigned long long prev_tid,\n'
+         '\t\t\t     int next_pid, unsigned long long next_tid);\n'
+         '\n'
+         '\t/* nk: does the host thread behind this tid still exist? */\n'
+         '\tint (*thread_alive)(lkl_thread_t tid);\n};',
+         'thread_alive')
+
+    edit('arch/lkl/kernel/threads.c',
+         '\tBUG_ON(!_next->tid);\n'
+         '\tif (lkl_ops->switch_trace)',
+         '\tBUG_ON(!_next->tid);\n'
+         '\tif (next->on_rq != 1)\n'
+         '\t\tprintk("lkl: SW-NONQUEUED pid %d tid %llx state %ld on_rq %d prev pid %d tid %llx\\n",\n'
+         '\t\t\t   next->pid, (unsigned long long)_next->tid,\n'
+         '\t\t\t   (long)next->__state, next->on_rq, prev->pid,\n'
+         '\t\t\t   (unsigned long long)_prev->tid);\n'
+         '\tif (prev->__state == TASK_DEAD)\n'
+         '\t\tprintk("lkl: SW-EXIT pid %d tid %llx next pid %d tid %llx\\n",\n'
+         '\t\t\t   prev->pid, (unsigned long long)_prev->tid, next->pid,\n'
+         '\t\t\t   (unsigned long long)_next->tid);\n'
+         '\tif (lkl_ops->thread_alive &&\n'
+         '\t    !lkl_ops->thread_alive(_next->tid))\n'
+         '\t\tprintk("lkl: SW-DEAD-TID pid %d tid %llx state %ld on_rq %d dead %d prev pid %d\\n",\n'
+         '\t\t\t   next->pid, (unsigned long long)_next->tid,\n'
+         '\t\t\t   (long)next->__state, next->on_rq, _next->dead, prev->pid);\n'
+         '\tif (lkl_ops->switch_trace)',
+         'SW-DEAD-TID')
+
+    edit('arch/lkl/kernel/syscalls.c',
+         'static void del_host_task(void *arg)\n'
+         '{\n'
+         '\tstruct task_struct *task = (struct task_struct *)arg;\n'
+         '\tstruct thread_info *ti = task_thread_info(task);\n'
+         '\n'
+         '\tif (lkl_cpu_get() < 0)\n'
+         '\t\treturn;\n'
+         '\n'
+         '\tswitch_to_host_task(task);\n',
+         'static void del_host_task(void *arg)\n'
+         '{\n'
+         '\tstruct task_struct *task = (struct task_struct *)arg;\n'
+         '\tstruct thread_info *ti = task_thread_info(task);\n'
+         '\n'
+         '\tprintk("lkl: del_host_task pid %d enter state %ld on_rq %d tid %llx self %llx\\n",\n'
+         '\t\t   task->pid, (long)task->__state, task->on_rq,\n'
+         '\t\t   (unsigned long long)ti->tid,\n'
+         '\t\t   (unsigned long long)lkl_ops->thread_self());\n'
+         '\tif (lkl_cpu_get() < 0)\n'
+         '\t\treturn;\n'
+         '\n'
+         '\tswitch_to_host_task(task);\n'
+         '\tprintk("lkl: del_host_task pid %d reentered state %ld on_rq %d\\n",\n'
+         '\t\t   task->pid, (long)task->__state, task->on_rq);\n',
+         'del_host_task pid')
+
+    edit('arch/lkl/kernel/syscalls.c',
+         '\tlkl_ops->jmp_buf_set(&ti->sched_jb, exit_task);\n'
+         '\tlkl_cpu_drop();\n'
+         '}\n',
+         '\tlkl_ops->jmp_buf_set(&ti->sched_jb, exit_task);\n'
+         '\tprintk("lkl: del_host_task pid %d after exit_task state %ld on_rq %d dead %d\\n",\n'
+         '\t\t   task->pid, (long)task->__state, task->on_rq, ti->dead);\n'
+         '\tlkl_cpu_drop();\n'
+         '}\n',
+         'after exit_task state')
+
+    say('del_host_task probe: pick state, dead tids, and whether do_exit finished')
+
+
+def exit_jb_gate():
+    """Do not let an inner schedule abort do_exit.
+
+    `del_host_task` arms `sched_jb` with `exit_task` and runs do_exit, so
+    that when the task's final switch happens the host thread is thrown
+    back out of the kernel and can finish exiting. But do_exit can
+    schedule *before* the task is dead: a reschedule point while tearing
+    the mm down, a lock taken on the way. `__switch_to` consumed the
+    jump buffer at that first inner switch -- measured, once per few
+    dozen exits: `del_host_task pid 49 after exit_task state 0 on_rq 1`
+    where healthy exits all say `state 128 on_rq 0` -- and longjmping out
+    of an unfinished do_exit leaves the task TASK_RUNNING and on the run
+    queue whose `tid` names a host thread that is about to stop existing.
+    The next switch to that task installs the dead tid as the CPU owner,
+    `sem_up` wakes nobody, and every other host thread parks on its own
+    sched_sem: the machine stops with one sleeper on cpu.sem for ever.
+
+    So the exit path keeps its jump buffer armed across inner schedules
+    and parks instead: the task blocks, the host thread blocks with it,
+    and both resume when the scheduler runs the task again. Only the
+    final switch, with `prev->__state == TASK_DEAD`, consumes the buffer
+    and throws the host thread out. Ordinary yields (`thread_sched_jb`,
+    used by `lkl_cpu_put` and `switch_to_host_task`) are not `exiting`
+    and keep the stock immediate longjmp, which is what makes them
+    return to the host at all.
+    """
+    edit('arch/lkl/include/asm/thread_info.h',
+         '\tstruct lkl_jmp_buf sched_jb;\n'
+         '\tbool dead;\n',
+         '\tstruct lkl_jmp_buf sched_jb;\n'
+         '\tbool dead;\n'
+         '\t/* Set by del_host_task before arming sched_jb for do_exit:\n'
+         '\t * an inner schedule must park and resume the exit, not\n'
+         '\t * longjmp out of it and leave a runnable zombie. */\n'
+         '\tbool exiting;\n',
+         'bool exiting;')
+
+    edit('arch/lkl/kernel/threads.c',
+         '\tti->dead = false;\n',
+         '\tti->dead = false;\n'
+         '\tti->exiting = false;\n',
+         'ti->exiting = false;')
+
+    edit('arch/lkl/kernel/threads.c',
+         '\tif (test_bit(TIF_SCHED_JB, &_prev_flags)) {\n'
+         '\t\t/* Atomic. Must be done before wakeup next */\n'
+         '\t\tclear_ti_thread_flag(_prev, TIF_SCHED_JB);\n'
+         '\t\t_prev_jb = _prev->sched_jb;\n'
+         '\t}\n'
+         '\n'
+         '\tlkl_ops->sem_up(_next->sched_sem);\n'
+         '\tif (test_bit(TIF_SCHED_JB, &_prev_flags)) {\n'
+         '\t\tlkl_ops->jmp_buf_longjmp(&_prev_jb, 1);\n'
+         '\t} else {\n'
+         '\t\tlkl_ops->sem_down(_prev->sched_sem);\n'
+         '\t}\n',
+         '\tint _consume_jb = 0;\n'
+         '\n'
+         '\tif (test_bit(TIF_SCHED_JB, &_prev_flags)) {\n'
+         '\t\tif (!_prev->exiting || prev->__state == TASK_DEAD) {\n'
+         '\t\t\t/* Atomic. Must be done before wakeup next */\n'
+         '\t\t\tclear_ti_thread_flag(_prev, TIF_SCHED_JB);\n'
+         '\t\t\t_prev_jb = _prev->sched_jb;\n'
+         '\t\t\t_consume_jb = 1;\n'
+         '\t\t}\n'
+         '\t\t/* else: an inner schedule on the way into do_exit.\n'
+         '\t\t * Keep the buffer armed and park; the exit resumes\n'
+         '\t\t * when the task is scheduled again, and the final\n'
+         '\t\t * (TASK_DEAD) switch consumes it. */\n'
+         '\t}\n'
+         '\n'
+         '\tlkl_ops->sem_up(_next->sched_sem);\n'
+         '\tif (_consume_jb) {\n'
+         '\t\tlkl_ops->jmp_buf_longjmp(&_prev_jb, 1);\n'
+         '\t} else {\n'
+         '\t\tlkl_ops->sem_down(_prev->sched_sem);\n'
+         '\t}\n',
+         '_consume_jb = 1;')
+
+    edit('arch/lkl/kernel/syscalls.c',
+         '\thost_task_id--;\n'
+         '\twakeup_idle_host_task();\n'
+         '\tset_ti_thread_flag(ti, TIF_SCHED_JB);\n',
+         '\thost_task_id--;\n'
+         '\twakeup_idle_host_task();\n'
+         '\tti->exiting = true;\n'
+         '\tset_ti_thread_flag(ti, TIF_SCHED_JB);\n',
+         'ti->exiting = true;')
+
+    say('exit jump buffer survives inner schedules (no runnable zombie with a dead tid)')
+
+
+def quiet_exit_probe():
+    """Keep the anomaly reports, drop the per-exit chatter.
+
+    `del_host_task_probe` earned its lines the hard way -- `after
+    exit_task state 0 on_rq 1` is what named the runnable zombie. With
+    `exit_jb_gate` in place every healthy exit prints three statements
+    to two consoles; a shell boot makes a hundred exits and the log
+    drowns. The dead-tid and non-queued switch reports only ever fire on
+    the failure, so they stay.
+    """
+    import re
+
+    def drop(path, pattern):
+        s = open(path).read()
+        new = re.sub(pattern, '', s)
+        if new != s:
+            open(path, 'w').write(new)
+            say(f"quiet: {path}")
+
+    drop('arch/lkl/kernel/syscalls.c',
+         r'\tprintk\("lkl: del_host_task[^;]*;\n')
+    drop('arch/lkl/kernel/threads.c',
+         r'\tif \(prev->__state == TASK_DEAD\)\n'
+         r'\t\tprintk\("lkl: SW-EXIT[^;]*;\n')
+
+
+def input_event_probe():
+    """Do pointer buttons reach the Linux input layer at all?
+
+    Motion works -- the Weston cursor follows the tablet -- but no button
+    ever reaches the GTK client: no press/release, no `:active`, nothing
+    posted to the daemon. This says whether QEMU's button events make it
+    through the virtqueue (in which case libinput/Weston dropped them) or
+    never arrive (device setup, nk's interrupt delivery, or the queue).
+    """
+    edit('drivers/virtio/virtio_input.c',
+         '\t\t\tinput_event(vi->idev,\n'
+         '\t\t\t\t    le16_to_cpu(event->type),\n'
+         '\t\t\t\t    le16_to_cpu(event->code),\n'
+         '\t\t\t\t    le32_to_cpu(event->value));\n',
+         '\t\t\tif (le16_to_cpu(event->type) == EV_KEY)\n'
+         '\t\t\t\tprintk("lkl: virtio-input EV_KEY code %u value %d\\n",\n'
+         '\t\t\t\t       le16_to_cpu(event->code),\n'
+         '\t\t\t\t       (int)le32_to_cpu(event->value));\n'
+         '\t\t\tinput_event(vi->idev,\n'
+         '\t\t\t\t    le16_to_cpu(event->type),\n'
+         '\t\t\t\t    le16_to_cpu(event->code),\n'
+         '\t\t\t\t    le32_to_cpu(event->value));\n',
+         'virtio-input EV_KEY')
+
+    say('input probe: EV_KEY events from virtio input devices are reported')
+
+
+def exec_files():
+    edit('arch/lkl/include/uapi/asm/unistd.h',
+         '#define __NR_device_page (__NR_arch_specific_syscall + 3)',
+         '#define __NR_device_page (__NR_arch_specific_syscall + 3)\n'
+         '#define __NR_exec_files (__NR_arch_specific_syscall + 4)',
+         '__NR_exec_files')
+    edit('arch/lkl/include/asm/unistd.h',
+         '__SYSCALL(__NR_device_page, sys_device_page)',
+         '__SYSCALL(__NR_device_page, sys_device_page)\n'
+         '__SYSCALL(__NR_exec_files, sys_exec_files)',
+         '__NR_exec_files')
+    edit('arch/lkl/kernel/syscalls.c',
+         'static asmlinkage long sys_device_page(unsigned long addr, unsigned long write);',
+         'static asmlinkage long sys_device_page(unsigned long addr, unsigned long write);\n'
+         'static asmlinkage long sys_exec_files(void);',
+         'static asmlinkage long sys_exec_files')
+    path = 'arch/lkl/kernel/syscalls.c'
+    if 'SYSCALL_DEFINE0(exec_files)' not in open(path).read():
+        open(path, 'a').write('''
+SYSCALL_DEFINE0(exec_files)
+{
+    int ret = unshare_files();
+    if (ret)
+        return ret;
+    do_close_on_exec(current->files);
+    return 0;
+}
+''')
+
+
+def nk_stack_maps():
+    edit('fs/proc/task_mmu.c',
+         'static int pid_maps_open(struct inode *inode, struct file *file)\n{\n\treturn do_maps_open(inode, file, &proc_pid_maps_op);\n}',
+         '''extern unsigned long nk_stack_top(long pid);
+
+static int nk_stack_maps_show(struct seq_file *m, void *v)
+{
+    unsigned long top = (unsigned long)m->private;
+    seq_printf(m, "%08lx-%08lx rw-p 00000000 00:00 0 [stack]\\n",
+               top - 262144UL, top);
+    return 0;
+}
+
+static const struct file_operations nk_stack_maps_ops = {
+    .read = seq_read,
+    .llseek = seq_lseek,
+    .release = single_release,
+};
+
+static int pid_maps_open(struct inode *inode, struct file *file)
+{
+    struct task_struct *task = get_proc_task(inode);
+    unsigned long top = task ? nk_stack_top(task_pid_nr(task)) : 0;
+    if (task)
+        put_task_struct(task);
+    if (top) {
+        struct mm_struct *mm = proc_mem_open(inode, PTRACE_MODE_READ);
+        int ret;
+        if (IS_ERR(mm))
+            return PTR_ERR(mm);
+        if (mm)
+            mmdrop(mm);
+        ret = single_open(file, nk_stack_maps_show, (void *)top);
+        if (!ret)
+            file->f_op = &nk_stack_maps_ops;
+        return ret;
+    }
+    return do_maps_open(inode, file, &proc_pid_maps_op);
+}''',
+         'static int nk_stack_maps_show')
 
 
 if __name__ == '__main__':
@@ -639,5 +1139,13 @@ if __name__ == '__main__':
     host0_signals()
     thread_files()
     device_pages()
+    exec_files()
+    nk_stack_maps()
     console_driver(shim)
     cpu_strand_fix()
+    cpu_handoff_wake()
+    switch_trace()
+    del_host_task_probe()
+    exit_jb_gate()
+    quiet_exit_probe()
+    input_event_probe()

@@ -19,9 +19,31 @@
 //!
 //! What is left is the flag that tells `useraccess` these pointers came from
 //! EL0 and must be treated as such.
+//!
+//! # The numbers are LKL's, not the host's
+//!
+//! `ldk lkl` builds Linux with `ARCH=lkl` on *both* hosts -- only the
+//! compiler differs -- so LKL's system call numbers come from
+//! `arch/lkl/include/uapi/asm/unistd.h`: the asm-generic table, plus a few
+//! `__NR_arch_specific_syscall + n` additions of nk's own.
+//!
+//! On aarch64 that table *is* the host's table, so a number taken from a user
+//! program's frame and handed to LKL unchanged is correct, and everything
+//! below assumes it.
+//!
+//! On x86-64 it is not. An x86-64 binary asking for `write` passes 1, and 1
+//! in the asm-generic table is `io_destroy`. Nothing would report an error --
+//! the call would succeed, against the wrong service. So x86-64 user space
+//! cannot use this path until the number is translated from the host's table
+//! into LKL's; `syscall_nr.rs` now carries both, verified against the kernel
+//! sources, for exactly that.
+//!
+//! Calls nk makes *itself* through `lkl::syscall` are unaffected: those are
+//! written with LKL's numbers directly and are correct on either host.
 
 use crate::lkl;
 use crate::sched;
+use crate::syscall_nr::x86_to_lkl::translate as x86_translate;
 
 /// Hand a system call to Linux with its arguments untouched.
 ///
@@ -30,16 +52,21 @@ use crate::sched;
 /// to forward to.
 pub fn forward(nr: u64, args: &[u64; 6]) -> Option<i64> {
     count_entry(nr);
+    sched::set_last_syscall(nr);
+    let Some(lkl_nr) = x86_translate(nr) else {
+        count_exit(nr);
+        return Some(-38);
+    };
     let mut args_copy = *args;
     // On a machine without an entropy device (virtio-rng), Linux's random pool
     // is never initialized (crng_ready() remains false). Plain getrandom() with
     // flags == 0 blocks indefinitely on crng_init_wait. Supply GRND_INSECURE (0x4)
     // when unseeded flags == 0 so Linux returns unseeded pseudo-random bytes immediately.
-    if nr == 278 && args_copy[2] == 0 {
+    if lkl_nr == 278 && args_copy[2] == 0 {
         args_copy[2] = 4; // GRND_INSECURE
     }
     let was = sched::set_user_syscall(true);
-    let ret = lkl::syscall(nr as i64, args_copy.map(|a| a as i64));
+    let ret = lkl::syscall(lkl_nr as i64, args_copy.map(|a| a as i64));
     sched::set_user_syscall(was);
     count_exit(nr);
     Some(ret)
@@ -51,6 +78,14 @@ pub fn forward(nr: u64, args: &[u64; 6]) -> Option<i64> {
 /// back. Printed by the watchdog.
 static mut ENTRIES: [u64; 512] = [0; 512];
 static mut EXITS: [u64; 512] = [0; 512];
+
+/// Total forwarded syscall entries, monotonic. The watchdog's liveness
+/// signal: the clock says nothing about whether the machine is alive, but a
+/// system making no syscalls at all -- not even a timer tick's worth of
+/// gettimeofday -- is stopped, wedged or finished, whatever the time is.
+pub fn activity() -> u64 {
+    unsafe { (&*(&raw const ENTRIES)).iter().sum() }
+}
 
 #[inline]
 fn count_entry(nr: u64) {

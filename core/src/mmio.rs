@@ -28,6 +28,7 @@
 
 /// # Safety
 /// `addr` must be a mapped Device-memory register of this width.
+#[cfg(target_arch = "aarch64")]
 #[inline]
 pub unsafe fn readl(addr: usize) -> u32 {
     let v: u32;
@@ -35,26 +36,57 @@ pub unsafe fn readl(addr: usize) -> u32 {
     v
 }
 
+/// x86-64 has no separate Device load: a volatile access to memory the page
+/// tables mark uncacheable is the same instruction as any other load, and
+/// the ordering AArch64 gets from Device-nGnRnE comes from the strong
+/// store ordering of the architecture instead.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub unsafe fn readl(addr: usize) -> u32 {
+    core::ptr::read_volatile(addr as *const u32)
+}
+
 /// # Safety
 /// As `readl`.
+#[cfg(target_arch = "aarch64")]
 #[inline]
 pub unsafe fn writel(addr: usize, v: u32) {
     core::arch::asm!("str {v:w}, [{a}]", v = in(reg) v, a = in(reg) addr, options(nostack, preserves_flags));
 }
 
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub unsafe fn writel(addr: usize, v: u32) {
+    core::ptr::write_volatile(addr as *mut u32, v);
+}
+
 /// # Safety
 /// As `readl`. Byte access is legal on some registers and not others -- the
 /// GIC's priority registers are byte-addressed by design, most are not.
+#[cfg(target_arch = "aarch64")]
 #[inline]
 pub unsafe fn writeb(addr: usize, v: u8) {
     core::arch::asm!("strb {v:w}, [{a}]", v = in(reg) v, a = in(reg) addr, options(nostack, preserves_flags));
 }
 
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub unsafe fn writeb(addr: usize, v: u8) {
+    core::ptr::write_volatile(addr as *mut u8, v);
+}
+
 /// # Safety
 /// As `readl`.
+#[cfg(target_arch = "aarch64")]
 #[inline]
 pub unsafe fn readb(addr: usize) -> u8 {
     let v: u32;
     core::arch::asm!("ldrb {v:w}, [{a}]", v = out(reg) v, a = in(reg) addr, options(nostack, preserves_flags));
     v as u8
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub unsafe fn readb(addr: usize) -> u8 {
+    core::ptr::read_volatile(addr as *const u8)
 }

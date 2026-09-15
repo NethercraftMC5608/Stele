@@ -272,6 +272,17 @@ cpu_switch:
 // task_exit rather than off the end of its stack.
 .global task_start
 task_start:
+    // Publish the task this CPU just replaced, before anything else.
+    //
+    // The outgoing task was marked Ready while its registers were still live
+    // on the CPU that switched it out, so until someone starts running here
+    // and clears its `on_cpu`, it must not be picked -- a second CPU running
+    // it would share one stack. This call is that moment for a freshly
+    // spawned task, exactly as the tail of `schedule_on` is for one that was
+    // only switched out. x19/x20 are preserved across a C call, which is
+    // what keeps the entry point and its argument intact.
+    bl      finish_switch_asm
+
     // Unmask interrupts before the task's first instruction.
     //
     // Every other task resumes by returning through irq_entry's epilogue,

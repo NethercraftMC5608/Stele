@@ -49,11 +49,20 @@ pub fn init(fdt: &Fdt) {
 
 /// Turn the machine off. Returns only if the firmware refuses.
 pub fn poweroff() {
+    #[cfg(target_arch = "aarch64")]
     unsafe {
         match core::ptr::read(&raw const METHOD) {
             Method::Hvc => core::arch::asm!("hvc #0", in("x0") SYSTEM_OFF as u64, options(nostack)),
             Method::Smc => core::arch::asm!("smc #0", in("x0") SYSTEM_OFF as u64, options(nostack)),
             Method::None => {}
         }
+    }
+    // PSCI is an Arm firmware interface; there is no `hvc`/`smc` on x86-64.
+    // Powering off a PC means an ACPI write or a hypervisor-specific port,
+    // neither of which nk has yet -- so this is honestly a no-op and the
+    // caller falls through to halting.
+    #[cfg(target_arch = "x86_64")]
+    {
+        let _ = SYSTEM_OFF;
     }
 }

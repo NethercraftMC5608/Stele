@@ -91,7 +91,61 @@ pub unsafe fn init(gicd: usize, gicr: usize) {
         options(nostack)
     );
 
+    // The reschedule SGI is enabled alongside everything else: without it
+    // a CPU can be told to reschedule only by a timer tick landing first.
+    w32(gicr + GICR_IGROUPR0, r32(gicr + GICR_IGROUPR0) | (1 << SGI_RESCHED));
+    writeb(gicr + GICR_IPRIORITYR + SGI_RESCHED as usize, PRIORITY);
+    w32(gicr + GICR_ISENABLER0, r32(gicr + GICR_ISENABLER0) | (1 << SGI_RESCHED));
+
     println!("  gic:    v3 up, dist {:#x} redist {:#x}", gicd, gicr);
+}
+
+/// The SGI used as the reschedule IPI. SGI 0..7 are free for the OS;
+/// 1 is the conventional choice and avoids 0, which firmware sometimes
+/// reserves for its own use.
+pub const SGI_RESCHED: u32 = 1;
+
+/// Bring up the interrupt controller on a secondary CPU.
+///
+/// The distributor is already configured by `init` on the boot CPU -- it is
+/// one per machine and stays that way. What each CPU owns is its
+/// redistributor (found by striding from the base by the CPU index; `virt`
+/// lays them out densely, one 128KB frame per CPU) and its CPU interface
+/// system registers. Enables the timer PPI and the reschedule SGI so the
+/// new CPU can tick and be woken.
+///
+/// # Safety
+/// `init` must have run on the boot CPU. `redist_stride` is the distance
+/// between redistributors -- 0x20000 on `virt`.
+pub unsafe fn init_secondary(redist_base: usize, redist_stride: usize, timer_ppi: u32) {
+    let gicr = redist_base + crate::arch::cpu_id() * redist_stride;
+
+    let waker = r32(gicr + GICR_WAKER);
+    w32(gicr + GICR_WAKER, waker & !(1 << 1));
+    while r32(gicr + GICR_WAKER) & (1 << 2) != 0 {}
+
+    let mut sre: u64;
+    core::arch::asm!("mrs {}, ICC_SRE_EL1", out(reg) sre, options(nomem, nostack));
+    core::arch::asm!("msr ICC_SRE_EL1, {}", "isb", in(reg) sre | 1, options(nostack));
+
+    core::arch::asm!(
+        "msr ICC_PMR_EL1, {pmr}",
+        "msr ICC_BPR1_EL1, {bpr}",
+        "msr ICC_IGRPEN1_EL1, {en}",
+        "isb",
+        pmr = in(reg) 0xffu64,
+        bpr = in(reg) 0u64,
+        en  = in(reg) 1u64,
+        options(nostack)
+    );
+
+    // Enable the reschedule SGI and the timer PPI on this CPU. Uses the
+    // raw frame rather than `enable_ppi` because that helper targets the
+    // boot CPU's cached base.
+    w32(gicr + GICR_IGROUPR0, r32(gicr + GICR_IGROUPR0) | (1 << SGI_RESCHED) | (1 << timer_ppi));
+    writeb(gicr + GICR_IPRIORITYR + SGI_RESCHED as usize, PRIORITY);
+    writeb(gicr + GICR_IPRIORITYR + timer_ppi as usize, PRIORITY);
+    w32(gicr + GICR_ISENABLER0, (1 << SGI_RESCHED) | (1 << timer_ppi));
 }
 
 /// Enable one private interrupt (an SGI or PPI, INTID < 32) on this CPU.

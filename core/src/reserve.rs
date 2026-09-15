@@ -33,6 +33,8 @@ struct Reservation {
     end: u64,
     writable: bool,
     exec: bool,
+    /// PROT_NONE: backed, but unreachable from user space.
+    none: bool,
     live: bool,
 }
 
@@ -42,19 +44,18 @@ static mut RESERVED: [Reservation; MAX] = [Reservation {
     end: 0,
     writable: false,
     exec: false,
+    none: false,
     live: false,
 }; MAX];
 
 fn space() -> u64 {
-    let v: u64;
-    unsafe { core::arch::asm!("mrs {}, ttbr0_el1", out(reg) v, options(nomem, nostack)) };
-    paging::table_of(v)
+    paging::table_of(crate::arch::current_page_table())
 }
 
 /// Record a range as reserved but unmapped. False when the table is full,
 /// which the caller must treat as a refusal rather than ignore: a
 /// reservation nobody recorded is a segfault on first touch.
-pub fn add(start: u64, len: u64, writable: bool, exec: bool) -> bool {
+pub fn add(start: u64, len: u64, writable: bool, exec: bool, none: bool) -> bool {
     let here = space();
     unsafe {
         let r = &mut *(&raw mut RESERVED);
@@ -65,6 +66,7 @@ pub fn add(start: u64, len: u64, writable: bool, exec: bool) -> bool {
                 end: start + len,
                 writable,
                 exec,
+                none,
                 live: true,
             };
             return true;
@@ -123,7 +125,7 @@ pub fn inherit(parent: u64, child: u64) {
 ///
 /// Returns whether any reservation covered part of the range -- which is how
 /// `mprotect` tells "nothing there" from "nothing there *yet*".
-pub fn protect(start: u64, len: u64, writable: bool, exec: bool) -> bool {
+pub fn protect(start: u64, len: u64, writable: bool, exec: bool, none: bool) -> bool {
     let here = space();
     let end = start + len;
     let mut touched = false;
@@ -147,6 +149,7 @@ pub fn protect(start: u64, len: u64, writable: bool, exec: bool) -> bool {
             r[i].end = hi.min(end);
             r[i].writable = writable;
             r[i].exec = exec;
+            r[i].none = none;
             for piece in [head, tail].into_iter().flatten() {
                 match r.iter_mut().find(|s| !s.live) {
                     Some(slot) => {
@@ -163,6 +166,68 @@ pub fn protect(start: u64, len: u64, writable: bool, exec: bool) -> bool {
         }
     }
     touched
+}
+
+/// Where an address sits relative to this space's reservations.
+///
+/// Returns `(inside, last_end, next_start, live)`: whether a reservation
+/// covers it, the end of the nearest one below, the start of the nearest one
+/// above, and how many are live. The fault reporter prints this because
+/// "unmapped" and "reserved but not yet faulted in" produce the identical
+/// translation fault, and the difference is the whole diagnosis.
+pub fn describe(addr: u64) -> (bool, u64, u64, usize) {
+    let here = space();
+    let page = addr & !4095;
+    let (mut inside, mut below, mut above, mut live) = (false, 0u64, u64::MAX, 0usize);
+    unsafe {
+        for s in (*(&raw const RESERVED)).iter() {
+            if !(s.live && s.space == here) {
+                continue;
+            }
+            live += 1;
+            if page >= s.start && page < s.end {
+                inside = true;
+            }
+            if s.end <= page && s.end > below {
+                below = s.end;
+            }
+            if s.start > page && s.start < above {
+                above = s.start;
+            }
+        }
+    }
+    (inside, below, if above == u64::MAX { 0 } else { above }, live)
+}
+
+/// The reservation covering exactly this range, if one does.
+///
+/// `mremap` needs it: growing a private anonymous mapping means growing the
+/// promise behind it, and the new range has to carry the same permissions
+/// the old one had rather than a guess.
+pub fn covering(start: u64, len: u64) -> Option<(bool, bool, bool)> {
+    let here = space();
+    let end = start + len;
+    unsafe {
+        (*(&raw const RESERVED))
+            .iter()
+            .find(|s| s.live && s.space == here && s.start <= start && end <= s.end)
+            .map(|s| (s.writable, s.exec, s.none))
+    }
+}
+
+/// How many reservations are live, and how much address space they cover.
+pub fn report() {
+    let here = space();
+    let (mut n, mut bytes) = (0usize, 0u64);
+    unsafe {
+        for s in (*(&raw const RESERVED)).iter() {
+            if s.live && s.space == here {
+                n += 1;
+                bytes += s.end - s.start;
+            }
+        }
+    }
+    crate::println!("  reservations: {} live, {} MiB of address space", n, bytes >> 20);
 }
 
 /// Drop every reservation belonging to an address space that is going away.
@@ -184,12 +249,12 @@ pub fn forget_space(table: u64) {
 pub fn fault_in(addr: u64) -> bool {
     let here = space();
     let page = addr & !4095;
-    let (writable, exec) = unsafe {
+    let (writable, exec, none) = unsafe {
         match (*(&raw const RESERVED))
             .iter()
             .find(|s| s.live && s.space == here && page >= s.start && page < s.end)
         {
-            Some(s) => (s.writable, s.exec),
+            Some(s) => (s.writable, s.exec, s.none),
             None => return false,
         }
     };
@@ -199,9 +264,14 @@ pub fn fault_in(addr: u64) -> bool {
         return false;
     };
     unsafe {
-        let root: u64;
-        core::arch::asm!("mrs {}, ttbr0_el1", out(reg) root, options(nomem, nostack));
-        paging::map_user_permissions(paging::table_of(root), page, frame as u64, 4096, exec, writable);
+        let root = paging::table_of(crate::arch::current_page_table());
+        paging::map_user_permissions(root, page, frame as u64, 4096, exec, writable);
+        // A PROT_NONE reservation keeps its backing but denies all user
+        // access; mapping it readable would make mprotect(PROT_NONE) a
+        // no-op for any page that had not yet been touched.
+        if none {
+            paging::protect_user_none(root, page, 4096);
+        }
     }
     true
 }

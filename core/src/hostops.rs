@@ -22,6 +22,7 @@
 use crate::sched;
 use crate::sync::{irq_restore, irq_save, Mutex, Semaphore};
 use alloc::boxed::Box;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 // --- the services nk provides to any Linux, shim or LKL -----------------
 //
@@ -53,18 +54,17 @@ pub extern "C" fn nk_alloc_pages(n: usize) -> *mut u8 {
 /// Mask interrupts and report the previous state, for a Linux spinlock.
 #[no_mangle]
 pub extern "C" fn nk_irq_save() -> u64 {
-    let daif: u64;
-    unsafe {
-        core::arch::asm!("mrs {}, daif", "msr daifset, #0x2", out(reg) daif, options(nomem, nostack))
-    };
-    daif
+    // Through `sync`, which already has an arm per architecture: DAIF on
+    // AArch64, RFLAGS via pushfq/cli on x86-64. Duplicating the two
+    // instructions here is how the two drift.
+    crate::sync::irq_save()
 }
 
 /// # Safety
 /// `flags` came from `nk_irq_save`.
 #[no_mangle]
 pub unsafe extern "C" fn nk_irq_restore(flags: u64) {
-    core::arch::asm!("msr daif, {}", in(reg) flags, options(nomem, nostack));
+    crate::sync::irq_restore(flags);
 }
 
 #[no_mangle]
@@ -306,6 +306,49 @@ pub fn tls_cleanup() {
     }
 }
 
+/// The first TLS key task `id` still holds a value for, with the generation
+/// that set it.
+///
+/// A task reaching reclaim with live TLS never went through `task_exit`: the
+/// host task pointer it left behind would be inherited by the slot's next
+/// occupant, which would then destroy a Linux task belonging to a dead
+/// generation or hand its dead tid to `__switch_to`. The scheduler checks
+/// this at reclaim and says so; with the current exit paths it should never
+/// fire, and that is exactly why it is worth asserting.
+pub fn tls_pending(id: usize) -> Option<(usize, u64)> {
+    if id >= sched::MAX_TASKS {
+        return None;
+    }
+    unsafe {
+        let tls = &*(&raw const TLS);
+        for key in 0..MAX_KEYS {
+            if !tls[id][key].is_null() {
+                return Some((key, (sched::uid(id) >> 16) as u64));
+            }
+        }
+    }
+    None
+}
+
+/// Drop every TLS value task `id` holds, without running destructors.
+///
+/// Deliberately not `tls_cleanup`: that runs on the *exiting* thread and
+/// calls into LKL, which may schedule. This is called from reclaim, where
+/// the task is already gone and there is no context to run a destructor on
+/// -- the value is leaked rather than handed to a callback that would touch
+/// a dead Linux task.
+pub fn tls_forget(id: usize) {
+    if id >= sched::MAX_TASKS {
+        return;
+    }
+    unsafe {
+        let tls = &mut *(&raw mut TLS);
+        for key in 0..MAX_KEYS {
+            tls[id][key] = core::ptr::null_mut();
+        }
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn nk_tls_set(key: usize, value: *mut u8) -> i32 {
     unsafe {
@@ -387,7 +430,14 @@ pub extern "C" fn nk_timer_free(id: usize) {
     unsafe { (*(&raw mut TIMERS))[id] = None };
 }
 
-static mut DUE: u32 = 0;
+/// Timers whose deadline has passed and which the timer thread has not yet
+/// run. Atomic because the two sides are on different CPUs: the BSP tick
+/// sets bits with `fetch_or` while the timer thread drains with `swap`.
+/// As a plain `static mut` the `|=` and the take are both read-modify-write,
+/// and an interleaving loses a bit outright -- a timer that never fires,
+/// with nothing to report it. The wake below is what the thread waits on;
+/// this counter is what it must not lose.
+static DUE: AtomicU32 = AtomicU32::new(0);
 static mut TIMER_TASK: usize = usize::MAX;
 
 // PROBE
@@ -419,7 +469,7 @@ pub fn tick_timers() {
         }
         if due != 0 {
             N_DUE += 1;
-            DUE |= due;
+            DUE.fetch_or(due, Ordering::SeqCst);
             let task = core::ptr::read(&raw const TIMER_TASK);
             if task != usize::MAX {
                 sched::wake(task);
@@ -433,12 +483,21 @@ pub fn tick_timers() {
 extern "C" fn timer_thread(_: usize) {
     loop {
         let flags = irq_save();
-        let due = unsafe { core::mem::take(&mut *(&raw mut DUE)) };
+        let due = DUE.swap(0, Ordering::SeqCst);
         if due == 0 {
-            // Nothing to do. Block with interrupts masked until the tick
-            // marks something due -- the same ordering every other wait in
-            // nk uses, for the same reason.
-            sched::block(flags);
+            // Predicate: DUE != 0 (a deadline has passed).
+            // Protected by: DUE's own atomicity plus the runqueue lock,
+            //   so draining and deciding to sleep is atomic against the tick.
+            // Published: `tick_timers` `fetch_or`s the bits and then calls
+            //   `sched::wake`, whose lock acquire orders the bits ahead of
+            //   the wake.
+            // Why the re-check closes it: a deadline that passes between the
+            //   swap above and the sleep sets DUE again; the re-check sees it
+            //   and this thread loops to drain instead of sleeping through a
+            //   timer. With the old unconditional `block_on`, that tick was
+            //   refused (the thread still read as Running) and then the
+            //   thread slept, so the timer fired late by a whole sleep.
+            sched::block_on_cond(flags, 0, || DUE.load(Ordering::SeqCst) != 0);
             continue;
         }
         unsafe { irq_restore(flags) };

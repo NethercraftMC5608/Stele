@@ -201,6 +201,13 @@ struct lkl_host_operations {
 				enum lkl_prot prot);
 
 	struct lkl_dev_pci_ops *pci_ops;
+
+	/* nk: owner installs and tid assignments, for the stall ring */
+	void (*switch_trace)(int prev_pid, unsigned long long prev_tid,
+			     int next_pid, unsigned long long next_tid);
+
+	/* nk: does the host thread behind this tid still exist? */
+	int (*thread_alive)(lkl_thread_t tid);
 };
 
 /**

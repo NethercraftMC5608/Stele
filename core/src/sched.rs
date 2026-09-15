@@ -11,7 +11,7 @@
 
 use crate::frames::{self, PAGE};
 use crate::println;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Four pages. Generous for what runs here, and cheap; a Linux driver's probe
 /// path is not shy with stack, and a kernel stack overflow with no guard page
@@ -25,9 +25,9 @@ const STACK_PAGES: usize = 16;
 /// before anything useful runs. Sixty-four is also the width of the waiter
 /// bitmask in `sync.rs`, and the two must stay equal -- a task whose slot is
 /// past the end of that mask can be blocked and never woken.
-pub const MAX_TASKS: usize = 64;
+pub const MAX_TASKS: usize = 128;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum State {
     Unused,
     Ready,
@@ -67,11 +67,68 @@ pub struct Task {
     /// first time one does.
     pub shadow: usize,
     pub state: State,
+    /// Whether this task is on a CPU right now: running, or picked and not
+    /// yet fully switched out.
+    ///
+    /// `schedule` marks the outgoing task `Ready` while its registers are
+    /// still live on the CPU doing the switch, so between that mark and the
+    /// completion of `cpu_switch` a `Ready` task is not yet pickable. This
+    /// flag closes that window: set when a task is picked, cleared by the
+    /// incoming task in `finish_switch` once the switch has landed. Without
+    /// it two CPUs pick one `Ready` task and share its stack.
+    pub on_cpu: bool,
     pub name: &'static str,
+    pub home_cpu: u8,
+    pub affinity: u8,
+    pub migrations: u32,
+    /// What kind of work this is. See `schedpolicy::Class`.
+    ///
+    /// What the task was *assigned*; what it is treated as also depends on
+    /// how it has behaved, which is `effective_class`.
+    pub class: crate::schedpolicy::Class,
+    /// Weighted CPU time consumed, in nanoseconds scaled by weight. The
+    /// fairness key: within a class, least-vruntime runs first.
+    ///
+    /// Monotonic per task, and never reset -- a task that blocks for an hour
+    /// must not come back with a vruntime so far behind everything else that
+    /// it monopolises the CPU to catch up. New and waking tasks are placed
+    /// relative to the run queue's minimum instead; see `place_vruntime`.
+    pub vruntime: u64,
+    /// Evidence of interactivity, 0..=INTERACTIVE_MAX. Raised by blocking
+    /// voluntarily, lowered by using a whole slice. Never set by the task.
+    pub interactive: i8,
+    /// Cycle counter reading when this task was last given the CPU, and the
+    /// total it has run for. `ran_for` is what the fairness and interactivity
+    /// updates are computed from.
+    pub ran_at: u64,
+    pub accounted_at: u64,
+    pub slice_scored: bool,
+    pub wake_pending: bool,
+    pub ran_ns: u64,
+    /// When this task became runnable, for the wakeup latency histogram and
+    /// for ageing. Zero when it is not waiting.
+    pub ready_at: u64,
+    /// The thread's own name from `prctl(PR_SET_NAME)`, for the wait graph.
+    /// `name` above is nk's kind ("thread", "forked"); this is what the guest
+    /// called itself ("gmain", "WebKit2IPC", "pool-spawner").
+    pub comm: [u8; 16],
     pub slices: u64,
     /// What this task is blocked on, when it is blocked: the id of a
     /// semaphore or mutex. Zero when it blocked for some other reason.
     pub waiting_on: u32,
+    /// The task blocked in `join` on this one, plus one; 0 for nobody.
+    /// Stored as an offset so that a zeroed table means "no joiner" rather
+    /// than "task 0 is waiting", which would make `task_exit` wake the boot
+    /// task out of whatever it was really doing.
+    pub joiner: u32,
+    /// The tick this task's `sleep_ticks` ends at; 0 when it is not
+    /// sleeping. Read by the timer interrupt, which is what wakes it.
+    pub wake_at: u64,
+    /// The most recent system call this task forwarded to Linux. Set before
+    /// every entry; a task that entered Linux and never came back leaves its
+    /// last syscall number here, which turns "task 44 holds the cpu lock" into
+    /// "task 44 is stuck in syscall N". Zero until the first forward.
+    pub last_syscall: u64,
     pub ttbr0: u64,
     pub linux_pid: i64,
     pub exit_status: i32,
@@ -121,6 +178,14 @@ pub struct Task {
     /// console. When it has not, nk answers writes to 1 and 2 itself, which
     /// prints and cannot redirect.
     pub has_console: bool,
+    /// Which system-call interface this task's program speaks.
+    ///
+    /// Per task, not per machine: a native NETHOS program and a Linux one
+    /// run side by side, and the same `svc`/`syscall` instruction is read
+    /// against a different table depending on which this is. Set from the
+    /// ELF's `EI_OSABI` when the program is loaded, and inherited across
+    /// fork -- a child of a native process is running the same image.
+    pub nethos_abi: bool,
     /// Whether this task is inside a system call made *from EL0*.
     ///
     /// Linux asks nk to copy user memory for it, and the same code path
@@ -145,7 +210,7 @@ pub struct Task {
     /// address space -- while a forked child gets a copy of the entries
     /// (its pages are private copies; see `user.rs`). Bounded: a process
     /// with more shared mappings than this is told no at `mmap` time.
-    pub shared: [crate::user::SharedMap; 16],
+    pub shared: [crate::user::SharedMap; 256],
     pub nshared: usize,
     /// Signal state. `actions` is shared across threads the way the address
     /// space is -- dispositions belong to the process -- while `mask` and
@@ -175,9 +240,26 @@ static mut TASKS: [Task; MAX_TASKS] = [Task {
     stack: 0,
     shadow: 0,
     state: State::Unused,
+    on_cpu: false,
     name: "",
+    home_cpu: 0,
+    affinity: 0xff,
+    migrations: 0,
+    class: crate::schedpolicy::Class::Normal,
+    vruntime: 0,
+    interactive: 0,
+    ran_at: 0,
+    accounted_at: 0,
+    slice_scored: false,
+    wake_pending: false,
+    ran_ns: 0,
+    ready_at: 0,
+    comm: [0; 16],
     slices: 0,
     waiting_on: 0,
+    joiner: 0,
+    wake_at: 0,
+    last_syscall: 0,
     ttbr0: 0,
     linux_pid: 0,
     exit_status: 0,
@@ -191,6 +273,7 @@ static mut TASKS: [Task; MAX_TASKS] = [Task {
     vfork_done: 0,
     clear_child_tid: 0,
     has_console: false,
+    nethos_abi: false,
     user_syscall: false,
     tpidr: 0,
     shared: [crate::user::SharedMap {
@@ -199,7 +282,7 @@ static mut TASKS: [Task; MAX_TASKS] = [Task {
         region: 0,
         fd: -1,
         anonymous: false,
-    }; 16],
+    }; 256],
     nshared: 0,
     sig_actions: [crate::signal::Action::default(); 64],
     sig_mask: 0,
@@ -216,6 +299,267 @@ static mut TASKS: [Task; MAX_TASKS] = [Task {
 static mut CURRENT: usize = 0;
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
+pub const MAX_CPUS: usize = 8;
+
+#[derive(Clone, Copy)]
+struct CpuState {
+    current: usize,
+    need_resched: bool,
+    online: bool,
+    idle_task: usize,
+    idle: bool,
+    ipi_pending: bool,
+    switches: u64,
+    stolen: u64,
+    /// The task this CPU most recently switched away from. `finish_switch`
+    /// runs on this CPU when the next task begins (see `task_start` and the
+    /// tail of `schedule_on`) and uses this to publish that task: it is only
+    /// safe to pick once `cpu_switch` has stored its registers, and that is
+    /// exactly when someone starts running in its place.
+    prev: usize,
+}
+
+const CPU_INIT: CpuState = CpuState {
+    current: usize::MAX,
+    need_resched: false,
+    online: false,
+    idle_task: usize::MAX,
+    idle: false,
+    ipi_pending: false,
+    switches: 0,
+    stolen: 0,
+    prev: usize::MAX,
+};
+
+static mut CPUS: [CpuState; MAX_CPUS] = [CPU_INIT; MAX_CPUS];
+static NCPUS: AtomicUsize = AtomicUsize::new(1);
+
+#[inline]
+fn cpu_index(cpu: usize) -> usize {
+    if cpu < MAX_CPUS {
+        cpu
+    } else {
+        0
+    }
+}
+
+pub fn cpu_id() -> usize {
+    crate::arch::cpu_id()
+}
+
+pub fn cpu_count() -> usize {
+    NCPUS.load(Ordering::Relaxed).max(1).min(MAX_CPUS)
+}
+
+pub fn current_cpu_state(cpu: usize) -> (usize, bool, bool) {
+    let cpu = cpu_index(cpu);
+    unsafe {
+        let st = &(*(&raw const CPUS))[cpu];
+        (st.current, st.need_resched, st.online)
+    }
+}
+
+fn cpu_current_unchecked() -> usize {
+    let cpu = cpu_index(crate::arch::cpu_id());
+    unsafe { (*(&raw const CPUS))[cpu].current }
+}
+
+/// The calling CPU's current task.
+///
+/// Every direct `TASKS[cur()]` read outside the switch path goes through
+/// here. `CURRENT` itself is kept as a cpu-0 mirror only -- anything still
+/// reading it directly is correct on the boot CPU and wrong everywhere
+/// else, which is exactly the class of bug SMP exists to expose.
+#[inline]
+fn cur() -> usize {
+    cpu_current_unchecked()
+}
+
+fn set_cpu_current(cpu: usize, task: usize) {
+    let cpu = cpu_index(cpu);
+    unsafe {
+        (*(&raw mut CPUS))[cpu].current = task;
+    }
+    if cpu == 0 {
+        unsafe {
+            CURRENT = task;
+        }
+    }
+}
+
+fn cpu_online(cpu: usize) -> bool {
+    let cpu = cpu_index(cpu);
+    unsafe { (*(&raw const CPUS))[cpu].online }
+}
+
+fn mark_cpu_online(cpu: usize, current: usize) {
+    let cpu = cpu_index(cpu);
+    unsafe {
+        let st = &mut (*(&raw mut CPUS))[cpu];
+        st.online = true;
+        st.current = current;
+    }
+    let live = NCPUS.load(Ordering::Relaxed);
+    let want = (cpu + 1).min(MAX_CPUS);
+    if want > live {
+        NCPUS.store(want, Ordering::Relaxed);
+    }
+    if cpu == 0 {
+        unsafe {
+            CURRENT = current;
+        }
+    }
+}
+
+#[inline]
+fn need_resched_on(cpu: usize) -> bool {
+    let cpu = cpu_index(cpu);
+    unsafe { (*(&raw const CPUS))[cpu].need_resched }
+}
+
+#[inline]
+fn set_need_resched_on(cpu: usize) {
+    let cpu = cpu_index(cpu);
+    unsafe {
+        (*(&raw mut CPUS))[cpu].need_resched = true;
+    }
+    if cpu == 0 {
+        NEED_RESCHED.store(true, Ordering::Relaxed);
+    }
+}
+
+#[inline]
+fn take_need_resched_on(cpu: usize) -> bool {
+    let cpu = cpu_index(cpu);
+    let was = unsafe {
+        let st = &mut (*(&raw mut CPUS))[cpu];
+        core::mem::replace(&mut st.need_resched, false)
+    };
+    if cpu == 0 && was {
+        NEED_RESCHED.store(false, Ordering::Relaxed);
+    }
+    was
+}
+
+pub fn cpu_stats(cpu: usize) -> (u64, u64) {
+    let cpu = cpu_index(cpu);
+    unsafe {
+        let st = &(*(&raw const CPUS))[cpu];
+        (st.switches, st.stolen)
+    }
+}
+
+pub fn cpu_idle(cpu: usize) -> bool {
+    let cpu = cpu_index(cpu);
+    unsafe { (*(&raw const CPUS))[cpu].idle }
+}
+
+fn set_cpu_idle(cpu: usize, idle: bool) {
+    let cpu = cpu_index(cpu);
+    unsafe {
+        (*(&raw mut CPUS))[cpu].idle = idle;
+    }
+}
+
+pub fn take_cpu_ipi(cpu: usize) -> bool {
+    let cpu = cpu_index(cpu);
+    unsafe {
+        let st = &mut (*(&raw mut CPUS))[cpu];
+        core::mem::replace(&mut st.ipi_pending, false)
+    }
+}
+
+pub fn send_reschedule_ipi(cpu: usize) {
+    let cpu = cpu_index(cpu);
+    let me = cpu_index(crate::arch::cpu_id());
+    if cpu == me {
+        set_need_resched_on(cpu);
+        return;
+    }
+    unsafe {
+        let st = &mut (*(&raw mut CPUS))[cpu];
+        if !st.online {
+            return;
+        }
+        st.ipi_pending = true;
+        st.need_resched = true;
+        st.idle = false;
+    }
+    crate::arch::send_ipi(cpu);
+}
+
+fn pick_target_cpu(id: usize) -> usize {
+    let mask = unsafe { (*(&raw const TASKS))[id].affinity };
+    let me = cpu_index(crate::arch::cpu_id());
+    // Wakes are placement decisions too, and the same LKL line applies: a
+    // task woken onto an AP while Linux is running would execute its next
+    // syscall there. Everything comes back to the boot CPU. See `LKL_ACTIVE`.
+    if lkl_active() {
+        return 0;
+    }
+    if mask & (1 << me) != 0 && cpu_online(me) {
+        return me;
+    }
+    let n = cpu_count();
+    for cpu in 0..n {
+        if mask & (1 << cpu) != 0 && cpu_online(cpu) {
+            return cpu;
+        }
+    }
+    me
+}
+
+pub fn set_affinity(id: usize, mask: u8) {
+    if id >= MAX_TASKS || mask == 0 {
+        return;
+    }
+    let flags = crate::sync::irq_save();
+    unsafe {
+        TASKS[id].affinity = mask;
+        if mask & (1u8 << TASKS[id].home_cpu.min(7)) == 0 {
+            let mut target = usize::MAX;
+            for cpu in 0..cpu_count() {
+                if mask & (1u8 << cpu.min(7)) != 0 && cpu_online(cpu) {
+                    target = cpu;
+                    break;
+                }
+            }
+            if target != usize::MAX {
+                TASKS[id].home_cpu = target as u8;
+                TASKS[id].migrations += 1;
+            }
+        }
+        crate::sync::irq_restore(flags);
+    }
+}
+
+pub fn task_home_cpu(id: usize) -> usize {
+    if id >= MAX_TASKS {
+        return 0;
+    }
+    unsafe { TASKS[id].home_cpu as usize }
+}
+
+pub fn task_migrations(id: usize) -> u32 {
+    if id >= MAX_TASKS {
+        return 0;
+    }
+    unsafe { TASKS[id].migrations }
+}
+
+pub fn wake_on_cpu(id: usize, what: u32, cpu: usize) -> bool {
+    let cpu = cpu_index(cpu);
+    if !cpu_online(cpu) {
+        return false;
+    }
+    let me = cpu_index(crate::arch::cpu_id());
+    let woke = wake_on(id, what);
+    if woke && cpu != me {
+        send_reschedule_ipi(cpu);
+    }
+    woke
+}
+
 extern "C" {
     fn cpu_switch(prev_sp: *mut usize, next_sp: usize);
     fn task_start();
@@ -231,22 +575,113 @@ pub fn init() {
         t.state = State::Running;
         t.name = "boot";
         t.shadow = frames::alloc().expect("no memory for the boot task shadow") as usize;
-        CURRENT = 0;
-        set_shadow(t.shadow);
+        let shadow = t.shadow;
+        mark_cpu_online(0, 0);
+        set_shadow(shadow);
     }
+}
+
+pub fn init_secondary(cpu: usize) {
+    let cpu = cpu_index(cpu);
+    unsafe {
+        let st = &mut (*(&raw mut CPUS))[cpu];
+        st.online = false;
+        st.current = usize::MAX;
+        st.need_resched = false;
+        st.idle_task = usize::MAX;
+    }
+    let live = NCPUS.load(Ordering::Relaxed);
+    let want = (cpu + 1).min(MAX_CPUS);
+    if want > live {
+        NCPUS.store(want, Ordering::Relaxed);
+    }
+}
+
+pub fn online_cpu(cpu: usize, current: usize) {
+    if current < MAX_TASKS {
+        unsafe {
+            // The task was spawned Ready; it becomes Running only by being
+            // picked, but this CPU starts *inside* it -- there is no switch
+            // to perform. Mark it so pick and account treat it as the
+            // incumbent rather than a rival candidate.
+            if TASKS[current].state == State::Ready {
+                TASKS[current].state = State::Running;
+                // This CPU runs the task from birth, with no switch to set
+                // the flag, so it is set here or the task would look
+                // pickable while this CPU already owns it.
+                TASKS[current].on_cpu = true;
+                TASKS[current].ran_at = crate::arch::cycles();
+                TASKS[current].accounted_at = TASKS[current].ran_at;
+                TASKS[current].ready_at = 0;
+            }
+        }
+    }
+    mark_cpu_online(cpu, current);
 }
 
 /// Put SP_EL0 back to the current task's shadow after a return from EL0,
 /// where it held the user stack pointer instead.
 pub fn restore_task_ptr() {
-    unsafe { set_shadow((*(&raw const TASKS))[CURRENT].shadow) };
+    let cur = cpu_current_unchecked();
+    unsafe { set_shadow((*(&raw const TASKS))[cur].shadow) };
 }
 
 /// Point SP_EL0 at this task's shadow page. Must happen before any Linux code
 /// runs on the task, and before every switch to it.
 #[inline]
 fn set_shadow(addr: usize) {
+    #[cfg(target_arch = "aarch64")]
     unsafe { core::arch::asm!("msr sp_el0, {}", in(reg) addr, options(nomem, nostack)) };
+    #[cfg(target_arch = "x86_64")]
+    let _ = addr;
+}
+
+/// One task's FPSIMD state: q0-q31, FPCR and FPSR, which is everything an
+/// EL0 thread can carry in the vector unit.
+///
+/// nk enables FP/SIMD for EL0 and EL1 (`CPACR_EL1.FPEN = 3`), and the guest
+/// is full of it -- Skia's raster pipeline, JSC, glibc's memcpy are all NEON.
+/// Nothing saved the vector registers across a context switch, so a task
+/// preempted mid-SIMD resumed with whatever the last task to touch the unit
+/// had left in it. The first symptom looked like Skia's gradient stage
+/// searching a stop index of 775 million and reading a kernel address: the
+/// index was not computed from the gradient at all, it was another task's
+/// vector lane.
+///
+/// 16-byte aligned because `stp qN, qN+1` requires it. Indexed by task slot,
+/// so it is host-static and reset when a slot is reused.
+#[repr(C, align(16))]
+#[derive(Clone, Copy)]
+pub struct FpSave {
+    pub q: [u64; 64],
+    pub fpcr: u64,
+    pub fpsr: u64,
+}
+
+static mut FP_SAVE: [FpSave; MAX_TASKS] = [FpSave { q: [0; 64], fpcr: 0, fpsr: 0 }; MAX_TASKS];
+
+/// A fresh task starts with a zeroed vector unit, like a process on Linux.
+pub fn fp_reset(id: usize) {
+    unsafe {
+        let p = (&raw mut FP_SAVE[id]) as *mut u8;
+        core::ptr::write_bytes(p, 0, core::mem::size_of::<FpSave>());
+    }
+}
+
+/// `fork` and `clone` copy the vector unit; the child runs on the parent's
+/// state until it changes it.
+pub fn fp_snapshot(id: usize) -> FpSave {
+    unsafe { FP_SAVE[id] }
+}
+
+pub fn fp_install(id: usize, state: FpSave) {
+    unsafe { FP_SAVE[id] = state };
+}
+
+/// The destination for the assembly save/restore, for the current task.
+#[no_mangle]
+pub extern "C" fn nk_fp_addr() -> u64 {
+    unsafe { (&raw mut FP_SAVE[current_id()]) as u64 }
 }
 
 /// Reclaim tasks that have finished and that nobody is going to wait for.
@@ -264,56 +699,177 @@ fn set_shadow(addr: usize) {
 /// with a live parent is that parent's to reap: its exit status is still the
 /// answer to a `wait4` that has not happened yet.
 fn reclaim_finished() {
-    let flags = crate::sync::irq_save();
+    // Under the runqueue lock: this frees stacks and shadows and blanks
+    // slots, and every other CPU picks tasks under this lock.
+    let g = RUNQUEUE.lock();
     unsafe {
         for id in 0..MAX_TASKS {
-            if id == CURRENT {
+            if id == cur() {
                 continue;
             }
             let t = TASKS[id];
             if t.state != State::Finished {
                 continue;
             }
-            let orphan = TASKS[t.parent].state == State::Unused;
-            if !(t.shares_mm || orphan) {
+            // A finished task is not necessarily *off its stack*. `task_exit`
+            // marks Finished and then yields in a loop, so until it is
+            // switched away it is still executing -- or halted -- on the very
+            // pages this would hand back. Freeing them lets the next `spawn`
+            // build a new task on top of the old one's live frame, and the
+            // old task resumes into it: a wild jump (measured: `rip 0x3`, the
+            // return address the new frame happened to contain) attributed to
+            // whichever task was unlucky enough to be running there.
+            //
+            // `on_cpu` is exactly that fact -- set when a CPU starts running a
+            // task, cleared by `finish_switch` once its registers are stored.
+            // A finished task that has genuinely switched away has it clear
+            // and is safe to reclaim; one still on a stack does not.
+            if t.on_cpu {
+                continue;
+            }
+            let orphan = TASKS[t.parent].state == State::Unused || TASKS[t.parent].state == State::Finished;
+            let kthread = t.ttbr0 == 0;
+            if !(t.shares_mm || orphan || kthread) {
                 continue;
             }
             // A thread's address space belongs to the threads it shared it
             // with; an orphan process owns its own and takes it with it.
-            if !t.shares_mm {
+            if !t.shares_mm && t.ttbr0 != 0 {
                 crate::paging::destroy_user_address_space(t.ttbr0);
                 mm_drop(t.ttbr0);
             }
-            for i in 0..STACK_PAGES {
-                frames::free((t.stack + i * PAGE) as *mut u8);
-            }
+            return_stack(t.stack);
             frames::free(t.shadow as *mut u8);
+            // A task that still holds TLS at reclaim never went through
+            // `task_exit`: whatever host task pointer it left behind would
+            // be inherited by the slot's next occupant -- which would then
+            // destroy a Linux task belonging to a dead generation, or hand
+            // its dead tid to `__switch_to`. Clear it, and say so: with
+            // the current exit paths this line should never print.
+            if let Some((key, gen)) = crate::hostops::tls_pending(id) {
+                println!(
+                    "  !! reclaim: task {} (gen {}) had live TLS key {} -- clearing",
+                    id, gen, key
+                );
+                crate::hostops::tls_forget(id);
+            }
             TASKS[id].state = State::Unused;
         }
     }
-    unsafe { crate::sync::irq_restore(flags) };
+    unsafe { RUNQUEUE.unlock(g) };
+}
+
+/// Task stacks come from one arena carved out of RAM at first use.
+///
+/// `frames::alloc_contiguous` walks a bump pointer that `alloc()` shares: by
+/// the time WebKit is up, single-frame allocations have walked it to the end
+/// of RAM, and a contiguous request then fails even with tens of thousands
+/// of frames free -- "out of memory for a task stack: free=22185" on a
+/// machine with 86 MiB idle. The arena is taken once, while the bump still
+/// has room, and handed out as 64 KiB stacks through a pool, so spawn/reap
+/// churn reuses it and never touches the dying bump again.
+const STACK_POOL_MAX: usize = 256;
+const STACK_ARENA_PAGES: usize = 4096;      // 16 MiB, 256 stacks
+static mut STACK_POOL: [usize; STACK_POOL_MAX] = [0; STACK_POOL_MAX];
+static mut STACK_POOL_LEN: usize = 0;
+static mut STACK_ARENA: usize = 0;
+static mut STACK_ARENA_NEXT: usize = 0;
+
+/// Serialises the stack pool. It was a plain `static mut` guarded only by an
+/// interrupt mask, and an interrupt mask stops nothing on another CPU: an AP
+/// spawning its idle task while the BSP spawned anything else ran two
+/// `take_stack`s against one `STACK_POOL_LEN`, and the pool handed the *same*
+/// 64 KiB stack to two tasks. Both then build their initial frame at the same
+/// top and run on the same memory; the visible result is a wild jump or a
+/// corrupted trap frame somewhere else entirely, which is what made this look
+/// like a scheduler bug for so long.
+///
+/// Its own lock rather than the runqueue's: the pool is also touched from
+/// `reclaim_finished`, which already holds the runqueue lock, so reusing that
+/// lock here would self-deadlock. Held only for the pool/arena arithmetic --
+/// zeroing a 64 KiB stack happens outside it.
+static STACK_LOCK: crate::sync::Spinlock = crate::sync::Spinlock::new();
+
+fn take_stack() -> Option<usize> {
+    let flags = STACK_LOCK.lock();
+    let taken = unsafe {
+        if STACK_POOL_LEN > 0 {
+            STACK_POOL_LEN -= 1;
+            let stack = STACK_POOL[STACK_POOL_LEN];
+            STACK_POOL[STACK_POOL_LEN] = 0;
+            Some(stack)
+        } else if STACK_ARENA == 0 {
+            // No `?` here: an early return would drop the lock still held.
+            match frames::alloc_contiguous(STACK_ARENA_PAGES) {
+                Some(p) => {
+                    STACK_ARENA = p as usize;
+                    STACK_ARENA_NEXT = STACK_PAGES;
+                    Some(STACK_ARENA)
+                }
+                None => None,
+            }
+        } else if STACK_ARENA_NEXT + STACK_PAGES <= STACK_ARENA_PAGES {
+            let stack = STACK_ARENA + STACK_ARENA_NEXT * PAGE;
+            STACK_ARENA_NEXT += STACK_PAGES;
+            Some(stack)
+        } else {
+            // Arena exhausted: the old path, and its panic, as the last word.
+            frames::alloc_contiguous(STACK_PAGES).map(|p| p as usize)
+        }
+    };
+    unsafe { STACK_LOCK.unlock(flags) };
+    // Zeroed outside the lock: 64 KiB under a spinlock would stall every
+    // other CPU for no reason. The address is already exclusively ours.
+    if let Some(stack) = taken {
+        unsafe { core::ptr::write_bytes(stack as *mut u8, 0, STACK_PAGES * PAGE) };
+    }
+    taken
+}
+
+fn return_stack(stack: usize) {
+    let flags = STACK_LOCK.lock();
+    unsafe {
+        if STACK_POOL_LEN < STACK_POOL_MAX {
+            STACK_POOL[STACK_POOL_LEN] = stack;
+            STACK_POOL_LEN += 1;
+        }
+        // Full pool: the block stays in the arena. Returning it to the
+        // single-frame list would put a 64 KiB stack beyond the reach of
+        // every future take, which is how the bump ran out to begin with.
+        STACK_LOCK.unlock(flags);
+    }
 }
 
 /// Create a task. `entry` is called with `arg`, and falling off the end of it
 /// is fine -- task_start catches the return.
 pub fn spawn(name: &'static str, entry: extern "C" fn(usize), arg: usize) -> usize {
+    let flags = crate::sync::irq_save();
     reclaim_finished();
     unsafe {
-        let tasks = &mut *(&raw mut TASKS);
-        let slot = tasks
-            .iter()
-            .position(|t| t.state == State::Unused)
-            .expect("no free task slots");
+        let placed = place_vruntime();
+        let slot = match (*(&raw const TASKS)).iter().position(|t| t.state == State::Unused) {
+            Some(s) => s,
+            None => {
+                crate::println!("out of task slots! dumping 64 tasks:");
+                for (i, t) in (*(&raw const TASKS)).iter().enumerate() {
+                    crate::println!(
+                        "  [{}] name {:<10} state {:?} parent {} ttbr0 {:#x} mm {}",
+                        i, t.name, t.state, t.parent, t.ttbr0, t.shares_mm
+                    );
+                }
+                panic!("no free task slots");
+            }
+        };
 
         // Bumped before the task exists, so no id for this incarnation can
         // ever equal one handed out for the last occupant of the slot.
-        let generation = tasks[slot].generation.wrapping_add(1);
+        let generation = TASKS[slot].generation.wrapping_add(1);
 
-        let stack = frames::alloc_contiguous(STACK_PAGES).unwrap_or_else(|| {
+        let stack = take_stack().unwrap_or_else(|| {
             let (used, total) = frames::stats();
             panic!("out of memory for a task stack: frames total={} free={} requested={}",
                 total, total - used, STACK_PAGES);
-        });
+        }) as *mut u8;
         let top = stack as usize + STACK_PAGES * PAGE;
 
         // The frame cpu_switch will pop: twelve callee-saved registers, laid
@@ -321,25 +877,66 @@ pub fn spawn(name: &'static str, entry: extern "C" fn(usize), arg: usize) -> usi
         // the `ret` at the end of cpu_switch lands there; x19 and x20 carry
         // what task_start needs, because there is no other way to pass an
         // argument through a `ret`.
-        let sp = top - 96;
-        let f = sp as *mut usize;
-        f.add(0).write(entry as *const () as usize); // x19
-        f.add(1).write(arg); // x20
-        for i in 2..10 {
-            f.add(i).write(0); // x21..x28
-        }
-        f.add(10).write(0); // x29, the frame pointer: a task has no caller
-        f.add(11).write(task_start as *const () as usize); // x30
+        #[cfg(target_arch = "aarch64")]
+        let sp = {
+            let sp = top - 96;
+            let f = sp as *mut usize;
+            f.add(0).write(entry as *const () as usize); // x19
+            f.add(1).write(arg); // x20
+            for i in 2..10 {
+                f.add(i).write(0); // x21..x28
+            }
+            f.add(10).write(0); // x29, frame pointer
+            f.add(11).write(task_start as *const () as usize); // x30
+            sp
+        };
+
+        #[cfg(target_arch = "x86_64")]
+        let sp = {
+            // Frame cpu_switch pops: r15, r14, r13, r12, rbx, rbp, ret
+            // 7 words = 56 bytes.
+            let sp = top - 56;
+            let f = sp as *mut usize;
+            f.add(0).write(0);                                  // r15
+            f.add(1).write(0);                                  // r14
+            f.add(2).write(arg);                                // r13 -> argument
+            f.add(3).write(entry as *const () as usize);        // r12 -> entry function
+            f.add(4).write(0);                                  // rbx
+            f.add(5).write(0);                                  // rbp (frame pointer top)
+            f.add(6).write(task_start as *const () as usize);   // return address -> task_start
+            sp
+        };
 
         let shadow = frames::alloc().expect("no memory for a task shadow") as usize;
-        tasks[slot] = Task {
+        TASKS[slot] = Task {
             sp,
             stack: stack as usize,
             shadow,
-            state: State::Ready,
+            state: State::Unused,
+            on_cpu: false,
             name,
+            home_cpu: cpu_index(crate::arch::cpu_id()) as u8,
+            affinity: 0xff,
+            migrations: 0,
+            class: crate::schedpolicy::Class::Normal,
+            // Placed against the run queue rather than at zero: a vruntime of
+            // 0 is far behind every running task, so a new task would run
+            // exclusively until it caught up -- which for a long-lived
+            // machine is a very long time.
+            vruntime: placed,
+            interactive: 0,
+            ran_at: 0,
+            accounted_at: 0,
+            slice_scored: false,
+            wake_pending: false,
+            ran_ns: 0,
+            ready_at: crate::arch::cycles(),
+            comm: [0; 16],
             slices: 0,
             waiting_on: 0,
+            joiner: 0,
+            wake_at: 0,
+            last_syscall: 0,
             ttbr0: 0,
             linux_pid: 0,
             exit_status: 0,
@@ -353,6 +950,7 @@ pub fn spawn(name: &'static str, entry: extern "C" fn(usize), arg: usize) -> usi
             vfork_done: 0,
             clear_child_tid: 0,
             has_console: false,
+            nethos_abi: false,
             user_syscall: false,
             tpidr: 0,
             shared: [crate::user::SharedMap {
@@ -361,7 +959,7 @@ pub fn spawn(name: &'static str, entry: extern "C" fn(usize), arg: usize) -> usi
                 region: 0,
                 fd: -1,
                 anonymous: false,
-            }; 16],
+            }; 256],
             nshared: 0,
             sig_actions: [crate::signal::Action::default(); 64],
             sig_mask: 0,
@@ -374,41 +972,660 @@ pub fn spawn(name: &'static str, entry: extern "C" fn(usize), arg: usize) -> usi
             sig_return_mask: 0,
             sig_return_alt: false,
         };
-        tasks[slot].ttbr0 = crate::paging::kernel_address_space();
+        TASKS[slot].ttbr0 = crate::paging::kernel_address_space();
+        // A slot that had an occupant before must not hand that task's
+        // vectors to the new one.
+        fp_reset(slot);
+        // Publish under the runqueue lock. The slot was written field by
+        // field above and `Ready` is the last store, but "last store" only
+        // orders anything for a reader that also synchronises -- an
+        // interrupt mask here stops other *handlers* on this CPU and
+        // nothing on any other. An AP reaching `pick_on` takes this lock,
+        // so acquiring it here both orders the slot's fields ahead of the
+        // state and keeps the task invisible until they are all in place.
+        // A waker that runs while this holds simply waits; it cannot see a
+        // half-built task and switch into it.
+        let published = RUNQUEUE.lock();
+        TASKS[slot].state = State::Ready;
+        unsafe { RUNQUEUE.unlock(published) };
+        crate::sync::irq_restore(flags);
         slot
     }
 }
 
-pub fn schedule() {
-    let flags = crate::sync::irq_save();
+/// Run somebody else if anybody else wants to run. Whether it switched.
+///
+/// The answer is what the idle halt is built on: a task told "nobody else"
+/// is the only thing between this CPU and an idle one, and on an emulated
+/// machine a CPU that spins rather than stopping is a host core at 100% for
+/// a guest doing nothing. `yield_now` and `sleep_ticks` halt on a false.
+///
+/// The halt is deliberately *not* here. This is called with interrupts
+/// masked from every kind of critical section, and `irq_restore` puts back
+/// what the caller had -- so halting here can halt with interrupts masked,
+/// where `wfi` wakes on the pending tick but the handler that would make
+/// something runnable never runs. That is a machine that stops during boot,
+/// which is exactly what it did.
+pub fn schedule() -> bool {
+    schedule_on(cpu_index(crate::arch::cpu_id()))
+}
+
+/// Run the scheduler pinned to one CPU. `schedule()` is this on the calling
+/// CPU; AP idle loops call it with their own index because `arch::cpu_id`
+/// is trustworthy there too, but being explicit keeps the idle path honest.
+/// The runqueue lock. Held across pick, account, and state changes --
+/// every path that reads another task's state and acts on it. Without
+/// this, two CPUs can pick the same Ready task and both switch into it:
+/// one CPU's stack, two occupants, and the corruption that follows reads
+/// as wild jumps and garbled consoles rather than anything schedulery.
+///
+/// A ticket lock, not irq_save alone: masking interrupts excludes handlers
+/// on this CPU and nothing on any other. Short sections only -- never held
+/// across cpu_switch, which would serialize all CPUs behind one stack
+/// switch and deadlock the moment two schedule at once.
+static RUNQUEUE: crate::sync::Spinlock = crate::sync::Spinlock::new();
+
+/// Whether LKL (Linux) is running. It is a single-CPU unikernel: its internal
+/// state assumes one host thread executes Linux code at a time, and nk's
+/// model -- preempt any task anywhere, run the next one on any CPU -- breaks
+/// that the moment an AP picks up a task whose syscalls are forwarded into
+/// Linux. The failure is not a clean fault in LKL: the boot thread, which is
+/// the one *inside* Linux, is the task that dies, jumping into LKL's own
+/// memory region with a corrupted frame (measured: RIP inside
+/// 0x50000000..0x54000000 on the `boot` task, and stub frames shifted into
+/// `rip 0x3`). Reproduced only with APs online: the same image is clean at
+/// `-smp 1`, faults at `-smp 2` and `-smp 4`, and everything up to the Linux
+/// handover -- including the whole SMP scheduler torture -- is unaffected.
+///
+/// So LKL is pinned to the boot CPU: the APs run every part of nk's own work
+/// (which is what the SMP correctness work is about) and stand down once
+/// Linux owns the machine. This is a deliberate scope line, not a fix for
+/// LKL's own threading; multi-CPU Linux would need LKL's host threads to be
+/// pinned and its CPU accounting kept per host CPU, which is a separate
+/// piece of work.
+static LKL_ACTIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Called once, just before Linux takes over.
+pub fn set_lkl_active() {
+    LKL_ACTIVE.store(true, core::sync::atomic::Ordering::SeqCst);
+    // Kick every other CPU: whatever it is running now must come off before
+    // it reaches a syscall, because from this point only the boot CPU may
+    // execute Linux code. `schedule_on` on those CPUs will find nothing to
+    // pick (see `pick_on`) and idle; the task it was running is left Ready
+    // and the boot CPU takes it.
+    for cpu in 1..cpu_count() {
+        if cpu_online(cpu) {
+            send_reschedule_ipi(cpu);
+        }
+    }
+}
+
+pub fn lkl_active() -> bool {
+    LKL_ACTIVE.load(core::sync::atomic::Ordering::SeqCst)
+}
+
+/// Publish the task the running CPU just replaced: clear its `on_cpu`, so
+/// that the `Ready` it was marked as is now real and it may be picked.
+///
+/// Called by every task the moment it starts executing -- `task_start` for a
+/// fresh task, the tail of `schedule_on` for one that was switched out and
+/// resumed -- so the delay between switching and publishing is a few
+/// instructions.
+///
+/// The CPU is resolved here rather than passed in because the frame that
+/// resumes a task is the frame from where it was switched *out*, which may
+/// be a different CPU. A task switched out on cpu0 and resumed on cpu1 runs
+/// cpu0's stale frame; a `cpu` argument would publish on cpu0 and leave
+/// cpu1's `prev` unpublished, so the task it replaced would stay
+/// unpickable forever.
+///
+/// # Safety
+/// Runs on the CPU that performed the switch, before anything else.
+unsafe fn finish_switch() {
+    let cpu = cpu_index(crate::arch::cpu_id());
+    let prev = (*(&raw const CPUS))[cpu].prev;
+    if prev >= MAX_TASKS {
+        return;
+    }
+    let flags = RUNQUEUE.lock();
+    // Publish: registers are saved (the switch completed), so the task is
+    // now genuinely off this CPU and may run anywhere.
+    (*(&raw mut TASKS))[prev].on_cpu = false;
+    let _ = flags;
+    (*(&raw mut CPUS))[cpu].prev = usize::MAX;
+    RUNQUEUE.unlock(flags);
+}
+
+/// `finish_switch` for the assembly task entry points, which cannot name a
+/// Rust function with a generic signature. Resolves the calling CPU the
+/// same way `schedule` does.
+#[no_mangle]
+pub extern "C" fn finish_switch_asm() {
+    unsafe { finish_switch() };
+}
+
+pub fn schedule_on(cpu: usize) -> bool {
+    let cpu = cpu_index(cpu);
+    // Mask first, then take the lock. Taking the lock alone would restore
+    // interrupts when it is released, and there is a switch still to come:
+    // in that window a timer could re-enter `schedule` on a half-built
+    // frame. With the outer save, the lock's release restores *masked*, so
+    // interrupts stay off until the switch has landed and this task's own
+    // state is restored below. `outer` is frame-local, so a resumed task
+    // restores its own interrupt state, not the CPU's last one.
+    let outer = crate::sync::irq_save();
+    let flags = RUNQUEUE.lock();
     unsafe {
         // No exclusive reference survives cpu_switch: another task mutates
         // this table while the outgoing one sleeps.
-        let cur = CURRENT;
-        let mut next = None;
-        for i in 1..=MAX_TASKS {
-            let candidate = (cur + i) % MAX_TASKS;
-            if TASKS[candidate].state == State::Ready {
-                next = Some(candidate);
-                break;
-            }
-        }
+        let cur = (*(&raw const CPUS))[cpu].current;
+        let now = crate::arch::cycles();
+
+        // Charge the outgoing task for what it just ran, before anything
+        // else looks at vruntimes -- the pick below compares against it.
+        let ran_ns = account(cur, now);
+
+        let next = pick_on(cur, cpu);
         if let Some(next) = next {
             if TASKS[cur].state == State::Running {
                 TASKS[cur].state = State::Ready;
+                TASKS[cur].ready_at = now;
             }
+
+            // Wakeup-to-run latency: the number the whole policy is judged
+            // by. Measured here because this is the moment the wait ends.
+            if TASKS[next].wake_pending {
+                crate::schedtrace::record_latency(now.wrapping_sub(TASKS[next].ready_at));
+            }
+
+            crate::schedtrace::record(
+                cpu,
+                crate::schedtrace::Event::ContextSwitch,
+                next,
+                cur,
+                effective_class_of(next).as_u8(),
+                now.wrapping_sub(TASKS[cur].ran_at),
+                ran_ns,
+            );
+
             TASKS[next].state = State::Running;
+            TASKS[next].on_cpu = true;
             TASKS[next].slices += 1;
-            core::arch::asm!("mrs {}, ttbr0_el1", out(reg) TASKS[cur].ttbr0, options(nostack));
-            core::arch::asm!("mrs {}, tpidr_el0", out(reg) TASKS[cur].tpidr, options(nostack));
-            CURRENT = next;
+            TASKS[next].ran_at = now;
+            TASKS[next].accounted_at = now;
+            TASKS[next].slice_scored = false;
+            TASKS[next].wake_pending = false;
+            TASKS[next].ready_at = 0;
+            TASKS[cur].ttbr0 = crate::arch::current_page_table();
+            TASKS[cur].tpidr = crate::arch::current_tls();
+            set_cpu_current(cpu, next);
+            (*(&raw mut CPUS))[cpu].switches += 1;
+            if (*(&raw const CPUS))[cpu].idle {
+                set_cpu_idle(cpu, false);
+                crate::schedtrace::record(
+                    cpu,
+                    crate::schedtrace::Event::IdleExit,
+                    next,
+                    cur,
+                    effective_class_of(next).as_u8(),
+                    0,
+                    0,
+                );
+            }
             set_shadow(TASKS[next].shadow);
-            core::arch::asm!("msr ttbr0_el1, {}", "dsb ishst", "tlbi vmalle1", "dsb ish", "isb",
-                in(reg) TASKS[next].ttbr0, options(nostack));
-            core::arch::asm!("msr tpidr_el0, {}", in(reg) TASKS[next].tpidr, options(nostack));
+            crate::arch::set_page_table(TASKS[next].ttbr0);
+            crate::arch::set_tls(TASKS[next].tpidr);
+            // On x86-64 the kernel stack a trap or syscall lands on is not a
+            // register the CPU keeps per task: it is read from the TSS (for an
+            // interrupt) or from a variable the syscall stub loads. Both name
+            // one stack, so both have to be repointed at the incoming task or
+            // its first syscall would run on the outgoing task's stack.
+            // aarch64 needs nothing here -- SP_EL1 is banked.
+            #[cfg(target_arch = "x86_64")]
+            set_kernel_stack_for(next);
+            // Park the outgoing task where the task that starts running next
+            // can find it. `cur` was just marked Ready, but its registers
+            // are still live on this CPU -- `cpu_switch` has not run yet --
+            // so it must not be picked until this switch completes. The
+            // incoming task clears `cur`'s `on_cpu` in `finish_switch`, and
+            // `pick_on` refuses any task that still has it set. Without that
+            // two CPUs end up sharing one stack.
+            (*(&raw mut CPUS))[cpu].prev = cur;
+            // Releases the runqueue lock only; interrupts stay masked
+            // because `outer` masked them before the lock was taken.
+            unsafe { RUNQUEUE.unlock(flags) };
             cpu_switch(&raw mut TASKS[cur].sp, TASKS[next].sp);
+            // Reached when this task is switched in again. Publish the task
+            // this CPU replaced, so its `Ready` becomes pickable now that
+            // its registers are safely stored.
+            finish_switch();
+            crate::sync::irq_restore(outer);
+            return true;
         }
-        crate::sync::irq_restore(flags);
+        if TASKS[cur].state != State::Running {
+            set_cpu_idle(cpu, true);
+            crate::schedtrace::record(
+                cpu,
+                crate::schedtrace::Event::IdleEnter,
+                cur,
+                cur,
+                0,
+                0,
+                0,
+            );
+        }
+        unsafe { RUNQUEUE.unlock(flags) };
+        crate::sync::irq_restore(outer);
+        false
+    }
+}
+
+/// The class a task is actually treated as: what it was assigned, adjusted
+/// by how it has behaved. See `schedpolicy::effective_class`.
+fn effective_class_of(id: usize) -> crate::schedpolicy::Class {
+    unsafe {
+        let t = &(*(&raw const TASKS))[id];
+        crate::schedpolicy::effective_class(t.class, t.interactive)
+    }
+}
+
+/// Charge a task for the CPU time it has just used, and let that time move
+/// its interactivity score. Returns how long it ran, in nanoseconds.
+///
+/// Called on the way out of `schedule` for the outgoing task. Both the
+/// fairness key and the interactivity evidence come from this one number, so
+/// it is computed once, here, rather than at each of the places that want it.
+///
+/// # Safety
+/// Caller holds the scheduler's interrupt mask.
+unsafe fn account(id: usize, now: u64) -> u64 {
+    account_task(&mut TASKS[id], now)
+}
+
+struct AccountState {
+    state: State,
+    class: crate::schedpolicy::Class,
+    interactive: i8,
+    ran_at: u64,
+    accounted_at: u64,
+    ran_ns: u64,
+    vruntime: u64,
+    slice_scored: bool,
+}
+
+fn account_state(s: &mut AccountState, now: u64) -> u64 {
+    if s.accounted_at == 0 {
+        if s.state == State::Running {
+            s.ran_at = now;
+            s.accounted_at = now;
+        }
+        return 0;
+    }
+    let ran_ns = crate::timer::cycles_to_ns(now.wrapping_sub(s.accounted_at));
+    s.accounted_at = if matches!(s.state, State::Blocked | State::Finished) { 0 } else { now };
+    s.ran_ns = s.ran_ns.wrapping_add(ran_ns);
+    let class = crate::schedpolicy::effective_class(s.class, s.interactive);
+    s.vruntime = s.vruntime.saturating_add(crate::schedpolicy::vruntime_delta(
+        ran_ns, crate::schedpolicy::class_weight(class),
+    ));
+    let slice = crate::schedpolicy::slice_ns(class);
+    let slice_ran = crate::timer::cycles_to_ns(now.wrapping_sub(s.ran_at));
+    if s.state == State::Blocked {
+        s.interactive = crate::schedpolicy::on_voluntary_block(s.interactive, slice_ran, slice);
+    } else if s.state == State::Running && slice_ran >= slice && !s.slice_scored {
+        s.interactive = crate::schedpolicy::on_slice_exhausted(s.interactive);
+        s.slice_scored = true;
+    }
+    ran_ns
+}
+
+pub fn accounting_regression() -> bool {
+    let step = 1000;
+    let mut running = AccountState {
+        state: State::Running,
+        class: crate::schedpolicy::Class::Normal,
+        interactive: 0,
+        ran_at: 1,
+        accounted_at: 1,
+        ran_ns: 0,
+        vruntime: 0,
+        slice_scored: false,
+    };
+    let first = account_state(&mut running, 1 + step);
+    let second = account_state(&mut running, 1 + step * 2);
+    let exact = running.ran_ns == first + second && first == second && running.ran_at == 1;
+    let mut blocked = AccountState {
+        state: State::Blocked,
+        class: crate::schedpolicy::Class::Normal,
+        interactive: 0,
+        ran_at: 1,
+        accounted_at: 1,
+        ran_ns: 100,
+        vruntime: 200,
+        slice_scored: false,
+    };
+    account_state(&mut blocked, 1 + step * 3);
+    let before = (blocked.ran_ns, blocked.vruntime, blocked.interactive, blocked.accounted_at);
+    account_state(&mut blocked, 1 + step * 100);
+    let blocked_once = (blocked.ran_ns, blocked.vruntime, blocked.interactive, blocked.accounted_at) == before;
+    let mut idle = AccountState {
+        state: State::Running,
+        class: crate::schedpolicy::Class::Normal,
+        interactive: 0,
+        ran_at: 1,
+        accounted_at: 0,
+        ran_ns: before.0,
+        vruntime: before.1,
+        slice_scored: false,
+    };
+    account_state(&mut idle, 1 + step * 200);
+    let idle_free = (idle.ran_ns, idle.vruntime) == (before.0, before.1);
+    let mut scored = AccountState {
+        state: State::Running,
+        class: crate::schedpolicy::Class::Normal,
+        interactive: 4,
+        ran_at: 1,
+        accounted_at: 1,
+        ran_ns: 0,
+        vruntime: 0,
+        slice_scored: false,
+    };
+    account_state(&mut scored, 1_000_000_000);
+    let score = (scored.interactive, scored.slice_scored);
+    account_state(&mut scored, 1_000_000_000 + step);
+    exact && blocked_once && idle_free && score == (2, true) && (scored.interactive, scored.slice_scored) == score
+}
+
+pub fn placement_regression() -> bool {
+    // Under the runqueue lock, not just an interrupt mask. This test drives
+    // the real `place_vruntime`/`make_ready` path by turning a live, unused
+    // slot into a `Blocked` task and making it `Ready` -- and for an instant
+    // that slot is a runnable task with no stack and no saved registers.
+    // With only the interrupt mask held, another CPU is free to run
+    // `pick_on`, choose it, and `cpu_switch` into it: two CPUs then treat a
+    // dead slot as a task, which shows up as a hang or a wild jump nowhere
+    // near this function. The mask stops nothing on other CPUs; the
+    // runqueue lock is what `pick_on` is reached under, so holding it makes
+    // the fabricated state unobservable. Restoration happens before the
+    // release for the same reason.
+    let flags = RUNQUEUE.lock();
+    let passed = unsafe {
+        if let Some(id) = (*(&raw const TASKS)).iter().position(|t| t.state == State::Unused) {
+            let saved_state = TASKS[id].state;
+            let saved_vruntime = TASKS[id].vruntime;
+            let saved_ready = TASKS[id].ready_at;
+            let saved_pending = TASKS[id].wake_pending;
+            let current = TASKS[cur()].vruntime;
+            TASKS[cur()].vruntime = current.max(1000);
+            let expected = place_vruntime();
+            TASKS[id].state = State::Blocked;
+            TASKS[id].vruntime = 0;
+            make_ready(id, 0);
+            let passed = TASKS[id].vruntime == expected && TASKS[id].wake_pending;
+            TASKS[id].state = saved_state;
+            TASKS[id].vruntime = saved_vruntime;
+            TASKS[id].ready_at = saved_ready;
+            TASKS[id].wake_pending = saved_pending;
+            TASKS[cur()].vruntime = current;
+            passed
+        } else {
+            false
+        }
+    };
+    unsafe { RUNQUEUE.unlock(flags) };
+    passed
+}
+
+fn account_task(t: &mut Task, now: u64) -> u64 {
+    if t.accounted_at == 0 {
+        if t.state == State::Running {
+            t.ran_at = now;
+            t.accounted_at = now;
+        }
+        return 0;
+    }
+    let ran_ns = crate::timer::cycles_to_ns(now.wrapping_sub(t.accounted_at));
+    t.accounted_at = if matches!(t.state, State::Blocked | State::Finished) { 0 } else { now };
+    t.ran_ns = t.ran_ns.saturating_add(ran_ns);
+    let class = crate::schedpolicy::effective_class(t.class, t.interactive);
+    t.vruntime = t.vruntime.saturating_add(crate::schedpolicy::vruntime_delta(
+        ran_ns, crate::schedpolicy::class_weight(class),
+    ));
+    let slice = crate::schedpolicy::slice_ns(class);
+    let slice_ran = crate::timer::cycles_to_ns(now.wrapping_sub(t.ran_at));
+    if t.state == State::Blocked {
+        t.interactive = crate::schedpolicy::on_voluntary_block(t.interactive, slice_ran, slice);
+    } else if t.state == State::Running && slice_ran >= slice && !t.slice_scored {
+        t.interactive = crate::schedpolicy::on_slice_exhausted(t.interactive);
+        t.slice_scored = true;
+    }
+    ran_ns
+}
+
+/// Where a new or newly-woken task's vruntime should start.
+///
+/// The minimum across the run queue, not zero. A task placed at zero is
+/// arbitrarily far behind everything else and runs to the exclusion of all
+/// of it until it catches up -- on a machine that has been up for an hour,
+/// that is minutes of one task. Placing it at the minimum makes it merely
+/// *next*, which is what "it should run soon" actually means.
+fn place_vruntime() -> u64 {
+    unsafe {
+        let tasks = &*(&raw const TASKS);
+        let mut min = u64::MAX;
+        for t in tasks.iter() {
+            if matches!(t.state, State::Ready | State::Running) && t.vruntime < min {
+                min = t.vruntime;
+            }
+        }
+        if min == u64::MAX {
+            0
+        } else {
+            min
+        }
+    }
+}
+
+/// Choose the next task to run, or `None` if nothing else is runnable.
+///
+/// Highest effective class first, and within that class the least weighted
+/// runtime. Strict class ordering is what makes interactive latency
+/// predictable; `STARVATION_NS` is what stops it being cruel.
+///
+/// Linear over the task table. 128 slots is a few hundred nanoseconds and is
+/// not what will be slow here -- and a tree would have to be kept correct
+/// across every state change in this file, which is a much better way to
+/// introduce a bug than to save time that is not being lost.
+///
+/// # Safety
+/// Caller holds the scheduler's interrupt mask.
+unsafe fn pick(cur: usize) -> Option<usize> {
+    pick_on(cur, cpu_index(crate::arch::cpu_id()))
+}
+
+unsafe fn pick_on(cur: usize, cpu: usize) -> Option<usize> {
+    let tasks = &*(&raw const TASKS);
+    let now = crate::arch::cycles();
+    let cpu = cpu_index(cpu);
+    // Linux runs on the boot CPU only; see `LKL_ACTIVE`. An AP that picked a
+    // Linux-ABI task here would run its syscalls into LKL concurrently with
+    // the boot CPU's, and LKL's single-CPU state cannot survive that.
+    if cpu != 0 && lkl_active() {
+        return None;
+    }
+    let cpu_bit = 1u8 << (cpu.min(7));
+
+    let mut best: Option<usize> = None;
+    let mut best_class = crate::schedpolicy::Class::Background;
+    let mut best_vruntime = u64::MAX;
+
+    // Round-robin the scan origin so that tasks which tie on both class and
+    // vruntime -- everything, on an idle machine where nobody has run for a
+    // measurable time -- still take turns rather than the lowest slot always
+    // winning. Without this a machine whose tasks all sit at vruntime 0
+    // starves every slot above the first.
+    for i in 1..=MAX_TASKS {
+        let id = (cur + i) % MAX_TASKS;
+        if tasks[id].state != State::Ready {
+            continue;
+        }
+        // Still on another CPU: marked Ready so it is picked again later,
+        // but `cpu_switch` has not finished storing it. See `Task::on_cpu`.
+        if tasks[id].on_cpu {
+            continue;
+        }
+        if tasks[id].affinity & cpu_bit == 0 {
+            continue;
+        }
+
+        let mut class = crate::schedpolicy::effective_class(tasks[id].class, tasks[id].interactive);
+
+        // Ageing. A task that has been ready far too long is considered one
+        // class higher than it is, which is enough to get it past whatever
+        // has been monopolising the CPU without inverting the policy
+        // wholesale. This is the promise that a background job still
+        // finishes while the user keeps working.
+        if tasks[id].ready_at != 0 {
+            let waited = crate::timer::cycles_to_ns(now.wrapping_sub(tasks[id].ready_at));
+            if waited >= crate::schedpolicy::STARVATION_NS {
+                class = match class {
+                    crate::schedpolicy::Class::Background
+                    | crate::schedpolicy::Class::Throughput
+                    | crate::schedpolicy::Class::Normal => crate::schedpolicy::Class::Interactive,
+                    other => other,
+                };
+                crate::schedtrace::record(
+                    0,
+                    crate::schedtrace::Event::Aged,
+                    id,
+                    cur,
+                    class.as_u8(),
+                    waited,
+                    0,
+                );
+            }
+        }
+
+        let better = match best {
+            None => true,
+            Some(_) => class > best_class || (class == best_class && tasks[id].vruntime < best_vruntime),
+        };
+        if better {
+            best = Some(id);
+            best_class = class;
+            best_vruntime = tasks[id].vruntime;
+        }
+    }
+    best
+}
+
+pub fn balance_on_idle(cpu: usize) -> bool {
+    let cpu = cpu_index(cpu);
+    let n = cpu_count();
+    if n <= 1 {
+        return false;
+    }
+    // Same line as `pick_on`: while Linux is running, its tasks may only
+    // execute on the boot CPU, so an AP must not pull one onto itself.
+    if cpu != 0 && lkl_active() {
+        return false;
+    }
+    let flags = crate::sync::irq_save();
+    let stolen = unsafe { balance_on_idle_locked(cpu, n) };
+    unsafe { crate::sync::irq_restore(flags) };
+    stolen
+}
+
+unsafe fn balance_on_idle_locked(cpu: usize, n: usize) -> bool {
+    let tasks = &mut *(&raw mut TASKS);
+    let cpu_bit = 1u8 << cpu.min(7);
+    let mut best_cpu = usize::MAX;
+    let mut best_count = 1usize;
+    for other in 0..n {
+        if other == cpu || !cpu_online(other) {
+            continue;
+        }
+        let mut count = 0usize;
+        for t in tasks.iter() {
+            if t.state == State::Ready && t.affinity & (1u8 << other.min(7)) != 0 {
+                count += 1;
+            }
+        }
+        if count > best_count {
+            best_count = count;
+            best_cpu = other;
+        }
+    }
+    if best_cpu == usize::MAX {
+        return false;
+    }
+    let mut best: Option<usize> = None;
+    let mut best_vruntime = u64::MAX;
+    for (id, t) in tasks.iter().enumerate() {
+        if t.state != State::Ready {
+            continue;
+        }
+        if t.affinity & cpu_bit == 0 {
+            continue;
+        }
+        if t.affinity & (1u8 << best_cpu.min(7)) == 0 {
+            continue;
+        }
+        if t.vruntime < best_vruntime {
+            best_vruntime = t.vruntime;
+            best = Some(id);
+        }
+    }
+    if let Some(id) = best {
+        tasks[id].home_cpu = cpu as u8;
+        tasks[id].migrations += 1;
+        (*(&raw mut CPUS))[cpu].stolen += 1;
+        crate::schedtrace::record(
+            cpu,
+            crate::schedtrace::Event::Migrate,
+            id,
+            (*(&raw const CPUS))[cpu].current,
+            tasks[id].class.as_u8(),
+            best_cpu as u64,
+            tasks[id].vruntime,
+        );
+        return true;
+    }
+    false
+}
+
+/// Stop the CPU until an interrupt, with interrupts open across the halt.
+///
+/// Only for a task that has nothing to do and holds nothing: the mask is
+/// lifted so the handler that makes something runnable can actually run,
+/// and put back afterwards. `wfi` on an already-pending interrupt returns
+/// at once, so this cannot sleep through a wake that has already happened.
+fn halt_until_interrupt() {
+    let saved = crate::sync::irq_save();
+    unsafe {
+        account(cur(), crate::arch::cycles());
+        TASKS[cur()].accounted_at = 0;
+        #[cfg(target_arch = "aarch64")]
+        {
+            let flags: u64;
+            core::arch::asm!("mrs {}, daif", out(reg) flags, options(nomem, nostack));
+            core::arch::asm!("msr daifclr, #0xf", options(nomem, nostack));
+            core::arch::asm!("wfi", options(nomem, nostack));
+            core::arch::asm!("msr daif, {}", in(reg) flags, options(nomem, nostack));
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            // `sti; hlt` is the standard x86 idle sequence: interrupts are
+            // enabled for the halt instruction itself without a window for
+            // an interrupt to land before the CPU actually stops.
+            core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack));
+        }
+        if TASKS[cur()].state == State::Running {
+            TASKS[cur()].ran_at = crate::arch::cycles();
+            TASKS[cur()].accounted_at = TASKS[cur()].ran_at;
+            TASKS[cur()].slice_scored = false;
+        }
+        crate::sync::irq_restore(saved);
     }
 }
 
@@ -454,9 +1671,7 @@ fn mm_find(ttbr0: u64) -> Option<(u64, u64, u64)> {
 }
 
 fn mm_current_ttbr0() -> u64 {
-    let v: u64;
-    unsafe { core::arch::asm!("mrs {}, ttbr0_el1", out(reg) v, options(nomem, nostack)) };
-    v
+    crate::arch::current_page_table()
 }
 
 /// Give an address space its memory layout, just before a task enters EL0
@@ -556,9 +1771,12 @@ pub fn user_memory() -> (u64, u64, u64) {
 /// Reserve `len` bytes of anonymous mapping space, growing down from the top.
 /// One critical section from read to store: two threads reserving at once
 /// must not read the same `mmap_next`. Returns the base, or `None` when the
-/// address space has no room. A later mapping failure leaks the reservation
-/// (address space, not memory); failures there are OOM/IO, not the path.
+/// address space has no room. The floor is the arena's base: without it the
+/// pointer walks off the bottom on a failure and every later mapping is
+/// `mmapfail range` -- the reservation leaks into a range `range_ok` was
+/// always going to refuse.
 pub fn reserve_mmap(len: u64) -> Option<u64> {
+    const HIGH_BASE: u64 = crate::user::USER_HIGH_BASE;
     let ttbr0 = mm_current_ttbr0();
     let flags = crate::sync::irq_save();
     let at = unsafe {
@@ -567,6 +1785,9 @@ pub fn reserve_mmap(len: u64) -> Option<u64> {
             .find(|e| e.live && e.ttbr0 == ttbr0)
             .and_then(|e| {
                 let at = e.mmap_next.checked_sub(len)?;
+                if at < HIGH_BASE {
+                    return None;
+                }
                 e.mmap_next = at;
                 Some(at)
             })
@@ -631,22 +1852,59 @@ pub fn set_user_mmap_next(v: u64) {
 /// reads a file through Linux while itself serving a user syscall.
 pub fn set_user_syscall(on: bool) -> bool {
     unsafe {
-        let was = TASKS[CURRENT].user_syscall;
-        TASKS[CURRENT].user_syscall = on;
+        let was = TASKS[cur()].user_syscall;
+        TASKS[cur()].user_syscall = on;
         was
     }
 }
 
+/// Record the syscall about to be forwarded, for the watchdog's wait graph.
+pub fn set_last_syscall(nr: u64) {
+    unsafe { TASKS[cur()].last_syscall = nr }
+}
+
+/// Record the running task's own name (`prctl(PR_SET_NAME)`), 15 bytes max.
+pub fn set_comm(name: &[u8]) {
+    unsafe {
+        let t = &mut TASKS[cur()];
+        t.comm = [0; 16];
+        let n = name.len().min(15);
+        t.comm[..n].copy_from_slice(&name[..n]);
+    }
+}
+
 pub fn set_has_console(on: bool) {
-    unsafe { TASKS[CURRENT].has_console = on }
+    unsafe { TASKS[cur()].has_console = on }
 }
 
 pub fn has_console() -> bool {
-    unsafe { TASKS[CURRENT].has_console }
+    unsafe { TASKS[cur()].has_console }
+}
+
+/// Record that the running task speaks the NETHOS ABI. Called once, when
+/// its program is loaded.
+pub fn set_nethos_abi(on: bool) {
+    unsafe { TASKS[cur()].nethos_abi = on }
+}
+
+/// Which ABI the running task speaks. Read on every system call, so it is
+/// a field rather than anything that has to be looked up.
+pub fn nethos_abi() -> bool {
+    unsafe { TASKS[cur()].nethos_abi }
+}
+
+/// As `nethos_abi`, for a task that is not the running one -- fork, which
+/// copies it to the child.
+pub fn task_nethos_abi(id: usize) -> bool {
+    unsafe { TASKS[id].nethos_abi }
+}
+
+pub fn set_task_nethos_abi(id: usize, on: bool) {
+    unsafe { TASKS[id].nethos_abi = on }
 }
 
 pub fn in_user_syscall() -> bool {
-    unsafe { TASKS[CURRENT].user_syscall }
+    unsafe { TASKS[cur()].user_syscall }
 }
 
 /// Record who forked whom, and answer questions about it.
@@ -671,27 +1929,27 @@ pub fn set_vfork_child(id: usize, done: usize) {
 /// Whether the running task is in an address space belonging to somebody
 /// else -- a thread of it, or a vfork child that has not exec'd yet.
 pub fn shares_mm_current() -> bool {
-    unsafe { TASKS[CURRENT].shares_mm }
+    unsafe { TASKS[cur()].shares_mm }
 }
 
 /// The running task now owns its address space: `execve` gave it one of its
 /// own, so its exit must tear that one down.
 pub fn own_mm_current() {
-    unsafe { TASKS[CURRENT].shares_mm = false }
+    unsafe { TASKS[cur()].shares_mm = false }
 }
 
 /// Take the semaphore a vfork parent is waiting on, leaving none behind: the
 /// promise is kept once, whether by `execve` or by exit.
 pub fn take_vfork_done() -> usize {
     unsafe {
-        let v = TASKS[CURRENT].vfork_done;
-        TASKS[CURRENT].vfork_done = 0;
+        let v = TASKS[cur()].vfork_done;
+        TASKS[cur()].vfork_done = 0;
         v
     }
 }
 
 pub fn clear_child_tid() -> u64 {
-    unsafe { TASKS[CURRENT].clear_child_tid }
+    unsafe { TASKS[cur()].clear_child_tid }
 }
 
 pub fn set_parent(child: usize, parent: usize) {
@@ -772,7 +2030,7 @@ pub fn drop_user_memory(ttbr0: u64) {
 /// child, which records them as pool references over its private copies.
 pub fn shared_maps() -> alloc::vec::Vec<crate::user::SharedMap> {
     unsafe {
-        TASKS[CURRENT].shared[..TASKS[CURRENT].nshared]
+        TASKS[cur()].shared[..TASKS[cur()].nshared]
             .iter()
             .copied()
             .collect::<alloc::vec::Vec<_>>()
@@ -784,9 +2042,9 @@ pub fn shared_maps() -> alloc::vec::Vec<crate::user::SharedMap> {
 /// same address space, same mappings.
 pub fn set_shared_maps(maps: &[crate::user::SharedMap]) {
     unsafe {
-        let n = maps.len().min(16);
-        TASKS[CURRENT].shared[..n].copy_from_slice(&maps[..n]);
-        TASKS[CURRENT].nshared = n;
+        let n = maps.len().min(TASKS[cur()].shared.len());
+        TASKS[cur()].shared[..n].copy_from_slice(&maps[..n]);
+        TASKS[cur()].nshared = n;
     }
 }
 
@@ -794,13 +2052,25 @@ pub fn set_shared_maps(maps: &[crate::user::SharedMap]) {
 /// full: the mapping is already in place, and the caller must undo it.
 pub fn add_shared_map(m: crate::user::SharedMap) -> bool {
     unsafe {
-        if TASKS[CURRENT].nshared >= 16 {
+        if TASKS[cur()].nshared >= TASKS[cur()].shared.len() {
             return false;
         }
-        let n = TASKS[CURRENT].nshared;
-        TASKS[CURRENT].shared[n] = m;
-        TASKS[CURRENT].nshared = n + 1;
+        let n = TASKS[cur()].nshared;
+        TASKS[cur()].shared[n] = m;
+        TASKS[cur()].nshared = n + 1;
         true
+    }
+}
+
+/// The shared-mapping record covering `at..at+len` whole, if one record
+/// does. `mremap` moves a mapping, not a stack of fragments, and needs to
+/// look before it removes: the replacement is mapped first so the region's
+/// reference count never dips while both ranges exist.
+pub fn shared_map_covering(at: u64, len: u64) -> Option<crate::user::SharedMap> {
+    unsafe {
+        (0..TASKS[cur()].nshared)
+            .map(|i| TASKS[cur()].shared[i])
+            .find(|m| m.start <= at && at + len <= m.start + m.len)
     }
 }
 
@@ -811,12 +2081,12 @@ pub fn remove_shared_maps(start: u64, len: u64) -> alloc::vec::Vec<crate::user::
     unsafe {
         let mut out = Vec::new();
         let mut i = 0;
-        while i < TASKS[CURRENT].nshared {
-            let m = TASKS[CURRENT].shared[i];
+        while i < TASKS[cur()].nshared {
+            let m = TASKS[cur()].shared[i];
             if m.start < start + len && start < m.start + m.len {
                 out.push(m);
-                TASKS[CURRENT].shared.copy_within(i + 1..TASKS[CURRENT].nshared, i);
-                TASKS[CURRENT].nshared -= 1;
+                TASKS[cur()].shared.copy_within(i + 1..TASKS[cur()].nshared, i);
+                TASKS[cur()].nshared -= 1;
             } else {
                 i += 1;
             }
@@ -829,11 +2099,11 @@ pub fn remove_shared_maps(start: u64, len: u64) -> alloc::vec::Vec<crate::user::
 pub fn take_shared_maps() -> alloc::vec::Vec<crate::user::SharedMap> {
     use alloc::vec::Vec;
     unsafe {
-        let mut out = Vec::with_capacity(TASKS[CURRENT].nshared);
-        for i in 0..TASKS[CURRENT].nshared {
-            out.push(TASKS[CURRENT].shared[i]);
+        let mut out = Vec::with_capacity(TASKS[cur()].nshared);
+        for i in 0..TASKS[cur()].nshared {
+            out.push(TASKS[cur()].shared[i]);
         }
-        TASKS[CURRENT].nshared = 0;
+        TASKS[cur()].nshared = 0;
         out
     }
 }
@@ -848,6 +2118,18 @@ pub fn signal_action(id: usize, sig: u64) -> crate::signal::Action {
 pub fn set_signal_action(id: usize, sig: u64, act: crate::signal::Action) {
     unsafe {
         if sig >= 1 && sig <= 64 {
+            // A vfork child shares its creator's page tables but not its
+            // signal state: Linux copies `signal_struct` there, and every
+            // `posix_spawn` resets the child's handled signals to default
+            // before exec. Propagating those writes by address space would
+            // wipe the parent's handlers through the shared root -- measured
+            // as the UI process losing SIGCHLD and SIGUSR1 when a web
+            // process was spawned. After exec the child has a root of its
+            // own, so only this pre-exec window needs the exception.
+            if TASKS[id].vfork_done != 0 {
+                TASKS[id].sig_actions[(sig - 1) as usize] = act;
+                return;
+            }
             // Threads share dispositions: writing one task's table writes
             // every task sharing its address space. The table is small and
             // sharing is by `ttbr0`, which threads share and processes do
@@ -857,6 +2139,22 @@ pub fn set_signal_action(id: usize, sig: u64, act: crate::signal::Action) {
                 if t.state != State::Unused && t.ttbr0 == root {
                     t.sig_actions[(sig - 1) as usize] = act;
                 }
+            }
+        }
+    }
+}
+
+/// `execve`'s half of signal state: Linux resets every handled signal to
+/// default and leaves ignored ones ignored. The mask and the altstack are
+/// the task's own and survive.
+pub fn reset_signal_handlers(id: usize) {
+    unsafe {
+        if id >= MAX_TASKS {
+            return;
+        }
+        for act in TASKS[id].sig_actions.iter_mut() {
+            if act.handler != crate::signal::SIG_DFL && act.handler != crate::signal::SIG_IGN {
+                *act = crate::signal::Action::default();
             }
         }
     }
@@ -992,16 +2290,16 @@ pub fn install_signal_state(
     alt_size: u64,
 ) {
     unsafe {
-        TASKS[CURRENT].sig_actions = actions;
-        TASKS[CURRENT].sig_mask = mask;
-        TASKS[CURRENT].sig_alt_base = alt_base;
-        TASKS[CURRENT].sig_alt_size = alt_size;
-        TASKS[CURRENT].sig_alt_in_use = false;
-        TASKS[CURRENT].sig_pending = 0;
-        TASKS[CURRENT].sig_code = [0; 64];
-        TASKS[CURRENT].sig_sender = [0; 64];
-        TASKS[CURRENT].sig_return_mask = 0;
-        TASKS[CURRENT].sig_return_alt = false;
+        TASKS[cur()].sig_actions = actions;
+        TASKS[cur()].sig_mask = mask;
+        TASKS[cur()].sig_alt_base = alt_base;
+        TASKS[cur()].sig_alt_size = alt_size;
+        TASKS[cur()].sig_alt_in_use = false;
+        TASKS[cur()].sig_pending = 0;
+        TASKS[cur()].sig_code = [0; 64];
+        TASKS[cur()].sig_sender = [0; 64];
+        TASKS[cur()].sig_return_mask = 0;
+        TASKS[cur()].sig_return_alt = false;
     }
 }
 
@@ -1017,16 +2315,72 @@ pub fn signal_actions(id: usize) -> [crate::signal::Action; 64] {
 /// program starts. Without resetting the stack pointer those frames are
 /// leaked for the life of the task, which a shell would notice.
 pub fn kernel_stack_top() -> usize {
-    kernel_stack_top_of(unsafe { CURRENT })
+    kernel_stack_top_of(cur())
 }
 
 pub fn kernel_stack_top_of(id: usize) -> usize {
     unsafe { TASKS[id].stack + STACK_PAGES * PAGE }
 }
 
+/// Publish task `id`'s kernel stack as the one traps and syscalls land on.
+///
+/// Two places need it and they are not the same mechanism: the TSS's RSP0 is
+/// what the CPU loads on a ring-3 interrupt, and `kernel_sp_scratch` is what
+/// the `syscall` stub loads by hand, because `syscall` does not switch stacks
+/// at all -- it leaves RSP pointing at the user stack.
+///
+/// `kernel_sp_scratch` was previously never written, so it held zero: the
+/// first `syscall` from ring 3 would have loaded RSP = 0 and faulted on the
+/// first push, with the fault itself unable to push. Nothing had reached ring
+/// 3 yet, so it had never been observed.
+#[cfg(target_arch = "x86_64")]
+pub fn set_kernel_stack_for(id: usize) {
+    // Task 0 is the boot path, which was already running on the stack the
+    // linker gave it; its `stack` field is zero because nothing allocated one.
+    // Computing a top from that zero would name a page near address 0 and send
+    // the next trap there, so the boot stack top is recorded separately.
+    let top = unsafe {
+        if TASKS[id].stack == 0 {
+            BOOT_STACK_TOP
+        } else {
+            kernel_stack_top_of(id) as u64
+        }
+    };
+    if top == 0 {
+        return;
+    }
+    unsafe {
+        crate::tss_x86::set_kernel_stack(top);
+        let cpu = crate::arch::cpu_id().min(7);
+        core::ptr::write_volatile(&raw mut kernel_sp_scratch[cpu], top);
+    }
+}
+
+/// The top of the stack the boot task is already running on; see
+/// `set_kernel_stack_for`.
+#[cfg(target_arch = "x86_64")]
+static mut BOOT_STACK_TOP: u64 = 0;
+
+/// Record the boot stack top, and publish it as the current trap stack.
+///
+/// # Safety
+/// Call once, early, from the boot task, with the top of its stack.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn set_boot_stack_top(top: u64) {
+    BOOT_STACK_TOP = top;
+    set_kernel_stack_for(cur());
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe extern "C" {
+    /// The per-CPU scratch slots the syscall stub loads RSP from; see
+    /// user-x86_64.s. Indexed by (APIC ID & 7).
+    static mut kernel_sp_scratch: [u64; 8];
+}
+
 pub fn bind_linux_pid(pid: i64) {
     unsafe {
-        TASKS[CURRENT].linux_pid = pid;
+        TASKS[cur()].linux_pid = pid;
     }
 }
 pub fn linux_pid(id: usize) -> i64 {
@@ -1034,16 +2388,108 @@ pub fn linux_pid(id: usize) -> i64 {
 }
 pub fn set_exit_status(status: i32) {
     unsafe {
-        TASKS[CURRENT].exit_status = status;
+        TASKS[cur()].exit_status = status;
     }
 }
 pub fn exit_status(id: usize) -> i32 {
     unsafe { TASKS[id].exit_status }
 }
 
-/// Give up the rest of this slice.
+/// Sleep until `ticks` timer ticks have passed.
+///
+/// A wait, not a spin: the caller is off the run queue for the duration and
+/// the CPU stops when nothing else wants it. `while ticks() < until
+/// { yield_now() }` is the same wait written as a busy loop, and on an
+/// emulated machine that is a host core at 100% for as long as it lasts --
+/// the watchdog's one-second pause alone kept this one from ever idling.
+///
+/// The tick handler wakes sleepers whose deadline has passed, so the
+/// resolution is one tick (HZ) and never shorter than asked for.
+pub fn sleep_ticks(ticks: u64) {
+    let until = crate::timer::ticks() + ticks;
+    loop {
+        let flags = crate::sync::irq_save();
+        if crate::timer::ticks() >= until {
+            unsafe { crate::sync::irq_restore(flags) };
+            return;
+        }
+        // Deadline recorded before blocking and with interrupts masked: a
+        // tick landing in between finds a sleeper to wake rather than
+        // passing it in the gap.
+        unsafe {
+            (*(&raw mut TASKS))[cur()].wake_at = until;
+        }
+        // Predicate: the millisecond clock has reached `until`.
+        // Protected by: the monotonic TICKS counter, read here under the
+        //   runqueue lock so the read and the decision to sleep cannot
+        //   straddle a tick.
+        // Published: `wake_sleepers` runs from the BSP tick, and under
+        //   RUNQUEUE clears `wake_at` and makes this task Ready.
+        // Ordering: a tick either already bumped TICKS before we take the
+        //   lock (we see the deadline passed) or it takes the lock after we
+        //   are marked Blocked and wakes us. Bumping TICKS is atomic and
+        //   happens before `wake_sleepers` acquires the lock.
+        // Why the re-check closes it: previously a tick landing between the
+        //   `wake_at` store above and `block_on` marking us Blocked found a
+        //   task that was still Running, refused the wake, and this task
+        //   then slept through its own deadline until the *next* tick. The
+        //   re-check turns that lost tick into a visible deadline.
+        block_on_cond(flags, SLEEP_WAIT, || crate::timer::ticks() >= until);
+        // `block_on` returns without having switched when nothing else is
+        // Ready, and this task is then still marked Blocked with its own
+        // deadline pending. Halting is exactly right here: the caller
+        // asked to be away for a while, the tick is what ends that, and
+        // this is the state an idle machine should be sitting in.
+        if unsafe { (*(&raw const TASKS))[cur()].state == State::Blocked } {
+            halt_until_interrupt();
+        }
+    }
+}
+
+/// What a sleeper is blocked on, so only the tick may wake it.
+const SLEEP_WAIT: u32 = u32::MAX - 1;
+
+/// Wake every sleeper whose deadline has passed. Called from the timer
+/// interrupt, which is the only thing that can make one runnable again.
+pub fn wake_sleepers() {
+    let now = crate::timer::ticks();
+    // Under the runqueue lock: `make_ready` publishes state that a pick on
+    // another CPU is concurrently reading. This runs from the BSP's tick,
+    // which is why it may take the lock at all -- an interrupt handler that
+    // only ever reads its own CPU's state could skip it.
+    let flags = RUNQUEUE.lock();
+    unsafe {
+        for i in 0..MAX_TASKS {
+            if TASKS[i].state == State::Blocked
+                && TASKS[i].waiting_on == SLEEP_WAIT
+                && TASKS[i].wake_at != 0
+                && now >= TASKS[i].wake_at
+            {
+                TASKS[i].wake_at = 0;
+                make_ready(i, SLEEP_WAIT);
+            }
+        }
+        RUNQUEUE.unlock(flags);
+    }
+}
+
+/// Give up the rest of this slice, and stop the CPU if that is all there is.
+///
+/// The spin-wait loops (the watchdog's second, the boot task's waits) are
+/// written as `while not_yet() { yield_now() }`, which on a machine with
+/// nothing else to run is a tight loop around a clock read. That is a host
+/// core at 100% for a guest that is doing nothing at all -- the guest looks
+/// busy because it never stops asking whether it is time yet.
+///
+/// So when the yield found nobody, halt until the next interrupt. The timer
+/// runs at HZ, so this wakes at least every tick and no wait gets longer;
+/// it just stops burning the CPU between them. `wfi` returns on a pending
+/// interrupt regardless of the mask, and the caller's loop re-tests its own
+/// condition afterwards, so this cannot swallow a wakeup.
 pub fn yield_now() {
-    schedule();
+    if !schedule() {
+        halt_until_interrupt();
+    }
 }
 
 /// Which task is running. The identity a semaphore or a join needs.
@@ -1076,8 +2522,14 @@ pub fn current_uid() -> usize {
 }
 
 pub fn current_id() -> usize {
-    unsafe { core::ptr::read(&raw const CURRENT) }
+    cpu_current_unchecked()
 }
+
+pub fn current_cpu() -> usize {
+    cpu_index(crate::arch::cpu_id())
+}
+
+pub fn set_current_cpu(_cpu: usize) {}
 
 /// Stop running until somebody calls `wake`.
 ///
@@ -1089,15 +2541,85 @@ pub fn block(flags: u64) {
     block_on(flags, 0)
 }
 
+/// Block unless `ready` says otherwise, with the check and the blocking
+/// decision made under the runqueue lock.
+///
+/// This is the fix for the classic lost wakeup. A primitive arms its own
+/// waiter state, then calls here. Between that arming and the sleep, a waker
+/// on another CPU can post and try to wake this task -- and `up` makes a
+/// task Ready only while its state is `Blocked`, so the wake is refused
+/// (the task is still `Running`) and then this function would set `Blocked`
+/// anyway, sleeping through a wake that already happened. Both sides of a
+/// ping-pong pair can do that to each other and end up blocked at once.
+///
+/// Re-checking under the same lock the waker takes closes it: if the post
+/// landed, `ready` is true here and the task does not sleep; if the post
+/// lands after, the waker finds the task `Blocked` and wakes it. The waker
+/// increments its counter *before* taking the lock, so a post that is
+/// already in flight but not yet visible at the first check is still either
+/// seen here or woken after.
+pub fn block_on_cond(flags: u64, what: u32, ready: impl Fn() -> bool) {
+    let g = RUNQUEUE.lock();
+    if ready() {
+        unsafe { RUNQUEUE.unlock(g) };
+        unsafe { crate::sync::irq_restore(flags) };
+        return;
+    }
+    unsafe {
+        (*(&raw mut TASKS))[cur()].waiting_on = what;
+        (*(&raw mut TASKS))[cur()].state = State::Blocked;
+        (*(&raw mut TASKS))[cur()].ready_at = 0;
+        account(cur(), crate::arch::cycles());
+        crate::schedtrace::record(
+            0,
+            crate::schedtrace::Event::Block,
+            cur(),
+            cur(),
+            effective_class_of(cur()).as_u8(),
+            what as u64,
+            0,
+        );
+        RUNQUEUE.unlock(g);
+    }
+    unsafe { crate::sync::irq_restore(flags) };
+    schedule();
+}
+
 /// Block, recording what is being waited for so a deadlock names itself.
 pub fn block_on(flags: u64, what: u32) {
+    // Marking Blocked under the runqueue lock, so a wake on another CPU
+    // either sees Blocked (and makes it Ready) or arrives before and lets
+    // this loop re-test its condition. The old unlocked store raced
+    // `wake_on` and lost wakes outright.
+    let g = RUNQUEUE.lock();
     unsafe {
-        (*(&raw mut TASKS))[CURRENT].waiting_on = what;
-        (*(&raw mut TASKS))[CURRENT].state = State::Blocked;
+        (*(&raw mut TASKS))[cur()].waiting_on = what;
+        (*(&raw mut TASKS))[cur()].state = State::Blocked;
+        (*(&raw mut TASKS))[cur()].ready_at = 0;
+        account(cur(), crate::arch::cycles());
+        crate::schedtrace::record(
+            0,
+            crate::schedtrace::Event::Block,
+            cur(),
+            cur(),
+            effective_class_of(cur()).as_u8(),
+            what as u64,
+            0,
+        );
+        RUNQUEUE.unlock(g);
         // Interrupts come back on before the switch: the task is already
         // marked blocked, so a wake arriving now sets it Ready again rather
         // than being lost.
-        core::arch::asm!("msr daif, {}", in(reg) flags, options(nomem, nostack));
+        crate::sync::irq_restore(flags);
+        // One switch, and the caller re-tests its own condition in a loop.
+        //
+        // Not a halt-until-really-elsewhere loop here, tempting as that is:
+        // this runs from every blocking primitive in the kernel, including
+        // LKL's semaphores during early boot and inside sections that block
+        // with interrupts deliberately masked. Halting in those contexts
+        // waits for an interrupt that cannot arrive -- measured as a boot
+        // that stops at the first mount. The idle halt lives in `yield_now`
+        // and `sleep_ticks`, where the context is known to be safe.
         schedule();
     }
 }
@@ -1125,20 +2647,27 @@ pub static mut LOST_WAKEUPS: u64 = 0;
 /// The token is the rule: 0 is nk's own generic wait and may be interrupted
 /// by anyone, and anything else names a primitive that only its owner may
 /// wake a task out of.
-pub fn wake_on(id: usize, what: u32) {
-    unsafe {
-        let tasks = &mut *(&raw mut TASKS);
+pub fn wake_on(id: usize, what: u32) -> bool {
+    let flags = RUNQUEUE.lock();
+    let woke = unsafe {
         if id >= MAX_TASKS {
-            return;
+            false
+        } else if TASKS[id].state == State::Blocked {
+            if TASKS[id].waiting_on == what {
+                make_ready(id, what);
+                true
+            } else {
+                false
+            }
+        } else if matches!(TASKS[id].state, State::Ready | State::Running) {
+            false
+        } else {
+            LOST_WAKEUPS += 1;
+            false
         }
-        if tasks[id].state == State::Blocked && tasks[id].waiting_on != what {
-            // Not ours to wake. Deliberately not counted as a lost wakeup:
-            // nothing was lost, and the signal or event that prompted this
-            // stays pending for whenever the task comes back on its own.
-            return;
-        }
-        wake(id);
-    }
+    };
+    unsafe { RUNQUEUE.unlock(flags) };
+    woke
 }
 
 /// Make a blocked task runnable, whatever it is waiting on.
@@ -1147,33 +2676,292 @@ pub fn wake_on(id: usize, what: u32) {
 /// the note there for what waking a task out of somebody else's semaphore
 /// does.
 pub fn wake(id: usize) {
+    let flags = RUNQUEUE.lock();
     unsafe {
-        let tasks = &mut *(&raw mut TASKS);
-        if id >= MAX_TASKS {
-            return;
+        if id < MAX_TASKS {
+            match TASKS[id].state {
+                State::Blocked => make_ready(id, TASKS[id].waiting_on),
+                State::Ready | State::Running => {}
+                _ => LOST_WAKEUPS += 1,
+            }
         }
-        match tasks[id].state {
-            State::Blocked => tasks[id].state = State::Ready,
-            // Already runnable: the wake is redundant, not lost.
-            State::Ready | State::Running => {}
-            _ => LOST_WAKEUPS += 1,
+        unsafe { RUNQUEUE.unlock(flags) };
+    }
+}
+
+/// Set a blocked task runnable, and decide whether it should run *now*.
+///
+/// Every wakeup goes through here, which is what makes the responsiveness
+/// policy actually apply: a task made Ready by a hand-written
+/// `state = Ready` would be correct but would wait for the tick, and a
+/// compositor woken by a keystroke waiting out a compiler's 20 ms slice is
+/// precisely the feeling this scheduler exists to avoid.
+///
+/// The decision itself is `schedpolicy::should_preempt`, and the switch is
+/// not done here -- this runs from interrupt handlers and from inside
+/// locks. It sets `NEED_RESCHED`, and the switch happens at the next safe
+/// point: the end of the interrupt, or the next `schedule()`.
+///
+/// # Safety
+/// Caller holds the scheduler's interrupt mask.
+unsafe fn make_ready(id: usize, what: u32) {
+    let placed = place_vruntime();
+    let now = crate::arch::cycles();
+    let cpu = cpu_index(crate::arch::cpu_id());
+    let current = (*(&raw const CPUS))[cpu].current;
+    TASKS[id].ready_at = now;
+    TASKS[id].wake_pending = true;
+    TASKS[id].state = State::Ready;
+
+    // A task that has been asleep for a long time would otherwise come back
+    // with a vruntime far behind the running set and monopolise the CPU
+    // catching up. Only ever moved forward: a task that slept briefly keeps
+    // its place, which is what makes short blocking cheap.
+    if TASKS[id].vruntime < placed {
+        TASKS[id].vruntime = placed;
+    }
+
+    crate::schedtrace::record(
+        0,
+        crate::schedtrace::Event::Wakeup,
+        id,
+        current,
+        crate::schedpolicy::effective_class(TASKS[id].class, TASKS[id].interactive).as_u8(),
+        what as u64,
+        0,
+    );
+
+    if id == current {
+        return;
+    }
+
+    let waker = crate::schedpolicy::effective_class(TASKS[id].class, TASKS[id].interactive);
+    let running = crate::schedpolicy::effective_class(
+        TASKS[current].class,
+        TASKS[current].interactive,
+    );
+    let running_for = if TASKS[current].ran_at == 0 {
+        0
+    } else {
+        crate::timer::cycles_to_ns(now.wrapping_sub(TASKS[current].ran_at))
+    };
+
+    if crate::schedpolicy::should_preempt(waker, running, running_for) {
+        crate::schedtrace::record(
+            0,
+            crate::schedtrace::Event::Preempt,
+            id,
+            current,
+            waker.as_u8(),
+            1,
+            running_for,
+        );
+        let target = pick_target_cpu(id);
+        if target == cpu {
+            set_need_resched_on(cpu);
+        } else {
+            send_reschedule_ipi(target);
         }
     }
 }
 
-/// Wait for a task to finish.
-pub fn join(id: usize) {
-    loop {
-        let done = unsafe {
-            let t = &(*(&raw const TASKS))[id];
-            t.state == State::Finished || t.state == State::Unused
-        };
-        if done {
-            return;
+/// Set when something has happened that should change which task is running
+/// -- a wakeup that outranks the current task, or a slice that has run out.
+///
+/// A flag rather than a switch, because the places that discover this are
+/// the worst possible places to switch from: inside an interrupt handler,
+/// inside a lock, inside LKL. The switch happens at the next point that is
+/// known to be safe, which is what §28 of the brief means by doing minimal
+/// work in interrupt context.
+pub static NEED_RESCHED: AtomicBool = AtomicBool::new(false);
+
+/// Whether a reschedule is wanted, clearing the request.
+pub fn take_need_resched() -> bool {
+    let cpu = cpu_index(crate::arch::cpu_id());
+    take_need_resched_on(cpu)
+}
+
+/// Ask for a reschedule at the next safe point.
+pub fn set_need_resched() {
+    let cpu = cpu_index(crate::arch::cpu_id());
+    set_need_resched_on(cpu)
+}
+
+pub fn take_need_resched_cpu(cpu: usize) -> bool {
+    take_need_resched_on(cpu)
+}
+
+pub fn set_need_resched_cpu(cpu: usize) {
+    set_need_resched_on(cpu)
+}
+
+/// Whether the running task has used its slice.
+///
+/// Called from the tick. A task that has had its share should be rotated
+/// even with nothing higher-class waiting, which is what keeps equals
+/// sharing fairly rather than the first one running until it blocks.
+pub fn slice_expired() -> bool {
+    unsafe {
+        let tasks = &*(&raw const TASKS);
+        let cur = cpu_current_unchecked();
+        if tasks[cur].ran_at == 0 {
+            return false;
         }
-        yield_now();
+        let class = crate::schedpolicy::effective_class(tasks[cur].class, tasks[cur].interactive);
+        let ran = crate::timer::cycles_to_ns(crate::arch::cycles().wrapping_sub(tasks[cur].ran_at));
+        ran >= crate::schedpolicy::slice_ns(class)
     }
 }
+
+/// Whether the task is parked rather than ready or running.
+///
+/// For the watchdog's LKL strand check: a blocked host thread cannot be
+/// inside Linux executing anything, so if it still owns LKL's CPU while the
+/// machine makes no syscalls, nobody else ever can either.
+pub fn blocked(id: usize) -> bool {
+    unsafe { id < MAX_TASKS && (*(&raw const TASKS))[id].state == State::Blocked }
+}
+
+/// Whether the slot holds a task that can never run again -- finished but
+/// not yet reaped, or already reclaimed. A `uid` naming one of these is dead
+/// for ownership purposes even while `from_uid` still resolves it.
+pub fn finished(id: usize) -> bool {
+    unsafe {
+        id < MAX_TASKS
+            && matches!(
+                (*(&raw const TASKS))[id].state,
+                State::Finished | State::Unused
+            )
+    }
+}
+
+/// A task's state as a number, for diagnostics: 0 unused, 1 ready,
+/// 2 running, 3 blocked, 4 finished, 5 stale uid, 6 out of range.
+pub fn task_state_of(uid: usize) -> u8 {
+    let id = uid & 0xffff;
+    if id >= MAX_TASKS {
+        return 6;
+    }
+    unsafe {
+        if TASKS[id].generation != (uid >> 16) as u64 {
+            return 5;
+        }
+        match TASKS[id].state {
+            State::Unused => 0,
+            State::Ready => 1,
+            State::Running => 2,
+            State::Blocked => 3,
+            State::Finished => 4,
+        }
+    }
+}
+
+/// The base address of a task's kernel stack, for diagnostics. Two tasks
+/// sharing a base is the allocator handing one stack to both.
+pub fn task_stack_of(id: usize) -> usize {
+    if id >= MAX_TASKS { return 0; }
+    unsafe { (*(&raw const TASKS))[id].stack }
+}
+
+/// Raw per-slot scheduler facts for diagnostics: state, what it is blocked
+/// on, whether a CPU owns it, and its home CPU. Takes a slot, not a uid --
+/// `task_state_of` masks a uid and reports 5 for a slot, which reads as
+/// "exited" and hides a live task.
+pub fn task_probe(id: usize) -> (u8, u32, bool, u8) {
+    if id >= MAX_TASKS {
+        return (6, 0, false, 0);
+    }
+    unsafe {
+        let t = &(*(&raw const TASKS))[id];
+        let st = match t.state {
+            State::Unused => 0,
+            State::Ready => 1,
+            State::Running => 2,
+            State::Blocked => 3,
+            State::Finished => 4,
+        };
+        (st, t.waiting_on, t.on_cpu, t.home_cpu)
+    }
+}
+
+/// Wait for a task to finish.
+///
+/// Blocked, not spinning. The boot task joins init and init is the whole
+/// session, so a spin here is a task that is Ready for hours: it costs a
+/// context switch per pass, and -- because `schedule` only stops the CPU
+/// when nothing at all is runnable -- it is on its own enough to keep a
+/// host core at 100% for an idle machine. `task_exit` wakes the joiner.
+pub fn join(id: usize) {
+    loop {
+        let flags = crate::sync::irq_save();
+        // The test and the registration happen together under the runqueue
+        // lock, which is the same lock `task_exit` takes to publish Finished
+        // and to take the joiner field. An exit landing between this test and
+        // the block below therefore either turns the test true right here, or
+        // finds a registered joiner when it takes the field and wakes it --
+        // there is no gap left for it to fall through.
+        //
+        // One slot, so one sleeping joiner: a second would overwrite the
+        // first and that first would never be woken. Nothing in nk joins the
+        // same task twice, and if anything ever does it yields instead of
+        // sleeping -- slower, and still correct.
+        let (done, alone) = {
+            let g = RUNQUEUE.lock();
+            let state = unsafe { (*(&raw const TASKS))[id].state };
+            let done = state == State::Finished || state == State::Unused;
+            let alone = if done {
+                false
+            } else {
+                unsafe {
+                    let tasks = &mut *(&raw mut TASKS);
+                    if tasks[id].joiner == 0 || tasks[id].joiner == cur() as u32 + 1 {
+                        tasks[id].joiner = cur() as u32 + 1;
+                        true
+                    } else {
+                        false
+                    }
+                }
+            };
+            unsafe { RUNQUEUE.unlock(g) };
+            (done, alone)
+        };
+        if done {
+            unsafe { crate::sync::irq_restore(flags) };
+            return;
+        }
+        if alone {
+            // Predicate: the target task is Finished (or its slot already
+            //   reclaimed to Unused).
+            // Protected by: the target's `state` under the runqueue lock.
+            //   `task_exit` now writes Finished *inside* that lock and takes
+            //   the joiner field in the same critical section, so there is
+            //   no unlocked window on either side.
+            // Published: `task_exit` holds the lock across "state = Finished
+            //   and read joiner", releases, then calls
+            //   `wake_on(joiner-1, JOIN_WAIT)`.
+            // Why the re-check closes it: an exit that lands between the
+            //   test at the top of this loop and this block is caught here
+            //   -- Finished makes the predicate true, so the joiner never
+            //   sleeps. An exit after the joiner is Blocked is delivered by
+            //   `wake_on`, which finds it Blocked and wakes it. The
+            //   unconditional `block_on` would have set Blocked after the
+            //   wake was refused, and the joiner would have slept forever on
+            //   a task that had already exited.
+            block_on_cond(flags, JOIN_WAIT, || {
+                let t = unsafe { &(*(&raw const TASKS))[id] };
+                t.state == State::Finished || t.state == State::Unused
+            });
+        } else {
+            unsafe { crate::sync::irq_restore(flags) };
+            yield_now();
+        }
+    }
+}
+
+/// What a joiner is blocked on, so only `task_exit` may wake it. See
+/// `wake_on`: a bare `wake` would return a task from somebody else's
+/// semaphore without the semaphore having been given to it.
+const JOIN_WAIT: u32 = u32::MAX;
 
 /// End the current task from inside it. What `task_exit` does when an entry
 /// function returns, exposed for a caller that decides to stop early.
@@ -1185,16 +2973,59 @@ pub fn exit_current() -> ! {
 #[no_mangle]
 pub extern "C" fn task_exit() -> ! {
     crate::hostops::tls_cleanup();
-    unsafe {
-        let tasks = &mut *(&raw mut TASKS);
-        tasks[CURRENT].state = State::Finished;
-        // The stack is deliberately not freed here: it is the stack this code
-        // is standing on. It is reclaimed by whoever reaps the slot, which
-        // nothing does yet -- a real leak, bounded by MAX_TASKS, and noted
-        // rather than hidden.
+    let flags = crate::sync::irq_save();
+    // Publish Finished under the runqueue lock, and read the joiner and the
+    // parent in the same critical section. `join` registers `joiner` under
+    // this lock too, and `wait4` re-checks the child's state under it, so
+    // both facts are ordered against their readers. A plain store ordered
+    // only by the wake's lock acquire would still be a data race on a
+    // non-atomic field, which is undefined behaviour even when it happens to
+    // work.
+    let (joiner, parent) = {
+        let g = RUNQUEUE.lock();
+        let published = unsafe {
+            TASKS[cur()].state = State::Finished;
+            account(cur(), crate::arch::cycles());
+            // Whoever is in `join` on this task is blocked, not spinning,
+            // and this is the only thing that will ever wake it.
+            (core::mem::take(&mut TASKS[cur()].joiner), TASKS[cur()].parent)
+        };
+        unsafe { RUNQUEUE.unlock(g) };
+        published
+    };
+    // Woken after the publication and outside the lock: `wake_on` takes the
+    // lock itself. A joiner or parent that acquires it now sees Finished and
+    // does not sleep; one already Blocked is woken here.
+    if joiner != 0 {
+        wake_on(joiner as usize - 1, JOIN_WAIT);
     }
+    // And a parent blocked in `wait4`. The wake has to be here rather than
+    // where the status is recorded: `sys_exit` posts SIGCHLD and wakes the
+    // parent while this task is still Running, so a parent that reaches its
+    // "has the child finished?" test in between sees "no", blocks, and is
+    // never woken again -- the whole machine then waits on a child that
+    // exited seconds ago. Marked Finished first, woken second, so the test
+    // the parent re-runs after waking can only ever see the state that made
+    // the wake true.
+    if parent != 0 && parent != cur() {
+        wake_on(parent, 0);
+    }
+    // The stack is deliberately not freed here: it is the stack this code is
+    // standing on. It is reclaimed by whoever reaps the slot, which nothing
+    // does yet -- a real leak, bounded by MAX_TASKS, and noted rather than
+    // hidden.
+    // Interrupts back on before parking. This runs with the mask held from
+    // `irq_save` above, and the loop below never returns -- a finished task
+    // that sat here masked would stop the timer, and on a single CPU that is
+    // a sleep nobody can ever wake: the finished task spins in `schedule`
+    // while the task that could reap it is parked and the clock that would
+    // wake it is off. It is invisible on SMP, where some other CPU runs the
+    // timer, which is exactly how it survived this long.
+    unsafe { crate::sync::irq_restore(flags) };
     loop {
-        schedule();
+        // `yield_now` halts when there is genuinely nothing else to run,
+        // rather than spinning a dead task at full tilt.
+        yield_now();
     }
 }
 
@@ -1208,11 +3039,114 @@ pub fn preempt_enabled() -> bool {
     ENABLED.load(Ordering::SeqCst)
 }
 
+/// Put a task in a scheduling class.
+///
+/// The only way a class is ever set: nothing infers one from a name, and no
+/// program may ask for one directly. What a task claims about itself is not
+/// evidence -- a program that could declare itself interactive would, and
+/// every program would, and the class would mean nothing. Interactivity is
+/// earned through behaviour (see `schedpolicy`); this is for the cases where
+/// nk genuinely knows, such as its own background threads.
+pub fn set_class(id: usize, class: crate::schedpolicy::Class) {
+    if id >= MAX_TASKS {
+        return;
+    }
+    let flags = crate::sync::irq_save();
+    unsafe {
+        let placed = place_vruntime();
+        let tasks = &mut *(&raw mut TASKS);
+        if tasks[id].class != class {
+            crate::schedtrace::record(
+                0,
+                crate::schedtrace::Event::PriorityChange,
+                id,
+                cur(),
+                class.as_u8(),
+                tasks[id].class.as_u8() as u64,
+                0,
+            );
+            tasks[id].class = class;
+            // The vruntime was accumulated at the old class's weight and is
+            // not comparable at the new one. Re-placing against the run
+            // queue keeps it meaningful without giving the task either a
+            // windfall or a penalty for the reclassification.
+            tasks[id].vruntime = placed;
+        }
+        crate::sync::irq_restore(flags);
+    }
+}
+
+pub fn set_current_class(class: crate::schedpolicy::Class) {
+    set_class(current_id(), class);
+}
+
+/// How many times a task has been given the CPU. The crude measure of how
+/// much of the machine it got, and enough to tell whether class ordering is
+/// doing anything.
+pub fn slices_of(id: usize) -> u64 {
+    if id >= MAX_TASKS {
+        return 0;
+    }
+    unsafe { (*(&raw const TASKS))[id].slices }
+}
+
+pub fn task_name(id: usize) -> &'static str {
+    if id >= MAX_TASKS {
+        return "?";
+    }
+    unsafe { (*(&raw const TASKS))[id].name }
+}
+
+/// Total CPU time a task has consumed, in nanoseconds.
+pub fn runtime_of(id: usize) -> u64 {
+    if id >= MAX_TASKS {
+        return 0;
+    }
+    unsafe { (*(&raw const TASKS))[id].ran_ns }
+}
+
+pub fn class(id: usize) -> crate::schedpolicy::Class {
+    if id >= MAX_TASKS {
+        return crate::schedpolicy::Class::Normal;
+    }
+    unsafe { (*(&raw const TASKS))[id].class }
+}
+
+/// A summary of how the scheduler is behaving, for the diagnostics path.
+pub fn report_classes() {
+    unsafe {
+        let tasks = &*(&raw const TASKS);
+        let mut runnable = 0;
+        let mut blocked = 0;
+        let mut per_class = [0usize; 5];
+        for t in tasks.iter() {
+            match t.state {
+                State::Ready | State::Running => {
+                    runnable += 1;
+                    let c = crate::schedpolicy::effective_class(t.class, t.interactive);
+                    per_class[c.as_u8() as usize] += 1;
+                }
+                State::Blocked => blocked += 1,
+                _ => {}
+            }
+        }
+        println!(
+            "  runqueue: {} runnable, {} blocked  (rt {}, interactive {}, normal {}, throughput {}, background {})",
+            runnable, blocked, per_class[4], per_class[3], per_class[2], per_class[1], per_class[0]
+        );
+        crate::schedtrace::report_latency();
+    }
+}
+
 pub fn current() -> usize {
-    unsafe { CURRENT }
+    cur()
 }
 
 pub fn report() {
+    fn comm_of(t: &Task) -> &str {
+        let end = t.comm.iter().position(|b| *b == 0).unwrap_or(t.comm.len());
+        core::str::from_utf8(&t.comm[..end]).unwrap_or("")
+    }
     unsafe {
         let tasks = &*(&raw const TASKS);
         for (i, t) in tasks.iter().enumerate() {
@@ -1226,13 +3160,18 @@ pub fn report() {
                 };
                 if t.state == State::Blocked && t.waiting_on != 0 {
                     println!(
-                        "          [{}] {:<10} {:<9} {} slices  waiting on {}",
-                        i, t.name, s, t.slices, t.waiting_on
+                        "          [{}] {:<10} {:<9} {} slices  pid {}  uid {:#x}  waiting on {} syscall {}  comm {}",
+                        i, t.name, s, t.slices, t.linux_pid, uid(i), t.waiting_on, t.last_syscall, comm_of(t)
+                    );
+                } else if t.last_syscall != 0 {
+                    println!(
+                        "          [{}] {:<10} {:<9} {} slices  pid {}  uid {:#x}  syscall {}  comm {}",
+                        i, t.name, s, t.slices, t.linux_pid, uid(i), t.last_syscall, comm_of(t)
                     );
                 } else {
                     println!(
-                        "          [{}] {:<10} {:<9} {} slices",
-                        i, t.name, s, t.slices
+                        "          [{}] {:<10} {:<9} {} slices  pid {}  comm {}",
+                        i, t.name, s, t.slices, t.linux_pid, comm_of(t)
                     );
                 }
             }
@@ -1245,7 +3184,7 @@ pub fn report() {
 pub fn reap_process(id: usize) {
     let flags = crate::sync::irq_save();
     unsafe {
-        assert_ne!(id, CURRENT);
+        assert_ne!(id, cur());
         let task = TASKS[id];
         assert!(task.state == State::Finished && task.linux_pid > 1);
         // A thread's address space belongs to the threads it shared it with,
@@ -1254,9 +3193,7 @@ pub fn reap_process(id: usize) {
             crate::paging::destroy_user_address_space(task.ttbr0);
             mm_drop(task.ttbr0);
         }
-        for i in 0..STACK_PAGES {
-            frames::free((task.stack + i * PAGE) as *mut u8);
-        }
+        return_stack(task.stack);
         frames::free(task.shadow as *mut u8);
         TASKS[id].state = State::Unused;
         crate::sync::irq_restore(flags);
@@ -1265,7 +3202,7 @@ pub fn reap_process(id: usize) {
 
 pub fn record_user_irq() {
     unsafe {
-        TASKS[CURRENT].user_irqs += 1;
+        TASKS[cur()].user_irqs += 1;
     }
 }
 pub fn user_irqs(id: usize) -> u64 {

@@ -49,7 +49,16 @@ pub fn copy_from_user(dst: &mut [u8], src: u64) -> Result<(), i64> {
     let mut done = 0usize;
     while done < dst.len() {
         let va = src.checked_add(done as u64).ok_or(EFAULT)?;
-        let pa = paging::user_to_phys(va).ok_or(EFAULT)?;
+        let pa = match paging::user_to_phys(va) {
+            Some(p) => p,
+            None => {
+                if crate::sched::in_user_syscall() && crate::reserve::fault_in(va) {
+                    paging::user_to_phys(va).ok_or(EFAULT)?
+                } else {
+                    return Err(EFAULT);
+                }
+            }
+        };
         // Up to the end of this page, or the end of the request.
         let in_page = (0x1000 - (va & 0xfff)) as usize;
         let n = in_page.min(dst.len() - done);
@@ -66,7 +75,16 @@ pub fn copy_to_user(dst: u64, src: &[u8]) -> Result<(), i64> {
     let mut done = 0usize;
     while done < src.len() {
         let va = dst.checked_add(done as u64).ok_or(EFAULT)?;
-        let pa = paging::user_to_phys_write(va).ok_or(EFAULT)?;
+        let pa = match paging::user_to_phys_write(va) {
+            Some(p) => p,
+            None => {
+                if crate::sched::in_user_syscall() && crate::reserve::fault_in(va) {
+                    paging::user_to_phys_write(va).ok_or(EFAULT)?
+                } else {
+                    return Err(EFAULT);
+                }
+            }
+        };
         let in_page = (0x1000 - (va & 0xfff)) as usize;
         let n = in_page.min(src.len() - done);
         unsafe {
@@ -87,7 +105,16 @@ pub fn copy_cstr_from_user(ptr: u64, out: &mut [u8]) -> Result<usize, i64> {
     let mut len = 0usize;
     while len < out.len() {
         let va = ptr.checked_add(len as u64).ok_or(EFAULT)?;
-        let pa = paging::user_to_phys(va).ok_or(EFAULT)?;
+        let pa = match paging::user_to_phys(va) {
+            Some(p) => p,
+            None => {
+                if crate::sched::in_user_syscall() && crate::reserve::fault_in(va) {
+                    paging::user_to_phys(va).ok_or(EFAULT)?
+                } else {
+                    return Err(EFAULT);
+                }
+            }
+        };
         let byte = unsafe { core::ptr::read_volatile(pa as *const u8) };
         out[len] = byte;
         if byte == 0 {

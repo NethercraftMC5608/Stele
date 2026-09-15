@@ -12,6 +12,7 @@
 
 use crate::sched;
 use crate::sync::{irq_restore, irq_save};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 extern "C" {
     fn lkl_trigger_irq(irq: i32) -> i32;
@@ -23,8 +24,13 @@ extern "C" {
 /// Interrupts 0..127. LKL hands them out from the bottom and nk will have a
 /// handful; a bitmask keeps `raise` to a few instructions with interrupts
 /// masked, which is what makes it safe in a handler.
-static mut PENDING: u128 = 0;
-static mut PUMP: usize = 0;
+/// Split into two 64-bit halves so each is a lock-free atomic: a plain
+/// `u128` `|=` and the pump's take are both read-modify-write, and on SMP an
+/// interleaving drops the bit -- a device interrupt that is never delivered,
+/// silently. The halves also make the drain and the "is anything pending"
+/// predicate cheap to express.
+static PENDING: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+static PUMP: AtomicUsize = AtomicUsize::new(0);
 
 /// Whether the pump is asleep in its *own* idle block, as opposed to blocked
 /// somewhere inside Linux.
@@ -42,7 +48,7 @@ static mut PUMP: usize = 0;
 /// A wake is only ever delivered when the pump is idle here, so an interrupt
 /// that arrives while it is inside Linux is recorded in `PENDING` and
 /// collected on the next loop, which is what `PENDING` was always for.
-static mut IDLE: bool = false;
+static IDLE: AtomicBool = AtomicBool::new(false);
 
 /// Which LKL interrupt a GIC interrupt stands for.
 ///
@@ -99,16 +105,20 @@ pub fn raise(irq: i32) {
     }
     unsafe {
         let flags = irq_save();
-        PENDING |= 1u128 << irq;
-        // Zero until the thread exists, and task zero is the boot thread:
-        // waking it because a device spoke early would mark it ready while it
-        // waits on something else entirely.
+        PENDING[(irq / 64) as usize].fetch_or(1u64 << (irq % 64), Ordering::SeqCst);
+        // Only ever wake the pump out of its *own* idle block, never out of
+        // a wait inside Linux; see `IDLE`.
         //
-        // `IDLE` for the same reason, generalised: only ever wake the pump
-        // out of its own block. Interrupts masked throughout, so the flag
-        // cannot change between the test and the wake.
-        if PUMP != 0 && IDLE {
-            sched::wake(PUMP);
+        // The wake is an optimisation, not the correctness: the pump's
+        // re-check of PENDING under the runqueue lock is what makes the
+        // interrupt survive a wake that lands while the pump is between its
+        // drain and its sleep. This handshake alone had a window -- `raise`
+        // could set PENDING and read IDLE == false just before the pump set
+        // IDLE and blocked, and the interrupt then sat undelivered until the
+        // next unrelated one.
+        let pump = PUMP.load(Ordering::SeqCst);
+        if pump != 0 && IDLE.load(Ordering::SeqCst) {
+            sched::wake(pump);
         }
         irq_restore(flags);
     }
@@ -117,13 +127,27 @@ pub fn raise(irq: i32) {
 extern "C" fn pump(_: usize) {
     loop {
         let flags = irq_save();
-        let due = unsafe { core::mem::take(&mut *(&raw mut PENDING)) };
+        let lo = PENDING[0].swap(0, Ordering::SeqCst);
+        let hi = PENDING[1].swap(0, Ordering::SeqCst);
+        let due = ((hi as u128) << 64) | lo as u128;
         if due == 0 {
-            // Marked idle with interrupts still masked, so a `raise` cannot
-            // land between deciding to sleep and being marked sleepable.
-            unsafe { IDLE = true };
-            sched::block(flags);
-            unsafe { IDLE = false };
+            // Predicate: PENDING is non-empty.
+            // Protected by: the halves' own atomicity plus the runqueue
+            //   lock, which is what makes the drain-then-sleep atomic
+            //   against `raise`.
+            // Published: `raise` `fetch_or`s the bit before it loads IDLE
+            //   and wakes; the lock acquire inside that wake orders the bit
+            //   ahead of the wake.
+            // Why the re-check closes it: an interrupt that lands after the
+            //   swap above sets the bit again; the re-check sees it and this
+            //   loop collects it instead of sleeping. Without it the pump
+            //   could sleep with a device line already pending -- the
+            //   original window -- and the interrupt waited for the next one.
+            IDLE.store(true, Ordering::SeqCst);
+            sched::block_on_cond(flags, 0, || {
+                PENDING[0].load(Ordering::SeqCst) != 0 || PENDING[1].load(Ordering::SeqCst) != 0
+            });
+            IDLE.store(false, Ordering::SeqCst);
             continue;
         }
         unsafe { irq_restore(flags) };
@@ -145,10 +169,10 @@ extern "C" fn pump(_: usize) {
 
 pub fn start() {
     let id = sched::spawn("lkl-irq", pump, 0);
-    unsafe { PUMP = id };
+    PUMP.store(id, Ordering::SeqCst);
     // Anything a device said while this was being set up.
     let flags = irq_save();
-    if unsafe { PENDING } != 0 {
+    if PENDING[0].load(Ordering::SeqCst) != 0 || PENDING[1].load(Ordering::SeqCst) != 0 {
         // Not gated on IDLE: the pump has not run yet, so it cannot be
         // inside Linux, and it must not miss what arrived during setup.
         sched::wake(id);
