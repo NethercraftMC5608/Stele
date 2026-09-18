@@ -57,7 +57,17 @@ pub fn cpu_id() -> usize {
             options(nomem, nostack, preserves_flags),
         );
     }
-    ((ebx >> 24) & 0x7) as usize
+    let from_cpuid = ((ebx >> 24) & 0x7) as usize;
+    // CPUID is not trustworthy this early on a secondary: the bring-up loop
+    // showed it reading 0 while the same CPU's LAPIC id was already 1. The
+    // architectural stand-in is the local APIC id; the firmware/APIC-derived
+    // dense mapping is the eventual design. Temporary, per the clean-tree
+    // parity pass.
+    let from_lapic = (crate::lapic::id() & 0xff) as usize;
+    if from_cpuid != from_lapic {
+        return from_lapic;
+    }
+    from_cpuid
 }
 
 /// Interrupt another CPU so it takes its pending reschedule promptly.

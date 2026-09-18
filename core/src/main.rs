@@ -549,6 +549,10 @@ pub extern "C" fn rust_main(dtb: *const u8) -> ! {
         .and_then(|n| n.interrupt(2))
         .expect("no virtual timer in the device tree");
     unsafe { timer::init(ppi + 16) };
+    // What a secondary needs to bring up its own redistributor. The stride is
+    // architectural for GICv3 -- a redistributor is two 64 KiB frames, RD_base
+    // then SGI_base -- and `virt` lays them out densely in CPU order.
+    unsafe { gic::remember_secondary_params(gicr, 0x20000, ppi + 16) };
 
     // The console can now be typed into. An SPI's device-tree number is
     // relative to the first SPI, and the GIC's first SPI is INTID 32.
@@ -577,6 +581,11 @@ pub extern "C" fn rust_main(dtb: *const u8) -> ! {
     println!("Stage 1 up. Unmasking interrupts.");
     sched::enable();
     unsafe { core::arch::asm!("msr daifclr, #0xf", options(nomem, nostack)) };
+    // Secondary CPUs, once interrupts are live on this one. Same position
+    // and same reasoning as the x86 path: the BSP's wait is bounded by the
+    // counter rather than a tick, so the order is a convenience rather than
+    // a requirement. No-op unless NK_SMP was set at build time.
+    smp::bring_up();
 
     // See the x86 path. Behind a flag: these saturate the machine for
     // several seconds on purpose.
@@ -1757,11 +1766,11 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     // Deliberately uses the raw console rather than anything that could be
     // locked or allocated: the panic path has to work when the reason for the
     // panic is that one of those is broken.
-    println!();
-    println!("!! kernel panic");
+    raw_println!();
+    raw_println!("!! kernel panic");
     if let Some(loc) = info.location() {
-        println!("   at {}:{}:{}", loc.file(), loc.line(), loc.column());
+        raw_println!("   at {}:{}:{}", loc.file(), loc.line(), loc.column());
     }
-    println!("   {}", info.message());
+    raw_println!("   {}", info.message());
     halt();
 }

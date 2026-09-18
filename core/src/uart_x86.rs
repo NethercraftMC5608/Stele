@@ -163,7 +163,9 @@ pub unsafe fn init_receive(_intid: u32) {
 macro_rules! print {
     ($($arg:tt)*) => {{
         use core::fmt::Write;
+        let __console = $crate::sync::console_lock();
         let _ = write!($crate::uart_x86::console(), $($arg)*);
+        unsafe { $crate::sync::console_unlock(__console) };
     }};
 }
 
@@ -171,4 +173,20 @@ macro_rules! print {
 macro_rules! println {
     ()                 => { $crate::print!("\n") };
     ($($arg:tt)*)      => { $crate::print!("{}\n", format_args!($($arg)*)) };
+}
+
+/// `print!` without the console lock, for the panic and fault paths.
+#[macro_export]
+macro_rules! raw_print {
+    ($($arg:tt)*) => {{
+        use core::fmt::Write;
+        let _ = write!($crate::uart_x86::console(), $($arg)*);
+    }};
+}
+
+/// `println!` without the console lock. See `raw_print!`.
+#[macro_export]
+macro_rules! raw_println {
+    ()                 => { $crate::raw_print!("\n") };
+    ($($arg:tt)*)      => { $crate::raw_print!("{}\n", format_args!($($arg)*)) };
 }

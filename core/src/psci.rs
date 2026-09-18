@@ -47,6 +47,46 @@ pub fn init(fdt: &Fdt) {
     );
 }
 
+/// Start a secondary CPU at a physical address, with a context value.
+///
+/// PSCI 0.2+ `CPU_ON`, the 64-bit function id. The target is an MPIDR value,
+/// the entry a *physical* address -- the CPU starts with the MMU off, so a
+/// link address only works because nk's image is loaded at the address it was
+/// linked for -- and the context is handed over in x0.
+///
+/// The return is the PSCI status: 0 is success, -2 (PSCI_ALREADY_ON) means
+/// the CPU was already running, and anything else is a refusal that says the
+/// target id was not one the firmware knows. Returning it rather than
+/// panicking is deliberate: "this CPU is already on" is a normal answer
+/// during bring-up, and the caller decides what it means.
+///
+/// # Safety
+/// `entry` must be executable with the MMU off. PSCI must have been found.
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn cpu_on(target: u64, entry: u64, context: u64) -> i64 {
+    let ret: u64;
+    match METHOD {
+        Method::Hvc => core::arch::asm!(
+            "hvc #0",
+            inout("x0") 0xC400_0003u64 => ret,
+            in("x1") target,
+            in("x2") entry,
+            in("x3") context,
+            options(nostack),
+        ),
+        Method::Smc => core::arch::asm!(
+            "smc #0",
+            inout("x0") 0xC400_0003u64 => ret,
+            in("x1") target,
+            in("x2") entry,
+            in("x3") context,
+            options(nostack),
+        ),
+        Method::None => return -1,
+    }
+    ret as i64
+}
+
 /// Turn the machine off. Returns only if the firmware refuses.
 pub fn poweroff() {
     #[cfg(target_arch = "aarch64")]

@@ -144,7 +144,7 @@ extern "C" fn pump(_: usize) {
             //   could sleep with a device line already pending -- the
             //   original window -- and the interrupt waited for the next one.
             IDLE.store(true, Ordering::SeqCst);
-            sched::block_on_cond(flags, 0, || {
+            sched::block_on_cond(flags, 0, || {}, || {
                 PENDING[0].load(Ordering::SeqCst) != 0 || PENDING[1].load(Ordering::SeqCst) != 0
             });
             IDLE.store(false, Ordering::SeqCst);

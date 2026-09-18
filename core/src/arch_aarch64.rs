@@ -68,6 +68,24 @@ pub fn halt() {
     unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };
 }
 
+/// Point VBAR_EL1 at nk's vector table.
+///
+/// The boot CPU does this in `boot.s` before it calls Rust; a secondary
+/// starts with VBAR_EL1 at its reset value, so until this runs any exception
+/// on that CPU vectors to an address that does not exist -- and the result is
+/// not a fault report, it is silence. Called before interrupts are unmasked.
+///
+/// # Safety
+/// `__vectors` must be the vector table, and the caller must not be relying
+/// on the old one.
+pub unsafe fn set_vectors() {
+    unsafe extern "C" {
+        static __vectors: u8;
+    }
+    let v = &raw const __vectors as u64;
+    core::arch::asm!("msr vbar_el1, {}", "isb", in(reg) v, options(nostack));
+}
+
 /// Which CPU this is, from the affinity the firmware assigned.
 ///
 /// MPIDR_EL1 Aff0 is the core number on `virt` and on every Apple Silicon

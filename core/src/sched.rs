@@ -46,10 +46,15 @@ pub enum State {
     Finished,
 }
 
-#[derive(Clone, Copy)]
+
 pub struct Task {
-    pub sp: usize,
+    /// Saved stack pointer, published by the outgoing CPU and consumed only
+    /// after observing `on_cpu == false` with Acquire.
+    pub sp: core::sync::atomic::AtomicUsize,
     pub stack: usize,
+    /// Length of the range `stack` names. Not always `STACK_PAGES * PAGE`:
+    /// the per-CPU idle tasks run on the 16 KiB secondary stacks.
+    pub stack_size: usize,
     /// What SP_EL0 points at while this task runs.
     ///
     /// On arm64 Linux, SP_EL0 in kernel mode holds the current task_struct --
@@ -74,9 +79,9 @@ pub struct Task {
     /// still live on the CPU doing the switch, so between that mark and the
     /// completion of `cpu_switch` a `Ready` task is not yet pickable. This
     /// flag closes that window: set when a task is picked, cleared by the
-    /// incoming task in `finish_switch` once the switch has landed. Without
+    /// incoming task in the assembly switch, once the switch has landed. Without
     /// it two CPUs pick one `Ready` task and share its stack.
-    pub on_cpu: bool,
+    pub on_cpu: core::sync::atomic::AtomicBool,
     pub name: &'static str,
     pub home_cpu: u8,
     pub affinity: u8,
@@ -235,13 +240,36 @@ pub struct Task {
     pub sig_return_alt: bool,
 }
 
-static mut TASKS: [Task; MAX_TASKS] = [Task {
-    sp: 0,
+impl Task {
+    /// The saved SP, read after the Acquire that observed `on_cpu == false`.
+    #[inline]
+    pub fn saved_sp(&self) -> usize {
+        self.sp.load(Ordering::Acquire)
+    }
+
+    /// Whether this task is on a CPU. The load that observes `false` is the
+    /// one that makes the saved context visible.
+    #[inline]
+    pub fn is_on_cpu(&self) -> bool {
+        self.on_cpu.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub fn set_on_cpu(&self, v: bool) {
+        self.on_cpu.store(v, Ordering::Relaxed);
+    }
+
+}
+
+static mut TASKS: [Task; MAX_TASKS] = [const {
+    Task {
+        sp: core::sync::atomic::AtomicUsize::new(0),
     stack: 0,
+    stack_size: 0,
     shadow: 0,
-    state: State::Unused,
-    on_cpu: false,
-    name: "",
+        state: State::Unused,
+        on_cpu: core::sync::atomic::AtomicBool::new(false),
+        name: "",
     home_cpu: 0,
     affinity: 0xff,
     migrations: 0,
@@ -294,41 +322,33 @@ static mut TASKS: [Task; MAX_TASKS] = [Task {
     sig_alt_in_use: false,
     sig_return_mask: 0,
     sig_return_alt: false,
-}; MAX_TASKS];
+} }; MAX_TASKS];
 
 static mut CURRENT: usize = 0;
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
 pub const MAX_CPUS: usize = 8;
 
-#[derive(Clone, Copy)]
 struct CpuState {
-    current: usize,
-    need_resched: bool,
-    online: bool,
+    current: core::sync::atomic::AtomicUsize,
+    need_resched: core::sync::atomic::AtomicBool,
+    online: core::sync::atomic::AtomicBool,
     idle_task: usize,
-    idle: bool,
-    ipi_pending: bool,
-    switches: u64,
-    stolen: u64,
-    /// The task this CPU most recently switched away from. `finish_switch`
-    /// runs on this CPU when the next task begins (see `task_start` and the
-    /// tail of `schedule_on`) and uses this to publish that task: it is only
-    /// safe to pick once `cpu_switch` has stored its registers, and that is
-    /// exactly when someone starts running in its place.
-    prev: usize,
+    idle: core::sync::atomic::AtomicBool,
+    ipi_pending: core::sync::atomic::AtomicBool,
+    switches: core::sync::atomic::AtomicU64,
+    stolen: core::sync::atomic::AtomicU64,
 }
 
 const CPU_INIT: CpuState = CpuState {
-    current: usize::MAX,
-    need_resched: false,
-    online: false,
+    current: core::sync::atomic::AtomicUsize::new(usize::MAX),
+    need_resched: core::sync::atomic::AtomicBool::new(false),
+    online: core::sync::atomic::AtomicBool::new(false),
     idle_task: usize::MAX,
-    idle: false,
-    ipi_pending: false,
-    switches: 0,
-    stolen: 0,
-    prev: usize::MAX,
+    idle: core::sync::atomic::AtomicBool::new(false),
+    ipi_pending: core::sync::atomic::AtomicBool::new(false),
+    switches: core::sync::atomic::AtomicU64::new(0),
+    stolen: core::sync::atomic::AtomicU64::new(0),
 };
 
 static mut CPUS: [CpuState; MAX_CPUS] = [CPU_INIT; MAX_CPUS];
@@ -355,13 +375,13 @@ pub fn current_cpu_state(cpu: usize) -> (usize, bool, bool) {
     let cpu = cpu_index(cpu);
     unsafe {
         let st = &(*(&raw const CPUS))[cpu];
-        (st.current, st.need_resched, st.online)
+        (st.current.load(Ordering::Acquire), st.need_resched.load(Ordering::Acquire), st.online.load(Ordering::Acquire))
     }
 }
 
 fn cpu_current_unchecked() -> usize {
     let cpu = cpu_index(crate::arch::cpu_id());
-    unsafe { (*(&raw const CPUS))[cpu].current }
+    unsafe { (*(&raw const CPUS))[cpu].current.load(Ordering::Acquire) }
 }
 
 /// The calling CPU's current task.
@@ -378,7 +398,7 @@ fn cur() -> usize {
 fn set_cpu_current(cpu: usize, task: usize) {
     let cpu = cpu_index(cpu);
     unsafe {
-        (*(&raw mut CPUS))[cpu].current = task;
+        (*(&raw mut CPUS))[cpu].current.store(task, Ordering::Release);
     }
     if cpu == 0 {
         unsafe {
@@ -389,15 +409,15 @@ fn set_cpu_current(cpu: usize, task: usize) {
 
 fn cpu_online(cpu: usize) -> bool {
     let cpu = cpu_index(cpu);
-    unsafe { (*(&raw const CPUS))[cpu].online }
+    unsafe { (*(&raw const CPUS))[cpu].online.load(Ordering::Acquire) }
 }
 
 fn mark_cpu_online(cpu: usize, current: usize) {
     let cpu = cpu_index(cpu);
     unsafe {
         let st = &mut (*(&raw mut CPUS))[cpu];
-        st.online = true;
-        st.current = current;
+        st.online.store(true, Ordering::Release);
+        st.current.store(current, Ordering::Release);
     }
     let live = NCPUS.load(Ordering::Relaxed);
     let want = (cpu + 1).min(MAX_CPUS);
@@ -414,14 +434,14 @@ fn mark_cpu_online(cpu: usize, current: usize) {
 #[inline]
 fn need_resched_on(cpu: usize) -> bool {
     let cpu = cpu_index(cpu);
-    unsafe { (*(&raw const CPUS))[cpu].need_resched }
+    unsafe { (*(&raw const CPUS))[cpu].need_resched.load(Ordering::Acquire) }
 }
 
 #[inline]
 fn set_need_resched_on(cpu: usize) {
     let cpu = cpu_index(cpu);
     unsafe {
-        (*(&raw mut CPUS))[cpu].need_resched = true;
+        (*(&raw mut CPUS))[cpu].need_resched.store(true, Ordering::Release);
     }
     if cpu == 0 {
         NEED_RESCHED.store(true, Ordering::Relaxed);
@@ -429,11 +449,12 @@ fn set_need_resched_on(cpu: usize) {
 }
 
 #[inline]
+#[inline]
 fn take_need_resched_on(cpu: usize) -> bool {
     let cpu = cpu_index(cpu);
     let was = unsafe {
         let st = &mut (*(&raw mut CPUS))[cpu];
-        core::mem::replace(&mut st.need_resched, false)
+        st.need_resched.swap(false, Ordering::AcqRel)
     };
     if cpu == 0 && was {
         NEED_RESCHED.store(false, Ordering::Relaxed);
@@ -445,19 +466,19 @@ pub fn cpu_stats(cpu: usize) -> (u64, u64) {
     let cpu = cpu_index(cpu);
     unsafe {
         let st = &(*(&raw const CPUS))[cpu];
-        (st.switches, st.stolen)
+        (st.switches.load(Ordering::Relaxed), st.stolen.load(Ordering::Relaxed))
     }
 }
 
 pub fn cpu_idle(cpu: usize) -> bool {
     let cpu = cpu_index(cpu);
-    unsafe { (*(&raw const CPUS))[cpu].idle }
+    unsafe { (*(&raw const CPUS))[cpu].idle.load(Ordering::Acquire) }
 }
 
 fn set_cpu_idle(cpu: usize, idle: bool) {
     let cpu = cpu_index(cpu);
     unsafe {
-        (*(&raw mut CPUS))[cpu].idle = idle;
+        (*(&raw mut CPUS))[cpu].idle.store(idle, Ordering::Release);
     }
 }
 
@@ -465,8 +486,18 @@ pub fn take_cpu_ipi(cpu: usize) -> bool {
     let cpu = cpu_index(cpu);
     unsafe {
         let st = &mut (*(&raw mut CPUS))[cpu];
-        core::mem::replace(&mut st.ipi_pending, false)
+        st.ipi_pending.swap(false, Ordering::AcqRel)
     }
+}
+
+/// Ask another CPU to reschedule: publish the request, then kick it. Remote
+/// work never performs another CPU's context switch locally.
+pub fn request_reschedule(cpu: usize) {
+    if cpu_index(cpu) == cpu_index(crate::arch::cpu_id()) {
+        set_need_resched_on(cpu);
+        return;
+    }
+    send_reschedule_ipi(cpu);
 }
 
 pub fn send_reschedule_ipi(cpu: usize) {
@@ -478,12 +509,12 @@ pub fn send_reschedule_ipi(cpu: usize) {
     }
     unsafe {
         let st = &mut (*(&raw mut CPUS))[cpu];
-        if !st.online {
+        if !st.online.load(Ordering::Acquire) {
             return;
         }
-        st.ipi_pending = true;
-        st.need_resched = true;
-        st.idle = false;
+        st.ipi_pending.store(true, Ordering::Release);
+        st.need_resched.store(true, Ordering::Release);
+        st.idle.store(false, Ordering::Relaxed);
     }
     crate::arch::send_ipi(cpu);
 }
@@ -513,7 +544,11 @@ pub fn set_affinity(id: usize, mask: u8) {
     if id >= MAX_TASKS || mask == 0 {
         return;
     }
-    let flags = crate::sync::irq_save();
+    // Under the runqueue lock, like every other mutation of task state.
+    // `balance_on_idle_locked` reads `affinity` and writes `home_cpu` under
+    // this lock; an unguarded `set_affinity` can be overwritten by a steal
+    // that had already decided to take the task.
+    let flags = RUNQUEUE.lock();
     unsafe {
         TASKS[id].affinity = mask;
         if mask & (1u8 << TASKS[id].home_cpu.min(7)) == 0 {
@@ -529,7 +564,7 @@ pub fn set_affinity(id: usize, mask: u8) {
                 TASKS[id].migrations += 1;
             }
         }
-        crate::sync::irq_restore(flags);
+        RUNQUEUE.unlock(flags);
     }
 }
 
@@ -537,14 +572,20 @@ pub fn task_home_cpu(id: usize) -> usize {
     if id >= MAX_TASKS {
         return 0;
     }
-    unsafe { TASKS[id].home_cpu as usize }
+    let g = RUNQUEUE.lock();
+    let h = unsafe { TASKS[id].home_cpu as usize };
+    unsafe { RUNQUEUE.unlock(g) };
+    h
 }
 
 pub fn task_migrations(id: usize) -> u32 {
     if id >= MAX_TASKS {
         return 0;
     }
-    unsafe { TASKS[id].migrations }
+    let g = RUNQUEUE.lock();
+    let m = unsafe { TASKS[id].migrations };
+    unsafe { RUNQUEUE.unlock(g) };
+    m
 }
 
 pub fn wake_on_cpu(id: usize, what: u32, cpu: usize) -> bool {
@@ -555,13 +596,25 @@ pub fn wake_on_cpu(id: usize, what: u32, cpu: usize) -> bool {
     let me = cpu_index(crate::arch::cpu_id());
     let woke = wake_on(id, what);
     if woke && cpu != me {
-        send_reschedule_ipi(cpu);
+        request_reschedule(cpu);
     }
     woke
 }
 
 extern "C" {
-    fn cpu_switch(prev_sp: *mut usize, next_sp: usize);
+    /// The five arguments, in order:
+    ///   x0 = &outgoing TASKS[cur].on_cpu  (cleared with a release store)
+    ///   x1 = &outgoing TASKS[cur].sp      (the saved context)
+    ///   x2 = incoming saved SP            (TASKS[next].sp)
+    ///   x3 = &CPUS[cpu].current           (published as `next`)
+    ///   x4 = incoming task id
+    fn cpu_switch(
+        prev_on_cpu: *mut u8,
+        prev_sp: *mut usize,
+        next_sp: usize,
+        next_current: *mut usize,
+        next_id: usize,
+    );
     fn task_start();
 }
 
@@ -585,9 +638,9 @@ pub fn init_secondary(cpu: usize) {
     let cpu = cpu_index(cpu);
     unsafe {
         let st = &mut (*(&raw mut CPUS))[cpu];
-        st.online = false;
-        st.current = usize::MAX;
-        st.need_resched = false;
+        st.online.store(false, Ordering::Relaxed);
+        st.current.store(usize::MAX, Ordering::Relaxed);
+        st.need_resched.store(false, Ordering::Relaxed);
         st.idle_task = usize::MAX;
     }
     let live = NCPUS.load(Ordering::Relaxed);
@@ -597,8 +650,54 @@ pub fn init_secondary(cpu: usize) {
     }
 }
 
+/// The idle task registered for each CPU: the only thing that makes "this
+/// CPU's idle task" well defined for picker exclusion and fallback.
+static IDLE_SLOT: [core::sync::atomic::AtomicU64; MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; MAX_CPUS];
+
+fn idle_task_of(cpu: usize) -> u64 {
+    IDLE_SLOT[cpu_index(cpu)].load(Ordering::SeqCst)
+}
+
+/// If `slot` is a CPU's registered idle task, which CPU owns it.
+///
+/// The picker excludes every registered idle task, not just the picking
+/// CPU's own: an idle task is a per-CPU fallback and must never be selected
+/// as ordinary runnable work. Affinity is a defensive invariant here, not
+/// the mechanism that keeps them apart.
+pub fn idle_owner_of_slot(slot: usize) -> Option<usize> {
+    if slot >= MAX_TASKS {
+        return None;
+    }
+    for c in 0..MAX_CPUS {
+        if IDLE_SLOT[c].load(Ordering::SeqCst) == slot as u64 {
+            return Some(c);
+        }
+    }
+    None
+}
+
+pub fn register_idle_task(cpu: usize, slot: usize) {
+    IDLE_SLOT[cpu_index(cpu)].store(slot as u64, Ordering::SeqCst);
+}
+
+/// The AP idle tasks run on the secondary stacks, not on the pool stack
+/// `spawn` allocated for them; the table's stack metadata must name the
+/// range really in use.
+pub fn set_task_stack(id: usize, base: usize, len: usize) {
+    if id < MAX_TASKS {
+        unsafe {
+            (*(&raw mut TASKS))[id].stack = base;
+            (*(&raw mut TASKS))[id].stack_size = len;
+        }
+    }
+}
+
 pub fn online_cpu(cpu: usize, current: usize) {
     if current < MAX_TASKS {
+        // Initialization before publication: this CPU is not yet online and
+        // the idle task is affinity-pinned to it, so no other CPU can pick
+        // it. The state becomes Running+owned before this CPU schedules.
         unsafe {
             // The task was spawned Ready; it becomes Running only by being
             // picked, but this CPU starts *inside* it -- there is no switch
@@ -609,7 +708,7 @@ pub fn online_cpu(cpu: usize, current: usize) {
                 // This CPU runs the task from birth, with no switch to set
                 // the flag, so it is set here or the task would look
                 // pickable while this CPU already owns it.
-                TASKS[current].on_cpu = true;
+                TASKS[current].on_cpu.store(true, Ordering::Relaxed);
                 TASKS[current].ran_at = crate::arch::cycles();
                 TASKS[current].accounted_at = TASKS[current].ran_at;
                 TASKS[current].ready_at = 0;
@@ -707,7 +806,7 @@ fn reclaim_finished() {
             if id == cur() {
                 continue;
             }
-            let t = TASKS[id];
+            let t = &TASKS[id];
             if t.state != State::Finished {
                 continue;
             }
@@ -721,10 +820,10 @@ fn reclaim_finished() {
             // whichever task was unlucky enough to be running there.
             //
             // `on_cpu` is exactly that fact -- set when a CPU starts running a
-            // task, cleared by `finish_switch` once its registers are stored.
+            // task, cleared by the assembly switch once its registers are stored.
             // A finished task that has genuinely switched away has it clear
             // and is safe to reclaim; one still on a stack does not.
-            if t.on_cpu {
+            if t.on_cpu.load(Ordering::Acquire) {
                 continue;
             }
             let orphan = TASKS[t.parent].state == State::Unused || TASKS[t.parent].state == State::Finished;
@@ -845,6 +944,9 @@ fn return_stack(stack: usize) {
 pub fn spawn(name: &'static str, entry: extern "C" fn(usize), arg: usize) -> usize {
     let flags = crate::sync::irq_save();
     reclaim_finished();
+    // Serialize spawns, but do not hold RUNQUEUE across the allocations:
+    // the commit below takes RUNQUEUE itself. Lock order SPAWN -> RUNQUEUE.
+    let sg = SPAWN.lock();
     unsafe {
         let placed = place_vruntime();
         let slot = match (*(&raw const TASKS)).iter().position(|t| t.state == State::Unused) {
@@ -909,11 +1011,12 @@ pub fn spawn(name: &'static str, entry: extern "C" fn(usize), arg: usize) -> usi
 
         let shadow = frames::alloc().expect("no memory for a task shadow") as usize;
         TASKS[slot] = Task {
-            sp,
+            sp: core::sync::atomic::AtomicUsize::new(sp),
             stack: stack as usize,
+            stack_size: STACK_PAGES * PAGE,
             shadow,
             state: State::Unused,
-            on_cpu: false,
+            on_cpu: core::sync::atomic::AtomicBool::new(false),
             name,
             home_cpu: cpu_index(crate::arch::cpu_id()) as u8,
             affinity: 0xff,
@@ -988,6 +1091,7 @@ pub fn spawn(name: &'static str, entry: extern "C" fn(usize), arg: usize) -> usi
         let published = RUNQUEUE.lock();
         TASKS[slot].state = State::Ready;
         unsafe { RUNQUEUE.unlock(published) };
+        SPAWN.unlock(sg);
         crate::sync::irq_restore(flags);
         slot
     }
@@ -1007,7 +1111,14 @@ pub fn spawn(name: &'static str, entry: extern "C" fn(usize), arg: usize) -> usi
 /// something runnable never runs. That is a machine that stops during boot,
 /// which is exactly what it did.
 pub fn schedule() -> bool {
-    schedule_on(cpu_index(crate::arch::cpu_id()))
+    // Mask before deriving the CPU: the value must be read in a window where
+    // this frame cannot be interrupted and resumed on another CPU, or the
+    // local scheduler state of one CPU is manipulated on another.
+    let outer = crate::sync::irq_save();
+    let cpu = cpu_index(crate::arch::cpu_id());
+    let switched = schedule_on(cpu);
+    unsafe { crate::sync::irq_restore(outer) };
+    switched
 }
 
 /// Run the scheduler pinned to one CPU. `schedule()` is this on the calling
@@ -1024,6 +1135,10 @@ pub fn schedule() -> bool {
 /// across cpu_switch, which would serialize all CPUs behind one stack
 /// switch and deadlock the moment two schedule at once.
 static RUNQUEUE: crate::sync::Spinlock = crate::sync::Spinlock::new();
+// Serializes task creation: the slot scan reads every task's state and the
+// commit writes a slot, and two concurrent spawns must not take one slot.
+// Lock order is SPAWN -> RUNQUEUE; no path takes RUNQUEUE then SPAWN.
+static SPAWN: crate::sync::Spinlock = crate::sync::Spinlock::new();
 
 /// Whether LKL (Linux) is running. It is a single-CPU unikernel: its internal
 /// state assumes one host thread executes Linux code at a time, and nk's
@@ -1055,7 +1170,7 @@ pub fn set_lkl_active() {
     // and the boot CPU takes it.
     for cpu in 1..cpu_count() {
         if cpu_online(cpu) {
-            send_reschedule_ipi(cpu);
+            request_reschedule(cpu);
         }
     }
 }
@@ -1081,31 +1196,20 @@ pub fn lkl_active() -> bool {
 ///
 /// # Safety
 /// Runs on the CPU that performed the switch, before anything else.
-unsafe fn finish_switch() {
-    let cpu = cpu_index(crate::arch::cpu_id());
-    let prev = (*(&raw const CPUS))[cpu].prev;
-    if prev >= MAX_TASKS {
-        return;
-    }
-    let flags = RUNQUEUE.lock();
-    // Publish: registers are saved (the switch completed), so the task is
-    // now genuinely off this CPU and may run anywhere.
-    (*(&raw mut TASKS))[prev].on_cpu = false;
-    let _ = flags;
-    (*(&raw mut CPUS))[cpu].prev = usize::MAX;
-    RUNQUEUE.unlock(flags);
-}
 
-/// `finish_switch` for the assembly task entry points, which cannot name a
+/// the assembly task entry points, which cannot name a
 /// Rust function with a generic signature. Resolves the calling CPU the
 /// same way `schedule` does.
 #[no_mangle]
-pub extern "C" fn finish_switch_asm() {
-    unsafe { finish_switch() };
-}
 
 pub fn schedule_on(cpu: usize) -> bool {
     let cpu = cpu_index(cpu);
+    // Local scheduling only: the argument must be the executing CPU.
+    #[cfg(target_arch = "aarch64")]
+    {
+        let actual = cpu_index(crate::arch::cpu_id());
+        assert!(actual == cpu, "schedule_on({}) on cpu{}", cpu, actual);
+    }
     // Mask first, then take the lock. Taking the lock alone would restore
     // interrupts when it is released, and there is a switch still to come:
     // in that window a timer could re-enter `schedule` on a half-built
@@ -1118,14 +1222,25 @@ pub fn schedule_on(cpu: usize) -> bool {
     unsafe {
         // No exclusive reference survives cpu_switch: another task mutates
         // this table while the outgoing one sleeps.
-        let cur = (*(&raw const CPUS))[cpu].current;
+        let cur = (*(&raw const CPUS))[cpu].current.load(Ordering::Acquire);
         let now = crate::arch::cycles();
 
         // Charge the outgoing task for what it just ran, before anything
         // else looks at vruntimes -- the pick below compares against it.
         let ran_ns = account(cur, now);
 
-        let next = pick_on(cur, cpu);
+        let mut next = pick_on(cur, cpu);
+        if next.is_none() {
+            // This CPU's own idle task, and only when it is available.
+            let idle = idle_task_of(cpu) as usize;
+            if idle < MAX_TASKS
+                && idle != cur
+                && TASKS[idle].state == State::Ready
+                && !TASKS[idle].is_on_cpu()
+            {
+                next = Some(idle);
+            }
+        }
         if let Some(next) = next {
             if TASKS[cur].state == State::Running {
                 TASKS[cur].state = State::Ready;
@@ -1149,7 +1264,7 @@ pub fn schedule_on(cpu: usize) -> bool {
             );
 
             TASKS[next].state = State::Running;
-            TASKS[next].on_cpu = true;
+            TASKS[next].on_cpu.store(true, Ordering::Relaxed);
             TASKS[next].slices += 1;
             TASKS[next].ran_at = now;
             TASKS[next].accounted_at = now;
@@ -1158,9 +1273,10 @@ pub fn schedule_on(cpu: usize) -> bool {
             TASKS[next].ready_at = 0;
             TASKS[cur].ttbr0 = crate::arch::current_page_table();
             TASKS[cur].tpidr = crate::arch::current_tls();
-            set_cpu_current(cpu, next);
-            (*(&raw mut CPUS))[cpu].switches += 1;
-            if (*(&raw const CPUS))[cpu].idle {
+            // `current` is published by `cpu_switch` itself, in the same
+            // sequence as the stack handoff.
+            (*(&raw mut CPUS))[cpu].switches.fetch_add(1, Ordering::Relaxed);
+            if (*(&raw const CPUS))[cpu].idle.load(Ordering::Acquire) {
                 set_cpu_idle(cpu, false);
                 crate::schedtrace::record(
                     cpu,
@@ -1187,18 +1303,39 @@ pub fn schedule_on(cpu: usize) -> bool {
             // can find it. `cur` was just marked Ready, but its registers
             // are still live on this CPU -- `cpu_switch` has not run yet --
             // so it must not be picked until this switch completes. The
-            // incoming task clears `cur`'s `on_cpu` in `finish_switch`, and
+            // incoming task clears `cur`'s `on_cpu` in the switch itself, and
             // `pick_on` refuses any task that still has it set. Without that
             // two CPUs end up sharing one stack.
-            (*(&raw mut CPUS))[cpu].prev = cur;
+            // Validate the incoming saved context before committing to it.
+            // A value outside the task's own stack means an earlier switch
+            // saved a foreign SP; aborting here keeps the machine coherent.
+            let incoming = TASKS[next].sp.load(Ordering::Acquire);
+            let stack = TASKS[next].stack;
+            let size = TASKS[next].stack_size;
+            if incoming == 0 || (stack != 0 && size != 0 && !(incoming > stack && incoming <= stack + size)) {
+                crate::println!("  !! incoming SP {:#x} outside task {} '{}' stack {:#x}+{:#x}; aborting switch",
+                    incoming, next, TASKS[next].name, stack, size);
+                TASKS[next].state = State::Ready;
+                TASKS[next].on_cpu.store(false, Ordering::Relaxed);
+                TASKS[cur].state = State::Running;
+                RUNQUEUE.unlock(flags);
+                crate::sync::irq_restore(outer);
+                return false;
+            }
             // Releases the runqueue lock only; interrupts stay masked
             // because `outer` masked them before the lock was taken.
             unsafe { RUNQUEUE.unlock(flags) };
-            cpu_switch(&raw mut TASKS[cur].sp, TASKS[next].sp);
-            // Reached when this task is switched in again. Publish the task
-            // this CPU replaced, so its `Ready` becomes pickable now that
-            // its registers are safely stored.
-            finish_switch();
+            // The switch publishes `current`, switches the stack, and clears
+            // the outgoing task's `on_cpu` with a release store -- after the
+            // saved SP above is visible.
+            cpu_switch(
+                &raw mut TASKS[cur].on_cpu as *mut u8,
+                &raw mut TASKS[cur].sp as *mut usize,
+                incoming,
+                &raw mut (*(&raw mut CPUS))[cpu].current as *mut usize,
+                next,
+            );
+
             crate::sync::irq_restore(outer);
             return true;
         }
@@ -1469,9 +1606,15 @@ unsafe fn pick_on(cur: usize, cpu: usize) -> Option<usize> {
         if tasks[id].state != State::Ready {
             continue;
         }
+        // Idle tasks are a per-CPU fallback and are never selected here,
+        // for any CPU: the fallback in `schedule_on` is the single selection
+        // site, and it only ever chooses this CPU's own idle task.
+        if idle_owner_of_slot(id).is_some() {
+            continue;
+        }
         // Still on another CPU: marked Ready so it is picked again later,
         // but `cpu_switch` has not finished storing it. See `Task::on_cpu`.
-        if tasks[id].on_cpu {
+        if tasks[id].on_cpu.load(Ordering::Acquire) {
             continue;
         }
         if tasks[id].affinity & cpu_bit == 0 {
@@ -1530,9 +1673,12 @@ pub fn balance_on_idle(cpu: usize) -> bool {
     if cpu != 0 && lkl_active() {
         return false;
     }
-    let flags = crate::sync::irq_save();
+    // Under the runqueue lock: the scan reads other tasks' state/affinity
+    // and writes `home_cpu`, the same fields `pick_on` and `set_affinity`
+    // mutate under this lock.
+    let flags = RUNQUEUE.lock();
     let stolen = unsafe { balance_on_idle_locked(cpu, n) };
-    unsafe { crate::sync::irq_restore(flags) };
+    unsafe { RUNQUEUE.unlock(flags) };
     stolen
 }
 
@@ -1546,7 +1692,10 @@ unsafe fn balance_on_idle_locked(cpu: usize, n: usize) -> bool {
             continue;
         }
         let mut count = 0usize;
-        for t in tasks.iter() {
+        for (id, t) in tasks.iter().enumerate() {
+            if idle_owner_of_slot(id).is_some() {
+                continue;
+            }
             if t.state == State::Ready && t.affinity & (1u8 << other.min(7)) != 0 {
                 count += 1;
             }
@@ -1562,6 +1711,9 @@ unsafe fn balance_on_idle_locked(cpu: usize, n: usize) -> bool {
     let mut best: Option<usize> = None;
     let mut best_vruntime = u64::MAX;
     for (id, t) in tasks.iter().enumerate() {
+        if idle_owner_of_slot(id).is_some() {
+            continue;
+        }
         if t.state != State::Ready {
             continue;
         }
@@ -1579,12 +1731,12 @@ unsafe fn balance_on_idle_locked(cpu: usize, n: usize) -> bool {
     if let Some(id) = best {
         tasks[id].home_cpu = cpu as u8;
         tasks[id].migrations += 1;
-        (*(&raw mut CPUS))[cpu].stolen += 1;
+        (*(&raw mut CPUS))[cpu].stolen.fetch_add(1, Ordering::Relaxed);
         crate::schedtrace::record(
             cpu,
             crate::schedtrace::Event::Migrate,
             id,
-            (*(&raw const CPUS))[cpu].current,
+            (*(&raw const CPUS))[cpu].current.load(Ordering::Acquire),
             tasks[id].class.as_u8(),
             best_cpu as u64,
             tasks[id].vruntime,
@@ -1986,13 +2138,16 @@ fn child_of(child: usize, waiter: usize) -> bool {
 
 /// A child of `parent` that has finished, if there is one.
 pub fn finished_child(parent: usize, want_pid: i64) -> Option<usize> {
-    unsafe {
+    let flags = RUNQUEUE.lock();
+    let found = unsafe {
         (0..MAX_TASKS).find(|&i| {
             child_of(i, parent)
                 && TASKS[i].state == State::Finished
                 && (want_pid <= 0 || TASKS[i].linux_pid == want_pid)
         })
-    }
+    };
+    unsafe { RUNQUEUE.unlock(flags) };
+    found
 }
 
 /// Whether `parent` still has a child that might yet finish. `wait4` blocks
@@ -2225,7 +2380,7 @@ pub fn task_with_linux_pid(pid: i64) -> Option<usize> {
 /// `(linux_pid, parent, live)` for `kill(0/-1)` group delivery.
 pub fn task_identity(id: usize) -> (i64, usize, bool) {
     unsafe {
-        let t = TASKS[id];
+        let t = &TASKS[id];
         let live = t.state == State::Running || t.state == State::Ready || t.state == State::Blocked;
         (t.linux_pid, t.parent, live)
     }
@@ -2405,6 +2560,16 @@ pub fn exit_status(id: usize) -> i32 {
 ///
 /// The tick handler wakes sleepers whose deadline has passed, so the
 /// resolution is one tick (HZ) and never shorter than asked for.
+/// Sleep until `ticks` timer ticks have passed.
+///
+/// A wait, not a spin: the caller is off the run queue for the duration and
+/// the CPU stops when nothing else wants it. `while ticks() < until
+/// { yield_now() }` is the same wait written as a busy loop, and on an
+/// emulated machine that is a host core at 100% for as long as it lasts --
+/// the watchdog's one-second pause alone kept this one from ever idling.
+///
+/// The tick handler wakes sleepers whose deadline has passed, so the
+/// resolution is one tick (HZ) and never shorter than asked for.
 pub fn sleep_ticks(ticks: u64) {
     let until = crate::timer::ticks() + ticks;
     loop {
@@ -2413,12 +2578,7 @@ pub fn sleep_ticks(ticks: u64) {
             unsafe { crate::sync::irq_restore(flags) };
             return;
         }
-        // Deadline recorded before blocking and with interrupts masked: a
-        // tick landing in between finds a sleeper to wake rather than
-        // passing it in the gap.
-        unsafe {
-            (*(&raw mut TASKS))[cur()].wake_at = until;
-        }
+
         // Predicate: the millisecond clock has reached `until`.
         // Protected by: the monotonic TICKS counter, read here under the
         //   runqueue lock so the read and the decision to sleep cannot
@@ -2434,13 +2594,22 @@ pub fn sleep_ticks(ticks: u64) {
         //   task that was still Running, refused the wake, and this task
         //   then slept through its own deadline until the *next* tick. The
         //   re-check turns that lost tick into a visible deadline.
-        block_on_cond(flags, SLEEP_WAIT, || crate::timer::ticks() >= until);
+        let blocked = block_on_cond(
+            flags,
+            SLEEP_WAIT,
+            // Deadline recorded before blocking, under the runqueue lock, so
+            // a tick can never find a half-armed sleeper.
+            || unsafe {
+                (*(&raw mut TASKS))[cur()].wake_at = until;
+            },
+            || crate::timer::ticks() >= until,
+        );
         // `block_on` returns without having switched when nothing else is
         // Ready, and this task is then still marked Blocked with its own
         // deadline pending. Halting is exactly right here: the caller
         // asked to be away for a while, the tick is what ends that, and
         // this is the state an idle machine should be sitting in.
-        if unsafe { (*(&raw const TASKS))[cur()].state == State::Blocked } {
+        if blocked {
             halt_until_interrupt();
         }
     }
@@ -2460,10 +2629,18 @@ pub fn wake_sleepers() {
     let flags = RUNQUEUE.lock();
     unsafe {
         for i in 0..MAX_TASKS {
-            if TASKS[i].state == State::Blocked
-                && TASKS[i].waiting_on == SLEEP_WAIT
-                && TASKS[i].wake_at != 0
-                && now >= TASKS[i].wake_at
+            // Snapshot the whole predicate from one iteration: the wake
+            // decision is a pure function of these three fields, and reading
+            // them once keeps the check and the wake on the same values.
+            let (state, what, wake_at) = (
+                TASKS[i].state,
+                TASKS[i].waiting_on,
+                TASKS[i].wake_at,
+            );
+            if state == State::Blocked
+                && what == SLEEP_WAIT
+                && wake_at != 0
+                && now >= wake_at
             {
                 TASKS[i].wake_at = 0;
                 make_ready(i, SLEEP_WAIT);
@@ -2558,12 +2735,21 @@ pub fn block(flags: u64) {
 /// increments its counter *before* taking the lock, so a post that is
 /// already in flight but not yet visible at the first check is still either
 /// seen here or woken after.
-pub fn block_on_cond(flags: u64, what: u32, ready: impl Fn() -> bool) {
+pub fn block_on_cond(
+    flags: u64,
+    what: u32,
+    prep: impl FnOnce(),
+    ready: impl Fn() -> bool,
+) -> bool {
     let g = RUNQUEUE.lock();
+    // The caller's wait state -- the deadline for a sleeper -- is published
+    // under the same lock the waker takes, so no reader can observe a
+    // half-armed waiter.
+    prep();
     if ready() {
         unsafe { RUNQUEUE.unlock(g) };
         unsafe { crate::sync::irq_restore(flags) };
-        return;
+        return false;
     }
     unsafe {
         (*(&raw mut TASKS))[cur()].waiting_on = what;
@@ -2583,6 +2769,7 @@ pub fn block_on_cond(flags: u64, what: u32, ready: impl Fn() -> bool) {
     }
     unsafe { crate::sync::irq_restore(flags) };
     schedule();
+    true
 }
 
 /// Block, recording what is being waited for so a deadlock names itself.
@@ -2737,14 +2924,18 @@ pub fn wake(id: usize) {
 /// # Safety
 /// Caller holds the scheduler's interrupt mask.
 unsafe fn make_ready(id: usize, what: u32) {
+    // Finished is terminal for scheduling: a task whose entry has returned
+    // must never re-enter the run queue.
+    if (*(&raw const TASKS))[id].state == State::Finished {
+        return;
+    }
     let placed = place_vruntime();
     let now = crate::arch::cycles();
     let cpu = cpu_index(crate::arch::cpu_id());
-    let current = (*(&raw const CPUS))[cpu].current;
+    let current = (*(&raw const CPUS))[cpu].current.load(Ordering::Acquire);
     TASKS[id].ready_at = now;
     TASKS[id].wake_pending = true;
     TASKS[id].state = State::Ready;
-
     // A task that has been asleep for a long time would otherwise come back
     // with a vruntime far behind the running set and monopolise the CPU
     // catching up. Only ever moved forward: a task that slept briefly keeps
@@ -2778,7 +2969,8 @@ unsafe fn make_ready(id: usize, what: u32) {
         crate::timer::cycles_to_ns(now.wrapping_sub(TASKS[current].ran_at))
     };
 
-    if crate::schedpolicy::should_preempt(waker, running, running_for) {
+    let should = crate::schedpolicy::should_preempt(waker, running, running_for);
+    if should {
         crate::schedtrace::record(
             0,
             crate::schedtrace::Event::Preempt,
@@ -2851,20 +3043,31 @@ pub fn slice_expired() -> bool {
 /// inside Linux executing anything, so if it still owns LKL's CPU while the
 /// machine makes no syscalls, nobody else ever can either.
 pub fn blocked(id: usize) -> bool {
-    unsafe { id < MAX_TASKS && (*(&raw const TASKS))[id].state == State::Blocked }
+    if id >= MAX_TASKS {
+        return false;
+    }
+    let flags = RUNQUEUE.lock();
+    let b = unsafe { (*(&raw const TASKS))[id].state == State::Blocked };
+    unsafe { RUNQUEUE.unlock(flags) };
+    b
 }
 
 /// Whether the slot holds a task that can never run again -- finished but
 /// not yet reaped, or already reclaimed. A `uid` naming one of these is dead
 /// for ownership purposes even while `from_uid` still resolves it.
 pub fn finished(id: usize) -> bool {
-    unsafe {
-        id < MAX_TASKS
-            && matches!(
+    if id >= MAX_TASKS {
+        return true;
+    }
+    let flags = RUNQUEUE.lock();
+    let done = unsafe {
+        matches!(
                 (*(&raw const TASKS))[id].state,
                 State::Finished | State::Unused
             )
-    }
+    };
+    unsafe { RUNQUEUE.unlock(flags) };
+    done
 }
 
 /// A task's state as a number, for diagnostics: 0 unused, 1 ready,
@@ -2874,25 +3077,32 @@ pub fn task_state_of(uid: usize) -> u8 {
     if id >= MAX_TASKS {
         return 6;
     }
-    unsafe {
+    let g = RUNQUEUE.lock();
+    let r = unsafe {
         if TASKS[id].generation != (uid >> 16) as u64 {
-            return 5;
+            5
+        } else {
+            match TASKS[id].state {
+                State::Unused => 0,
+                State::Ready => 1,
+                State::Running => 2,
+                State::Blocked => 3,
+                State::Finished => 4,
+            }
         }
-        match TASKS[id].state {
-            State::Unused => 0,
-            State::Ready => 1,
-            State::Running => 2,
-            State::Blocked => 3,
-            State::Finished => 4,
-        }
-    }
+    };
+    unsafe { RUNQUEUE.unlock(g) };
+    r
 }
 
 /// The base address of a task's kernel stack, for diagnostics. Two tasks
 /// sharing a base is the allocator handing one stack to both.
 pub fn task_stack_of(id: usize) -> usize {
     if id >= MAX_TASKS { return 0; }
-    unsafe { (*(&raw const TASKS))[id].stack }
+    let g = RUNQUEUE.lock();
+    let v = unsafe { (*(&raw const TASKS))[id].stack };
+    unsafe { RUNQUEUE.unlock(g) };
+    v
 }
 
 /// Raw per-slot scheduler facts for diagnostics: state, what it is blocked
@@ -2903,7 +3113,8 @@ pub fn task_probe(id: usize) -> (u8, u32, bool, u8) {
     if id >= MAX_TASKS {
         return (6, 0, false, 0);
     }
-    unsafe {
+    let g = RUNQUEUE.lock();
+    let r = unsafe {
         let t = &(*(&raw const TASKS))[id];
         let st = match t.state {
             State::Unused => 0,
@@ -2912,8 +3123,10 @@ pub fn task_probe(id: usize) -> (u8, u32, bool, u8) {
             State::Blocked => 3,
             State::Finished => 4,
         };
-        (st, t.waiting_on, t.on_cpu, t.home_cpu)
-    }
+        (st, t.waiting_on, t.on_cpu.load(Ordering::Acquire), t.home_cpu)
+    };
+    unsafe { RUNQUEUE.unlock(g) };
+    r
 }
 
 /// Wait for a task to finish.
@@ -2979,7 +3192,7 @@ pub fn join(id: usize) {
             //   unconditional `block_on` would have set Blocked after the
             //   wake was refused, and the joiner would have slept forever on
             //   a task that had already exited.
-            block_on_cond(flags, JOIN_WAIT, || {
+            block_on_cond(flags, JOIN_WAIT, || {}, || {
                 let t = unsafe { &(*(&raw const TASKS))[id] };
                 t.state == State::Finished || t.state == State::Unused
             });
@@ -3217,7 +3430,7 @@ pub fn reap_process(id: usize) {
     let flags = crate::sync::irq_save();
     unsafe {
         assert_ne!(id, cur());
-        let task = TASKS[id];
+        let task = &TASKS[id];
         assert!(task.state == State::Finished && task.linux_pid > 1);
         // A thread's address space belongs to the threads it shared it with,
         // and they are still running in it.

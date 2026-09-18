@@ -92,6 +92,25 @@ pub unsafe fn init(intid: u32) {
     );
 }
 
+/// Arm and enable this CPU's virtual timer, for a secondary.
+///
+/// `init` cannot be reused: it calls `gic::enable_ppi`, which targets the
+/// *boot* CPU's cached redistributor base, so on an AP it would enable the
+/// timer interrupt on the wrong CPU. The private interrupt is enabled by
+/// `gic::init_secondary` instead, and what is left here is the timer itself,
+/// which is per-CPU state (CNTV_TVAL/CNTV_CTL) and has to be programmed on
+/// the CPU that will take the interrupt.
+///
+/// # Safety
+/// The GIC's redistributor for this CPU must already be awake and have the
+/// timer PPI enabled.
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn start_this_cpu() {
+    rearm();
+    // ENABLE with IMASK clear, exactly as `init` does.
+    core::arch::asm!("msr cntv_ctl_el0, {}", in(reg) 1u64, options(nomem, nostack));
+}
+
 /// Program the PIT to interrupt at `HZ` on IRQ 0.
 ///
 /// # Safety

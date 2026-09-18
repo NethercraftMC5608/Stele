@@ -148,6 +148,29 @@ pub unsafe fn init_secondary(redist_base: usize, redist_stride: usize, timer_ppi
     w32(gicr + GICR_ISENABLER0, (1 << SGI_RESCHED) | (1 << timer_ppi));
 }
 
+/// Where the redistributors are and which private interrupt is the timer,
+/// remembered for the secondaries.
+///
+/// `init_secondary` needs all three and runs on a CPU that has no way to ask
+/// the device tree -- the FDT was parsed once, by the boot CPU, before any
+/// of this existed. So the values are stored here where the AP can read
+/// them, rather than re-derived.
+static mut REDIST: usize = 0;
+static mut REDIST_STRIDE: usize = 0;
+static mut TIMER_INTID: u32 = 0;
+
+/// Record what `init_secondary` will need. Called once, by the boot CPU.
+pub unsafe fn remember_secondary_params(redist: usize, stride: usize, timer_intid: u32) {
+    REDIST = redist;
+    REDIST_STRIDE = stride;
+    TIMER_INTID = timer_intid;
+}
+
+/// The parameters `remember_secondary_params` stored.
+pub fn secondary_params() -> (usize, usize, u32) {
+    unsafe { (REDIST, REDIST_STRIDE, TIMER_INTID) }
+}
+
 /// Enable one private interrupt (an SGI or PPI, INTID < 32) on this CPU.
 ///
 /// Only the private range: shared interrupts live in the distributor's own

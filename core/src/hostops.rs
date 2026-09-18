@@ -497,7 +497,7 @@ extern "C" fn timer_thread(_: usize) {
             //   timer. With the old unconditional `block_on`, that tick was
             //   refused (the thread still read as Running) and then the
             //   thread slept, so the timer fired late by a whole sleep.
-            sched::block_on_cond(flags, 0, || DUE.load(Ordering::SeqCst) != 0);
+            sched::block_on_cond(flags, 0, || {}, || DUE.load(Ordering::SeqCst) != 0);
             continue;
         }
         unsafe { irq_restore(flags) };

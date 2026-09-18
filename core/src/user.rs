@@ -2168,7 +2168,7 @@ fn wait4(pid: i64, status: u64, options: u64) -> i64 {
         //   slept past the exit. Under the runqueue lock the exit is either
         //   visible to this re-check (we never sleep) or it arrives after we
         //   are Blocked and wakes us.
-        crate::sched::block_on_cond(flags, 0, || {
+        crate::sched::block_on_cond(flags, 0, || {}, || {
             crate::sched::finished_child(me, pid).is_some()
                 || crate::signal::interrupt_pending()
         });

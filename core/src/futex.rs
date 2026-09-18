@@ -154,7 +154,7 @@ extern "C" fn timer_thread(_: usize) {
             //   the block would previously be refused (this task still read
             //   as Running) and then slept through; here the re-check sees
             //   the flag and loops to take it instead of sleeping.
-            sched::block_on_cond(flags, 0, || unsafe { *(&raw const TIMER_DUE) });
+            sched::block_on_cond(flags, 0, || {}, || unsafe { *(&raw const TIMER_DUE) });
             continue;
         }
         let snapshot = unsafe { *(&raw const WAITERS) };
@@ -294,7 +294,7 @@ fn wait(uaddr: u64, val: u32, bits: u32, deadline: Option<(bool, i64)>) -> i64 {
     // Why the re-check closes it: a wake between the test above and the
     //   sleep makes the predicate true here, so this task does not sleep;
     //   a wake after it is Blocked is delivered by `sched::wake`.
-    sched::block_on_cond(flags, 0, || unsafe { (*(&raw const WAITERS))[slot].woken });
+    sched::block_on_cond(flags, 0, || {}, || unsafe { (*(&raw const WAITERS))[slot].woken });
 
     let flags = irq_save();
     let result = unsafe {

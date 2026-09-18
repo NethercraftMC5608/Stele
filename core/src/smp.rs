@@ -16,6 +16,27 @@ use crate::println;
 /// Maximum APs to start. Matches MAX_CPUS in sched and the GDT/TSS tables.
 pub const MAX_APS: usize = 7;
 
+/// How many CPUs bring-up actually found online, recorded at the end of
+/// `bring_up`. The torture compares the scheduler's count against this: an
+/// SMP-capable build booted on one CPU (`-smp 1`) is a configuration this
+/// project tests on purpose, so "the build has SMP" is not the same claim as
+/// "this machine has more than one CPU".
+static CPUS_ONLINE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(1);
+
+pub fn cpus_online() -> usize {
+    CPUS_ONLINE.load(core::sync::atomic::Ordering::Relaxed).max(1)
+}
+
+fn record_cpus_online() {
+    let mut n = 0usize;
+    for cpu in 0..crate::sched::MAX_CPUS {
+        if crate::sched::current_cpu_state(cpu).2 {
+            n += 1;
+        }
+    }
+    CPUS_ONLINE.store(n.max(1), core::sync::atomic::Ordering::Relaxed);
+}
+
 /// Where the AP trampoline is copied: a page below 1MB that firmware and
 /// QEMU both leave alone. 0x8000 is the conventional spot -- above the IVT
 /// and BDA, below the option ROMs.
@@ -57,6 +78,25 @@ pub fn bring_up() {
         return;
     }
     println!("  smp:    bring-up starting");
+    // From here on, more than one CPU can print. Enabled before any
+    // secondary exists, so its own announcements are serialised too.
+    crate::sync::enable_console_lock();
+
+    // An idle task for the boot CPU, exactly as each AP gets one.
+    //
+    // Without it the boot CPU has no fallback task. When the boot task has
+    // migrated elsewhere and some other task on cpu 0 finishes -- a storm
+    // worker, an exiting process -- `task_exit` yields with nothing
+    // pickable, and that Finished task then sits as cpu 0's "current" for
+    // ever: one wake per tick, never switched away, and so never reclaimed
+    // (`reclaim_finished` refuses a task that still has `on_cpu` set). The
+    // APs never had this problem because they each spawn an idle task below.
+    if crate::sched::cpu_id() == 0 {
+        let idle = crate::sched::spawn("idle", idle_entry, 0);
+        crate::sched::set_class(idle, crate::schedpolicy::Class::Background);
+        crate::sched::set_affinity(idle, 0x01);
+        crate::sched::register_idle_task(0, idle);
+    }
     if option_env!("NK_SMP_PROBE").is_some() {
         println!("  smp:    probe only, not starting APs");
         return;
@@ -69,6 +109,7 @@ pub fn bring_up() {
     unsafe {
         bring_up_arm();
     }
+    record_cpus_online();
 }
 
 /// Which AP bring-up layer is live. Raised one step at a time, in order:
@@ -130,7 +171,12 @@ pub unsafe extern "C" fn rust_ap_main(cpu: u64) -> ! {
         let idle = crate::sched::spawn("idle", ap_idle, cpu);
         crate::sched::set_class(idle, crate::schedpolicy::Class::Background);
         crate::sched::set_affinity(idle, 1u8 << cpu.min(7));
+        // The AP's idle loop runs on the stack the trampoline set up, not on
+        // the pool allocation `spawn` gave the placeholder task, so record
+        // the stack that is really in use. See `sched::set_task_stack`.
+        crate::sched::set_task_stack(idle, (ap_stack_top(cpu) - 16384) as usize, 16384);
         crate::sched::online_cpu(cpu, idle);
+        crate::sched::register_idle_task(cpu, idle);
         println!("  smp:    cpu{} online (apic {})", cpu, crate::lapic::id());
         // This CPU's own tick, started only once a valid task is current:
         // the timer handler schedules, and scheduling on usize::MAX is the
@@ -151,15 +197,15 @@ pub unsafe extern "C" fn rust_ap_main(cpu: u64) -> ! {
     }
     loop {
         if crate::sched::take_need_resched_cpu(cpu) {
-            crate::sched::schedule_on(cpu);
-        } else if crate::sched::schedule_on(cpu) {
+            crate::sched::schedule();
+        } else if crate::sched::schedule() {
             // Stole or picked local work above; loop back and run it.
         } else {
             // Nothing runnable anywhere this CPU may take from. Try one
             // steal from the busiest CPU before halting, so an idle AP
             // pulls work instead of waiting to be handed it.
             if crate::sched::balance_on_idle(cpu) {
-                crate::sched::schedule_on(cpu);
+                crate::sched::schedule();
             } else {
                 crate::arch::halt();
             }
@@ -171,11 +217,15 @@ pub unsafe extern "C" fn rust_ap_main(cpu: u64) -> ! {
 /// halts in a loop, and any wakeup preempts it through the normal path.
 /// A real task rather than a null current, so accounting, pick, and the
 /// tick handler never touch an invalid slot.
-#[cfg(target_arch = "x86_64")]
-extern "C" fn ap_idle(_arg: usize) {
+extern "C" fn idle_entry(_arg: usize) {
     loop {
         crate::arch::halt();
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+extern "C" fn ap_idle(_arg: usize) {
+    idle_entry(_arg)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -397,7 +447,322 @@ fn wait_ready(cpu: usize, spins: u64) -> bool {
 }
 
 #[cfg(target_arch = "aarch64")]
+/// The boot CPU's mailbox to the parked secondaries.
+///
+/// aarch64 does not need a trampoline copy the way x86 does: QEMU's `virt`
+/// starts *every* CPU in `-smp` at `_start`, and `boot.s` parks the ones that
+/// are not affinity 0 before it has done anything at all. So the release is a
+/// value in memory plus an event, not an INIT/STARTUP dance -- and it cannot
+/// use `static mut` fields in Rust order, because `park` reads it from
+/// assembly with the MMU still off.
+///
+/// One 64-byte aligned block so a single `dc cvac` publishes all of it: the
+/// boot CPU runs with caches on and the parked CPUs with the MMU (and so the
+/// caches) off, which makes this a coherence problem, not a store.
+#[cfg(target_arch = "aarch64")]
+#[repr(C, align(64))]
+pub struct ApMailbox {
+    /// Set to `AP_RELEASE_MAGIC` by the boot CPU to release the others.
+    /// Unused by the PSCI path -- nothing is parked -- and kept for the
+    /// configuration where secondaries do arrive at `_start`.
+    pub go: u32,
+    pub _pad: u32,
+    /// `reached[cpu] == cpu + 1` once that CPU has entered its first
+    /// instruction. Zero means it never arrived.
+    pub reached: [u32; MAX_APS],
+    pub _pad2: u32,
+    /// The kernel stack top for each CPU, written by the boot CPU before it
+    /// asks PSCI to start that CPU. The secondary reads it with the MMU off,
+    /// so it is plain memory and the boot CPU cleans the line.
+    pub stack_top: [u64; MAX_APS],
+}
+
+#[cfg(target_arch = "aarch64")]
+const AP_RELEASE_MAGIC: u32 = 0x4e4b_4150;
+
+#[cfg(target_arch = "aarch64")]
+#[no_mangle]
+pub static mut AP_MAILBOX: ApMailbox = ApMailbox {
+    go: 0,
+    _pad: 0,
+    reached: [0; MAX_APS],
+    _pad2: 0,
+    stack_top: [0; MAX_APS],
+};
+
+/// One 16 KiB stack per secondary, in .bss and therefore identity-mapped
+/// before the MMU is on -- which it has to be, since the CPU loads SP from
+/// one of these before it can turn the MMU on at all.
+#[cfg(target_arch = "aarch64")]
+#[repr(align(16))]
+#[derive(Clone, Copy)]
+struct ApStackArm([u8; 16384]);
+
+#[cfg(target_arch = "aarch64")]
+static mut AP_STACKS_ARM: [ApStackArm; MAX_APS] = [ApStackArm([0; 16384]); MAX_APS];
+
+#[cfg(target_arch = "aarch64")]
+fn ap_stack_top_arm(cpu: usize) -> u64 {
+    unsafe { (&raw const AP_STACKS_ARM[cpu.min(MAX_APS - 1)].0 as u64) + 16384 }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn dc_cvac(addr: u64) {
+    core::arch::asm!("dc cvac, {}", in(reg) addr, options(nostack, preserves_flags));
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn dc_ivac(addr: u64) {
+    core::arch::asm!("dc ivac, {}", in(reg) addr, options(nostack, preserves_flags));
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn dsb_sy() {
+    core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn sev() {
+    core::arch::asm!("sev", options(nostack, preserves_flags));
+}
+
+/// Milestone 1: release the parked CPUs and see which ones answer.
+///
+/// The question this stage answers is empirical -- how many CPUs the machine
+/// actually started, and whether `wfe`/`sev` reaches them at all -- so it
+/// deliberately stops before stacks, MMU or Rust. A CPU that arrives sets a
+/// word in the mailbox and waits; the boot CPU cleans, releases, and reports.
+#[cfg(target_arch = "aarch64")]
 unsafe fn bring_up_arm() {
-    // PSCI CPU_ON path: implemented in the ARM stage.
-    println!("  smp:    ARM bring-up not yet implemented");
+    unsafe extern "C" {
+        fn secondary_entry();
+    }
+    let entry = secondary_entry as *const () as u64;
+
+    println!("  smp:    ARM bring-up: PSCI CPU_ON, entry {:#x}", entry);
+
+    let mb = &raw mut AP_MAILBOX;
+    (*mb).reached = [0; MAX_APS];
+    // Not the parked-CPU magic: under HVF nothing is sitting in `park`
+    // waiting for it, and leaving it unset keeps that path inert so a CPU
+    // that *does* arrive at `_start` cannot confuse this stage's count.
+    (*mb).go = 0;
+    // Each secondary's stack, before that CPU exists: it loads SP from here
+    // before it can do anything else, so this cannot be handed over later.
+    for cpu in 0..MAX_APS {
+        (*mb).stack_top[cpu] = ap_stack_top_arm(cpu);
+    }
+    // Publish both cache lines: the secondaries read them with the MMU off.
+    dc_cvac(mb as u64);
+    dc_cvac((mb as u64) + 64);
+    dsb_sy();
+
+    // Targets are MPIDR values. On `virt` the secondary affinities are
+    // 1..n-1 in order, which is what this stage walks; the device tree is the
+    // authority and replaces this once the path works.
+    let mut started = 0usize;
+    for target in 1..MAX_APS as u64 {
+        // Every fact the BSP supplies: the target MPIDR affinity, the logical
+        // slot it intends that target to become, the entry address, and the
+        // context_id PSCI carries to the secondary. The secondary records
+        // what it actually saw; the two are compared in the identity report.
+        println!("  smp:    CPU_ON target aff0 {} entry {:#x} context_id {} stack_top {:#x}",
+            target, entry, target, (*mb).stack_top[target as usize]);
+        let rc = crate::psci::cpu_on(target, entry, target);
+        if rc == 0 {
+            started += 1;
+        } else if rc != -2 {
+            println!("  smp:    cpu{} refused: PSCI {}", target, rc);
+        }
+    }
+    println!("  smp:    {} CPUs accepted CPU_ON", started);
+
+    // Wait for the arrivals, bounded by the counter rather than a tick.
+    let start = crate::arch::cycles();
+    let mut answered = 0usize;
+    loop {
+        dc_ivac(mb as u64);
+        dsb_sy();
+        answered = (0..MAX_APS).filter(|&i| (*mb).reached[i] != 0).count();
+        if answered >= MAX_APS {
+            break;
+        }
+        let waited = crate::arch::cycles().wrapping_sub(start);
+        if crate::timer::cycles_to_ns(waited) >= 300_000_000 {
+            break;
+        }
+    }
+    println!("  smp:    {} secondary entries answered", answered);
+
+    // Now wait for them to reach the scheduler, which is the thing that
+    // actually has to happen: a CPU that entered the trampoline and then
+    // faulted would have answered the mailbox and never arrived here. The
+    // state is in the scheduler, so there is no second mailbox flag to keep
+    // in step with it.
+    let start = crate::arch::cycles();
+    let mut online = 0usize;
+    loop {
+        online = (0..MAX_APS)
+            .filter(|&c| crate::sched::current_cpu_state(c).2)
+            .count();
+        if online >= answered + 1 {
+            break;
+        }
+        let waited = crate::arch::cycles().wrapping_sub(start);
+        if crate::timer::cycles_to_ns(waited) >= 500_000_000 {
+            break;
+        }
+    }
+    println!("  smp:    {} CPUs online", online);
+    for cpu in 0..MAX_APS {
+        if crate::sched::current_cpu_state(cpu).2 {
+            println!("  smp:    cpu{} online", cpu);
+        }
+    }
+    counter_sample_report(online);
+}
+
+/// Where a secondary lands after its stack is set: Rust, with translation
+/// about to come on.
+///
+/// The half of `paging::init` that matters here is the per-CPU half -- the
+/// identity map is already built and global -- so this calls only
+/// `enable_translation`, then proves the CPU is really running nk's kernel
+/// by printing through the same console as the boot CPU.
+#[cfg(target_arch = "aarch64")]
+#[no_mangle]
+pub unsafe extern "C" fn rust_ap_main_arm(cpu: u64) -> ! {
+    let cpu = (cpu as usize).min(MAX_APS);
+    crate::paging::enable_translation();
+    println!("  smp:    secondary {} entering scheduler bring-up", cpu);
+
+    crate::arch::set_vectors();
+
+    // This CPU's redistributor, its CPU interface, and the two private
+    // interrupts it needs: the timer that gives it a tick, and the SGI that
+    // lets another CPU wake it.
+    let (redist, stride, timer_intid) = crate::gic::secondary_params();
+    crate::gic::init_secondary(redist, stride, timer_intid);
+
+    // A scheduler slot, and a task to run when nothing else wants this CPU.
+    // Same shape as the x86 AP path: `online_cpu` marks the task Running
+    // because this CPU starts *inside* it, with no switch to record it.
+    crate::sched::init_secondary(cpu);
+    let idle = crate::sched::spawn("idle", idle_entry, cpu);
+    crate::sched::set_class(idle, crate::schedpolicy::Class::Background);
+    crate::sched::set_affinity(idle, 1u8 << cpu.min(7));
+    // The AP's idle loop runs on the stack `secondary_entry` set up, not on
+    // the pool allocation `spawn` gave the placeholder task, so record the
+    // stack that is really in use. See `sched::set_task_stack`.
+    crate::sched::set_task_stack(idle, (ap_stack_top_arm(cpu) - 16384) as usize, 16384);
+    crate::sched::online_cpu(cpu, idle);
+    crate::sched::register_idle_task(cpu, idle);
+
+    // Its own tick, started only now that a valid task is current: the
+    // handler schedules, and scheduling on usize::MAX is the panic this
+    // ordering exists to avoid.
+    crate::timer::start_this_cpu();
+
+    // Interrupts on. Everything before this point is per-CPU state that
+    // must exist before the first interrupt can be taken.
+    core::arch::asm!("msr daifclr, #0xf", options(nomem, nostack));
+    println!("  smp:    cpu{} online", cpu);
+    counter_sample_secondary(cpu);
+
+    // The same idle loop the x86 APs run: take a local reschedule if one is
+    // pending, pick work if there is any, try one steal, otherwise stop.
+    loop {
+        {
+            // The loop carries the cpu it was built for. If this body is ever
+            // resumed on a different CPU, every per-CPU call below names the
+            // wrong CPU while the switch still happens here -- which is
+            // exactly what "crossed current values" looks like from outside.
+            //
+        }
+        if crate::sched::take_need_resched_cpu(cpu) {
+            crate::sched::schedule();
+            // This frame is resumed *inside* `schedule_on`, past the check at
+            // the top of the loop. If another CPU resumed it, this is the
+            // first instruction where that shows.
+        } else {
+            if crate::sched::schedule() {
+                // Picked work above; loop back and run it.
+            } else if crate::sched::balance_on_idle(cpu) {
+                crate::sched::schedule();
+            } else {
+                crate::arch::halt();
+            }
+        }
+    }
+}
+
+/// One-shot, near-simultaneous counter sample from every CPU.
+///
+/// QEMU/HVF and the ARM architecture both *intend* CNTVCT to be a
+/// system-wide timebase, so "the counter is per-CPU" is a claim that needs
+/// measuring rather than asserting: the `wait_until` timeout was rewritten
+/// because `cycles() - start` went backwards across a migration, and that
+/// has to be explained by the actual numbers.
+static CNT_GO: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static CNT_READY: [core::sync::atomic::AtomicBool; MAX_APS] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; MAX_APS];
+static mut CNT_VIRT: [u64; MAX_APS] = [0; MAX_APS];
+static mut CNT_PHYS: [u64; MAX_APS] = [0; MAX_APS];
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn read_cntvct() -> u64 {
+    let v: u64;
+    core::arch::asm!("mrs {}, cntvct_el0", out(reg) v, options(nomem, nostack));
+    v
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn read_cntpct() -> u64 {
+    let v: u64;
+    core::arch::asm!("mrs {}, cntpct_el0", out(reg) v, options(nomem, nostack));
+    v
+}
+
+/// Called by each secondary after it is online: wait for the boot CPU's go,
+/// then sample both counters as close together as possible.
+#[cfg(target_arch = "aarch64")]
+pub(crate) unsafe fn counter_sample_secondary(cpu: usize) {
+    let deadline = read_cntvct().wrapping_add(24_000_000); // ~1 s at 24 MHz
+    while !CNT_GO.load(core::sync::atomic::Ordering::Acquire) {
+        if read_cntvct() > deadline {
+            return;
+        }
+    }
+    let v = read_cntvct();
+    let p = read_cntpct();
+    CNT_VIRT[cpu.min(MAX_APS - 1)] = v;
+    CNT_PHYS[cpu.min(MAX_APS - 1)] = p;
+    CNT_READY[cpu.min(MAX_APS - 1)].store(true, core::sync::atomic::Ordering::Release);
+}
+
+/// Boot CPU: trigger the sample, take its own, wait for the rest, report.
+#[cfg(target_arch = "aarch64")]
+pub(crate) unsafe fn counter_sample_report(online: usize) {
+    CNT_GO.store(true, core::sync::atomic::Ordering::Release);
+    CNT_VIRT[0] = read_cntvct();
+    CNT_PHYS[0] = read_cntpct();
+    let deadline = CNT_VIRT[0].wrapping_add(48_000_000);
+    while read_cntvct() < deadline {
+        let mut all = true;
+        for c in 1..online {
+            if !CNT_READY[c].load(core::sync::atomic::Ordering::Acquire) {
+                all = false;
+            }
+        }
+        if all {
+            break;
+        }
+    }
+    crate::println!("  smp:    counters (virt / phys, delta vs cpu0):");
+    for c in 0..online {
+        crate::println!("    cpu{}: cntvct {:#x} cntpct {:#x} d_virt {} d_phys {}",
+            c, CNT_VIRT[c], CNT_PHYS[c],
+            (CNT_VIRT[c] as i64 - CNT_VIRT[0] as i64),
+            (CNT_PHYS[c] as i64 - CNT_PHYS[0] as i64));
+    }
 }

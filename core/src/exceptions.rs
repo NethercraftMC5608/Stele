@@ -126,14 +126,30 @@ pub extern "C" fn rust_irq() {
 
     if intid == crate::timer::intid() {
         unsafe { crate::timer::rearm() };
-        crate::timer::on_tick();
-        #[cfg(nk_linux)]
-        unsafe {
-            crate::linux::nk_tick()
-        };
-        // One-shot timers Linux asked for. Checked on the periodic tick,
-        // which caps their resolution at one tick -- see hostops.rs.
-        crate::hostops::tick_timers();
+        // The global clock belongs to the boot CPU alone.
+        //
+        // `on_tick` bumps the shared millisecond counter and wakes sleepers,
+        // `nk_tick` feeds Linux's own time, and `tick_timers` walks one table
+        // of one-shot timers. Every one of those is single, shared state: run
+        // them from each CPU's tick and a 100 Hz timer becomes 400 Hz on four
+        // CPUs. Measured before this branch: the same storm did 409569 round
+        // trips on `-smp 1` and 73857 on `-smp 4`, because `sleep_ticks(HZ)`
+        // -- the storm's one-second window -- expired in a quarter of a
+        // second. The x86 AP timer takes the same line; see the 0xef handler.
+        //
+        // What a secondary *does* need from its tick is entirely local:
+        // rearm, and decide whether the task this CPU is running has had
+        // enough. Both are below and are per-CPU by construction.
+        if crate::arch::cpu_id() == 0 {
+            crate::timer::on_tick();
+            #[cfg(nk_linux)]
+            unsafe {
+                crate::linux::nk_tick()
+            };
+            // One-shot timers Linux asked for. Checked on the periodic tick,
+            // which caps their resolution at one tick -- see hostops.rs.
+            crate::hostops::tick_timers();
+        }
         // Completion before the switch, not after: cpu_switch does not return
         // here, it returns into some other task, and an un-EOI'd interrupt
         // stays active forever. The symptom is a timer that ticks exactly

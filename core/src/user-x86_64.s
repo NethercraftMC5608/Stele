@@ -5,7 +5,12 @@
 // C and Rust cannot express:
 //
 //   * nk_setjmp / nk_longjmp: LKL's host unwinding operations
-//   * cpu_switch: context switch between two kernel tasks
+//   * cpu_switch: context switch between two kernel tasks. Five arguments:
+//       rdi = &outgoing TASKS[cur].on_cpu   (cleared; the release store)
+//       rsi = &outgoing TASKS[cur].sp       (the saved context)
+//       rdx = incoming saved SP             (TASKS[next].sp)
+//       rcx = &CPUS[cpu].current            (published as `next`)
+//       r8  = incoming task id
 //   * enter_user / resume_user: drop from ring 0 to ring 3
 //
 // AT&T syntax, matching boot-x86_64.s and the options(att_syntax) flag.
@@ -69,8 +74,13 @@ cpu_switch:
     push    %r14
     push    %r15
 
-    mov     %rsp, (%rdi)
-    mov     %rsi, %rsp
+    mov     %rsp, (%rsi)
+    mov     %rdx, %rsp
+    # Ownership first, publication second -- see the aarch64 `cpu_switch`
+    # for why the order matters. On x86-64 TSO the plain stores below are
+    # already the release the protocol needs.
+    mov     %r8, (%rcx)             # CPUS[cpu].current = next_id
+    movb    $0, (%rdi)              # the outgoing task is no longer on a CPU
 
     pop     %r15
     pop     %r14
@@ -87,7 +97,6 @@ cpu_switch:
 // the initial stack frame by cpu_switch.
 .global task_start
 task_start:
-    call    finish_switch_asm       # publish the task the switch replaced
     sti                             # unmask interrupts for the new task
     mov     %r13, %rdi              # System V AMD64 first parameter is rdi
     call    *%r12                   # entry(arg)

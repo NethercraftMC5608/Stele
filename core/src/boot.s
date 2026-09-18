@@ -113,9 +113,83 @@ at_el1:
     bl      rust_main
     // rust_main is -> !, so this is only reached if it ever stops being that.
 
+// ---------------------------------------------------- secondary CPUs --
+//
+// Every CPU the machine starts arrives at `real_start`, and the ones that
+// are not affinity 0 come here. They arrive with the MMU off, no stack, BSS
+// not yet zeroed and no vectors loaded -- the boot CPU has not run a single
+// instruction of its own setup yet -- so this path may touch nothing but the
+// mailbox until it is deliberately released.
+//
+// It waits for a magic value rather than a boolean: the mailbox lives in
+// .bss, and a CPU that arrived before the boot CPU zeroed it could read a
+// stale non-zero word and proceed early. No plausible garbage equals the
+// magic, and zero -- what it will be once BSS is cleared -- does not.
+//
+// The boot CPU has caches on and these CPUs have them off, so the release is
+// a clean-and-sev on that side and a plain read here. See `ap_release`.
 park:
+    ldr     x2, =AP_MAILBOX
+    ldr     w5, =0x4e4b4150         // "NKAP": the release magic
+    mov     x3, x1                  // this CPU's affinity, from above
+wait_release:
     wfe
-    b       park
+    ldr     w4, [x2]
+    cmp     w4, w5
+    b.ne    wait_release
+
+    // Released. Record this CPU in the mailbox so the boot CPU can report
+    // which ones answered, then wait to be given a stack and the MMU
+    // parameters. `reached` starts at offset 8; entries are cpu+1 so that a
+    // zeroed mailbox means "nobody".
+    add     x5, x2, #8
+    add     w6, w3, #1
+    str     w6, [x5, x3, lsl #2]
+stage2:
+    wfe
+    b       stage2
+
+// ---------------------------------------------------- PSCI secondary --
+//
+// Where PSCI `CPU_ON` is told to start a secondary. Under HVF the parked
+// path above is never taken: HVF does not start secondary vCPUs at the kernel
+// entry at all, so they exist only after `CPU_ON`, and this is their first
+// instruction. Measured, not assumed -- releasing the parked CPUs at `-smp 4`
+// produced zero arrivals, and the same image arrives through here instead.
+//
+// The CPU starts with the MMU off at the physical address it was given, which
+// is this label's link address: the image is loaded at 0x40080000 and linked
+// there, so physical and virtual agree until translation is turned on. x0
+// carries whatever context `CPU_ON` was called with.
+//
+// Milestone 2 stops here: record the arrival so the boot CPU can report it,
+// and nothing else. Stacks, translation and Rust come next, one stage at a
+// time, because each of them can fail in a way that looks like the CPU never
+// starting at all.
+.global secondary_entry
+secondary_entry:
+    mrs     x1, mpidr_el1
+    and     x1, x1, #0xff           // this CPU's affinity (AFF0)
+    ldr     x2, =AP_MAILBOX
+    add     x5, x2, #8              // &reached[0]
+    add     w6, w1, #1              // cpu + 1; zero means "never arrived"
+    str     w6, [x5, x1, lsl #2]
+
+    // Its own stack, published by the boot CPU before . Loaded
+    // before translation is on, from identity-mapped .bss, which is the
+    // only reason it can be loaded at all -- SP has to exist before the
+    // code that turns the MMU on can run.
+    add     x5, x2, #40             // &stack_top[0]
+    ldr     x6, [x5, x1, lsl #3]
+    add     sp, x6, #0
+
+    // cpu index in x0, then into Rust: translation, vectors and the rest
+    // are per-CPU and handled there.
+    add     x0, x1, #0
+    bl      rust_ap_main_arm
+secondary_wait:
+    wfe
+    b       secondary_wait
 
 
 // The vector table. Sixteen entries, each exactly 0x80 bytes, in the fixed
@@ -237,13 +311,13 @@ irq_entry:
     eret
 
 
-// cpu_switch(prev_sp: *mut usize, next_sp: usize)
+// cpu_switch(prev_on_cpu, prev_sp, next_sp, next_current, next_id)
 //
-// Only the callee-saved registers, because this is reached by an ordinary
-// function call: AAPCS already says x0-x18 are the caller's problem, and the
-// caller has already dealt with them. What makes it a context switch rather
-// than a function call is the two instructions in the middle that put SP
-// somewhere else.
+// x0 = outgoing task's on_cpu byte, x1 = &outgoing TASKS[cur].sp,
+// x2 = incoming sp, x3 = &CPUS[cpu].current, x4 = incoming task id.
+//
+// The saved SP is stored before the release store below, and the incoming
+// task is named current before it runs.
 .global cpu_switch
 cpu_switch:
     sub     sp, sp, #96
@@ -253,9 +327,18 @@ cpu_switch:
     stp     x25, x26, [sp, #16 * 3]
     stp     x27, x28, [sp, #16 * 4]
     stp     x29, x30, [sp, #16 * 5]
-    mov     x2, sp
-    str     x2, [x0]                // remember where the outgoing task stopped
-    mov     sp, x1                  // and take up where the incoming one did
+
+    mov     x8, sp
+    str     x8, [x1]                // TASKS[cur].sp = sp: the saved context
+    mov     sp, x2                  // take up where the incoming one did
+    stlr    x4, [x3]                // CPUS[cpu].current = next_id (Release:
+                                    // pairs with Acquire loads on other CPUs).
+    stlrb   wzr, [x0]               // Release: the outgoing task is off a CPU.
+
+                                    // All earlier stores -- the saved SP above
+                                    // -- are ordered before this one, so a
+                                    // consumer that Acquire-observes
+                                    //  sees the saved context.
     ldp     x19, x20, [sp, #16 * 0]
     ldp     x21, x22, [sp, #16 * 1]
     ldp     x23, x24, [sp, #16 * 2]
@@ -272,17 +355,6 @@ cpu_switch:
 // task_exit rather than off the end of its stack.
 .global task_start
 task_start:
-    // Publish the task this CPU just replaced, before anything else.
-    //
-    // The outgoing task was marked Ready while its registers were still live
-    // on the CPU that switched it out, so until someone starts running here
-    // and clears its `on_cpu`, it must not be picked -- a second CPU running
-    // it would share one stack. This call is that moment for a freshly
-    // spawned task, exactly as the tail of `schedule_on` is for one that was
-    // only switched out. x19/x20 are preserved across a C call, which is
-    // what keeps the entry point and its argument intact.
-    bl      finish_switch_asm
-
     // Unmask interrupts before the task's first instruction.
     //
     // Every other task resumes by returning through irq_entry's epilogue,

@@ -441,7 +441,7 @@ impl Semaphore {
             // seen here as a token, and this task does not sleep through it.
             // Without the re-check both partners of a ping-pong can block on
             // each other, each having lost the other's wake.
-            sched::block_on_cond(flags, self.id, || self.count.load(SeqCst) > 0);
+            sched::block_on_cond(flags, self.id, || {}, || self.count.load(SeqCst) > 0);
             // `block_on_cond` restored interrupts; mask again for the retry.
             flags = irq_save();
         }
@@ -646,7 +646,7 @@ impl Mutex {
             //   which the unlock is neither seen nor woken on, which was
             //   exactly the failure of the unconditional `block_on`: it set
             //   Blocked *after* the wake had already been refused.
-            sched::block_on_cond(flags, self.id, || self.owner.load(SeqCst) == NO_OWNER);
+            sched::block_on_cond(flags, self.id, || {}, || self.owner.load(SeqCst) == NO_OWNER);
         }
     }
 

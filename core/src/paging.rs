@@ -977,43 +977,21 @@ pub unsafe fn clean_icache_range(_pa: u64, _size: u64) {}
 ///
 /// # Safety
 /// Called once, on the boot CPU, with the MMU off.
+/// Turn translation on for the calling CPU, from the tables the boot CPU
+/// built.
+///
+/// Split out of `init` because the secondaries need exactly this half and
+/// must not repeat the other: the identity map is global state, built once
+/// against the device tree, but MAIR/TCR/TTBR/SCTLR are per-CPU registers
+/// that reset independently. A secondary that skipped this would run with
+/// the MMU off, and everything it touched would be uncached and unshared --
+/// it would appear to work and slowly diverge from the other CPUs.
+///
+/// # Safety
+/// The tables must already be built, and the caller must be running at an
+/// address that stays valid across the switch.
 #[cfg(target_arch = "aarch64")]
-pub unsafe fn init(ram_base: u64, ram_size: u64) {
-    let l1_ptr = &raw mut L1 as *mut Table as u64;
-
-    // The low 512GB of the address space, which is all nk maps.
-    (*(&raw mut L0)).0[0] = l1_ptr | pte::VALID | pte::TABLE;
-
-    // The first gigabyte, through a table of 2MB blocks rather than one
-    // block, so that only the addresses devices actually occupy are taken.
-    // Never executable: nothing should branch into a register window, and if
-    // it does the fault should say so.
-    let l2_low = &raw mut L2_LOW as *mut Table as u64;
-    (*(&raw mut L1)).0[0] = l2_low | pte::VALID | pte::TABLE;
-    let mut dev = DEVICE_START;
-    while dev < DEVICE_END {
-        (*(&raw mut L2_LOW)).0[(dev >> L2_SHIFT) as usize & 511] =
-            dev | pte::VALID | pte::AF | pte::attr(ATTR_DEVICE) | pte::UXN | pte::PXN;
-        dev += BLOCK_2MB;
-    }
-
-    // RAM, in 1GB blocks, from the device tree rather than assumed. Rounded
-    // up: a machine with 512MB still needs its whole block mapped, and the
-    // address space above the RAM inside that block is simply never touched.
-    let first = ram_base / GB;
-    let last = (ram_base + ram_size).div_ceil(GB);
-    for gb in first..last {
-        (*(&raw mut L1)).0[gb as usize] =
-            (gb * GB) | pte::VALID | pte::AF | pte::SH_INNER | pte::attr(ATTR_NORMAL);
-    }
-    println!(
-        "  mmu:    identity, devices {:#x}..{:#x}, {} GB of RAM, {} MiB free below them",
-        DEVICE_START,
-        DEVICE_END,
-        last - first,
-        DEVICE_START / (1024 * 1024)
-    );
-
+pub unsafe fn enable_translation() {
     let l0_ptr = &raw mut L0 as *mut Table as u64;
 
     // Physical address size. Hard-coding 48 bits would fault on a CPU that
@@ -1133,6 +1111,47 @@ pub unsafe fn init(ram_base: u64, ram_size: u64) {
         (check >> 12) & 1
     );
     assert!(check & 1 == 1, "the MMU did not come on");
+}
+
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn init(ram_base: u64, ram_size: u64) {
+    let l1_ptr = &raw mut L1 as *mut Table as u64;
+
+    // The low 512GB of the address space, which is all nk maps.
+    (*(&raw mut L0)).0[0] = l1_ptr | pte::VALID | pte::TABLE;
+
+    // The first gigabyte, through a table of 2MB blocks rather than one
+    // block, so that only the addresses devices actually occupy are taken.
+    // Never executable: nothing should branch into a register window, and if
+    // it does the fault should say so.
+    let l2_low = &raw mut L2_LOW as *mut Table as u64;
+    (*(&raw mut L1)).0[0] = l2_low | pte::VALID | pte::TABLE;
+    let mut dev = DEVICE_START;
+    while dev < DEVICE_END {
+        (*(&raw mut L2_LOW)).0[(dev >> L2_SHIFT) as usize & 511] =
+            dev | pte::VALID | pte::AF | pte::attr(ATTR_DEVICE) | pte::UXN | pte::PXN;
+        dev += BLOCK_2MB;
+    }
+
+    // RAM, in 1GB blocks, from the device tree rather than assumed. Rounded
+    // up: a machine with 512MB still needs its whole block mapped, and the
+    // address space above the RAM inside that block is simply never touched.
+    let first = ram_base / GB;
+    let last = (ram_base + ram_size).div_ceil(GB);
+    for gb in first..last {
+        (*(&raw mut L1)).0[gb as usize] =
+            (gb * GB) | pte::VALID | pte::AF | pte::SH_INNER | pte::attr(ATTR_NORMAL);
+    }
+    println!(
+        "  mmu:    identity, devices {:#x}..{:#x}, {} GB of RAM, {} MiB free below them",
+        DEVICE_START,
+        DEVICE_END,
+        last - first,
+        DEVICE_START / (1024 * 1024)
+    );
+
+    enable_translation();
+
 
     // Prove the high alias rather than assume it. The kernel image starts
     // with the arm64 boot header, whose magic is at offset 56; reading it
