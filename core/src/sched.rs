@@ -46,10 +46,14 @@ pub enum State {
     Finished,
 }
 
+/// No CPU owns (or has reserved) a task's execution context.
+pub const NO_OWNER: usize = usize::MAX;
+/// No task was released by the switch recorded for a CPU.
+pub const NO_TASK: usize = usize::MAX;
 
 pub struct Task {
     /// Saved stack pointer, published by the outgoing CPU and consumed only
-    /// after observing `on_cpu == false` with Acquire.
+    /// after observing `owner == NO_OWNER` with Acquire.
     pub sp: core::sync::atomic::AtomicUsize,
     pub stack: usize,
     /// Length of the range `stack` names. Not always `STACK_PAGES * PAGE`:
@@ -81,7 +85,10 @@ pub struct Task {
     /// flag closes that window: set when a task is picked, cleared by the
     /// incoming task in the assembly switch, once the switch has landed. Without
     /// it two CPUs pick one `Ready` task and share its stack.
-    pub on_cpu: core::sync::atomic::AtomicBool,
+    /// Execution-context ownership: `NO_OWNER` when the context is
+    /// physically unowned and claimable, otherwise the CPU that owns or has
+    /// reserved it. This is not `home_cpu` and not a wake target.
+    pub owner_cpu: core::sync::atomic::AtomicUsize,
     pub name: &'static str,
     pub home_cpu: u8,
     pub affinity: u8,
@@ -241,22 +248,34 @@ pub struct Task {
 }
 
 impl Task {
-    /// The saved SP, read after the Acquire that observed `on_cpu == false`.
+    /// The saved SP, read after the Acquire that observed `owner == NO_OWNER`.
     #[inline]
     pub fn saved_sp(&self) -> usize {
         self.sp.load(Ordering::Acquire)
     }
 
-    /// Whether this task is on a CPU. The load that observes `false` is the
-    /// one that makes the saved context visible.
+    /// The CPU that owns this execution context, or `NO_OWNER`. The load
+    /// that observes `NO_OWNER` is the one that makes the saved context
+    /// visible (it pairs with the assembly's release store).
     #[inline]
-    pub fn is_on_cpu(&self) -> bool {
-        self.on_cpu.load(Ordering::Acquire)
+    pub fn owner(&self) -> usize {
+        self.owner_cpu.load(Ordering::Acquire)
     }
 
-    #[inline]
-    pub fn set_on_cpu(&self, v: bool) {
-        self.on_cpu.store(v, Ordering::Relaxed);
+    pub fn is_owned(&self) -> bool {
+        self.owner() != NO_OWNER
+    }
+
+    pub fn is_owned_by(&self, cpu: usize) -> bool {
+        self.owner() == cpu
+    }
+
+    pub fn set_owner(&self, cpu: usize) {
+        self.owner_cpu.store(cpu, Ordering::Relaxed);
+    }
+
+    pub fn release_owner(&self) {
+        self.owner_cpu.store(NO_OWNER, Ordering::Relaxed);
     }
 
 }
@@ -268,7 +287,7 @@ static mut TASKS: [Task; MAX_TASKS] = [const {
     stack_size: 0,
     shadow: 0,
         state: State::Unused,
-        on_cpu: core::sync::atomic::AtomicBool::new(false),
+        owner_cpu: core::sync::atomic::AtomicUsize::new(NO_OWNER),
         name: "",
     home_cpu: 0,
     affinity: 0xff,
@@ -333,6 +352,10 @@ struct CpuState {
     current: core::sync::atomic::AtomicUsize,
     need_resched: core::sync::atomic::AtomicBool,
     online: core::sync::atomic::AtomicBool,
+    /// The outgoing task of the physical context switch that last occurred
+    /// on this CPU. Written by the outgoing context, consumed by whatever
+    /// context the switch resurfaced. Single writer (this CPU).
+    released_task: core::sync::atomic::AtomicUsize,
     idle_task: usize,
     idle: core::sync::atomic::AtomicBool,
     ipi_pending: core::sync::atomic::AtomicBool,
@@ -344,6 +367,7 @@ const CPU_INIT: CpuState = CpuState {
     current: core::sync::atomic::AtomicUsize::new(usize::MAX),
     need_resched: core::sync::atomic::AtomicBool::new(false),
     online: core::sync::atomic::AtomicBool::new(false),
+    released_task: core::sync::atomic::AtomicUsize::new(NO_TASK),
     idle_task: usize::MAX,
     idle: core::sync::atomic::AtomicBool::new(false),
     ipi_pending: core::sync::atomic::AtomicBool::new(false),
@@ -520,6 +544,10 @@ pub fn send_reschedule_ipi(cpu: usize) {
 }
 
 fn pick_target_cpu(id: usize) -> usize {
+    let forced = TEST_WAKE_TARGET.load(Ordering::Relaxed);
+    if forced != usize::MAX {
+        return cpu_index(forced);
+    }
     let mask = unsafe { (*(&raw const TASKS))[id].affinity };
     let me = cpu_index(crate::arch::cpu_id());
     // Wakes are placement decisions too, and the same LKL line applies: a
@@ -603,13 +631,13 @@ pub fn wake_on_cpu(id: usize, what: u32, cpu: usize) -> bool {
 
 extern "C" {
     /// The five arguments, in order:
-    ///   x0 = &outgoing TASKS[cur].on_cpu  (cleared with a release store)
+    ///   x0 = &outgoing TASKS[cur].owner_cpu (release-store NO_OWNER)
     ///   x1 = &outgoing TASKS[cur].sp      (the saved context)
     ///   x2 = incoming saved SP            (TASKS[next].sp)
     ///   x3 = &CPUS[cpu].current           (published as `next`)
     ///   x4 = incoming task id
     fn cpu_switch(
-        prev_on_cpu: *mut u8,
+        prev_owner: *mut usize,
         prev_sp: *mut usize,
         next_sp: usize,
         next_current: *mut usize,
@@ -626,6 +654,7 @@ pub fn init() {
     unsafe {
         let t = &mut (*(&raw mut TASKS))[0];
         t.state = State::Running;
+        t.set_owner(0);
         t.name = "boot";
         t.shadow = frames::alloc().expect("no memory for the boot task shadow") as usize;
         let shadow = t.shadow;
@@ -641,6 +670,7 @@ pub fn init_secondary(cpu: usize) {
         st.online.store(false, Ordering::Relaxed);
         st.current.store(usize::MAX, Ordering::Relaxed);
         st.need_resched.store(false, Ordering::Relaxed);
+        st.released_task.store(NO_TASK, Ordering::Relaxed);
         st.idle_task = usize::MAX;
     }
     let live = NCPUS.load(Ordering::Relaxed);
@@ -708,7 +738,7 @@ pub fn online_cpu(cpu: usize, current: usize) {
                 // This CPU runs the task from birth, with no switch to set
                 // the flag, so it is set here or the task would look
                 // pickable while this CPU already owns it.
-                TASKS[current].on_cpu.store(true, Ordering::Relaxed);
+                TASKS[current].set_owner(cpu_index(cpu));
                 TASKS[current].ran_at = crate::arch::cycles();
                 TASKS[current].accounted_at = TASKS[current].ran_at;
                 TASKS[current].ready_at = 0;
@@ -823,7 +853,7 @@ fn reclaim_finished() {
             // task, cleared by the assembly switch once its registers are stored.
             // A finished task that has genuinely switched away has it clear
             // and is safe to reclaim; one still on a stack does not.
-            if t.on_cpu.load(Ordering::Acquire) {
+            if t.is_owned() {
                 continue;
             }
             let orphan = TASKS[t.parent].state == State::Unused || TASKS[t.parent].state == State::Finished;
@@ -1016,7 +1046,7 @@ pub fn spawn(name: &'static str, entry: extern "C" fn(usize), arg: usize) -> usi
             stack_size: STACK_PAGES * PAGE,
             shadow,
             state: State::Unused,
-            on_cpu: core::sync::atomic::AtomicBool::new(false),
+            owner_cpu: core::sync::atomic::AtomicUsize::new(NO_OWNER),
             name,
             home_cpu: cpu_index(crate::arch::cpu_id()) as u8,
             affinity: 0xff,
@@ -1236,7 +1266,7 @@ pub fn schedule_on(cpu: usize) -> bool {
             if idle < MAX_TASKS
                 && idle != cur
                 && TASKS[idle].state == State::Ready
-                && !TASKS[idle].is_on_cpu()
+                && !TASKS[idle].is_owned()
             {
                 next = Some(idle);
             }
@@ -1264,7 +1294,7 @@ pub fn schedule_on(cpu: usize) -> bool {
             );
 
             TASKS[next].state = State::Running;
-            TASKS[next].on_cpu.store(true, Ordering::Relaxed);
+            TASKS[next].set_owner(cpu);
             TASKS[next].slices += 1;
             TASKS[next].ran_at = now;
             TASKS[next].accounted_at = now;
@@ -1316,7 +1346,7 @@ pub fn schedule_on(cpu: usize) -> bool {
                 crate::println!("  !! incoming SP {:#x} outside task {} '{}' stack {:#x}+{:#x}; aborting switch",
                     incoming, next, TASKS[next].name, stack, size);
                 TASKS[next].state = State::Ready;
-                TASKS[next].on_cpu.store(false, Ordering::Relaxed);
+                TASKS[next].release_owner();
                 TASKS[cur].state = State::Running;
                 RUNQUEUE.unlock(flags);
                 crate::sync::irq_restore(outer);
@@ -1328,13 +1358,25 @@ pub fn schedule_on(cpu: usize) -> bool {
             // The switch publishes `current`, switches the stack, and clears
             // the outgoing task's `on_cpu` with a release store -- after the
             // saved SP above is visible.
+            // Record the outgoing task for the switch that is about to
+            // happen. This is a physical-switch fact, not ownership: it
+            // identifies the task this CPU is releasing right now, with no
+            // dependence on Rust frame locals after the switch.
+            (*(&raw mut CPUS))[cpu].released_task.store(cur, Ordering::Relaxed);
             cpu_switch(
-                &raw mut TASKS[cur].on_cpu as *mut u8,
+                &raw mut TASKS[cur].owner_cpu as *mut usize,
                 &raw mut TASKS[cur].sp as *mut usize,
                 incoming,
                 &raw mut (*(&raw mut CPUS))[cpu].current as *mut usize,
                 next,
             );
+
+            // Common switch-completion. IRQs are still masked here; the CPU
+            // identity is derived from hardware because this frame may have
+            // been built on a different CPU when this task last blocked.
+            while finish_switch_work() {
+                schedule_on(cpu_index(crate::arch::cpu_id()));
+            }
 
             crate::sync::irq_restore(outer);
             return true;
@@ -1354,6 +1396,91 @@ pub fn schedule_on(cpu: usize) -> bool {
         unsafe { RUNQUEUE.unlock(flags) };
         crate::sync::irq_restore(outer);
         false
+    }
+}
+
+/// Whether the task still carries its wake obligation. For the regression
+/// test: it must be true from the wake until a successful claim.
+pub fn wake_pending_of(slot: usize) -> bool {
+    if slot >= MAX_TASKS {
+        return false;
+    }
+    let g = RUNQUEUE.lock();
+    let w = unsafe { (*(&raw const TASKS))[slot].wake_pending };
+    unsafe { RUNQUEUE.unlock(g) };
+    w
+}
+
+/// The completed-switch record currently held for a CPU (`NO_TASK` when the
+/// switch that last ran on it has already been consumed). For diagnostics.
+pub fn released_task_of(cpu: usize) -> usize {
+    let cpu = cpu_index(cpu);
+    unsafe { (*(&raw const CPUS))[cpu].released_task.load(Ordering::Acquire) }
+}
+
+/// Consume this CPU's completed-switch record and, if the switch released a
+/// task that is now Ready, still carries its wake obligation, and is
+/// unowned, create a fresh scheduling opportunity for it.
+///
+/// Returns true when the caller must re-enter the scheduler on this CPU
+/// before returning to ordinary execution (local forwarding). Remote
+/// forwarding sets the target's doorbell and sends the IPI outside the
+/// runqueue lock. `wake_pending` is never cleared here: only a successful
+/// claim discharges it.
+pub fn finish_switch_work() -> bool {
+    let cpu = cpu_index(crate::arch::cpu_id());
+    let released = unsafe {
+        (*(&raw mut CPUS))[cpu].released_task.swap(NO_TASK, Ordering::AcqRel)
+    };
+    if released >= MAX_TASKS {
+        return false;
+    }
+    let mut local = false;
+    let mut remote: usize = usize::MAX;
+    {
+        let g = RUNQUEUE.lock();
+        unsafe {
+            let t = &(*(&raw const TASKS))[released];
+            if t.state == State::Ready && t.wake_pending && t.owner() == NO_OWNER {
+                let mask = t.affinity;
+                if mask & (1u8 << cpu.min(7)) != 0 {
+                    local = true;
+                } else {
+                    let n = cpu_count();
+                    let mut c = 0usize;
+                    while c < n {
+                        if mask & (1u8 << c.min(7)) != 0 && cpu_online(c) {
+                            remote = c;
+                            break;
+                        }
+                        c += 1;
+                    }
+                    if remote == usize::MAX {
+                        local = true;
+                    }
+                }
+            }
+        }
+        unsafe { RUNQUEUE.unlock(g) };
+    }
+    if local {
+        return true;
+    }
+    if remote != usize::MAX {
+        set_need_resched_on(remote);
+        crate::arch::send_ipi(remote);
+    }
+    false
+}
+
+/// Entry every fresh task takes after its first physical switch. Consumes
+/// the completed-switch record (a switch into a fresh task releases an
+/// outgoing one just like any other) and honours a local retry before the
+/// task body runs. Called with IRQs masked from `task_start`.
+#[no_mangle]
+pub extern "C" fn switch_complete_entry() {
+    if finish_switch_work() {
+        schedule();
     }
 }
 
@@ -1614,7 +1741,7 @@ unsafe fn pick_on(cur: usize, cpu: usize) -> Option<usize> {
         }
         // Still on another CPU: marked Ready so it is picked again later,
         // but `cpu_switch` has not finished storing it. See `Task::on_cpu`.
-        if tasks[id].on_cpu.load(Ordering::Acquire) {
+        if tasks[id].is_owned() {
             continue;
         }
         if tasks[id].affinity & cpu_bit == 0 {
@@ -2560,16 +2687,23 @@ pub fn exit_status(id: usize) -> i32 {
 ///
 /// The tick handler wakes sleepers whose deadline has passed, so the
 /// resolution is one tick (HZ) and never shorter than asked for.
-/// Sleep until `ticks` timer ticks have passed.
-///
-/// A wait, not a spin: the caller is off the run queue for the duration and
-/// the CPU stops when nothing else wants it. `while ticks() < until
-/// { yield_now() }` is the same wait written as a busy loop, and on an
-/// emulated machine that is a host core at 100% for as long as it lasts --
-/// the watchdog's one-second pause alone kept this one from ever idling.
-///
-/// The tick handler wakes sleepers whose deadline has passed, so the
-/// resolution is one tick (HZ) and never shorter than asked for.
+// Regression-test infrastructure: the forced mid-switch window and the
+// wake-target override. Both are inert unless `mid_switch_wake_test` arms
+// them; nothing in ordinary scheduler operation writes either.
+pub static TEST_WAKE_TARGET: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(usize::MAX);
+
+pub static TEST_MW_ARMED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+pub static TEST_MW_ENTERED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+pub static TEST_MW_RELEASE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+pub static TEST_MW_TASK: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(usize::MAX);
+pub static TEST_MW_RUN_CYC: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 pub fn sleep_ticks(ticks: u64) {
     let until = crate::timer::ticks() + ticks;
     loop {
@@ -2766,6 +2900,21 @@ pub fn block_on_cond(
             0,
         );
         RUNQUEUE.unlock(g);
+    }
+    // Mid-switch wake regression hook: the task is Blocked, still owns its
+    // execution context, and the physical switch has not happened. IRQs are
+    // still masked here (the caller's flags are restored below), so the
+    // window cannot be preempted out from under the test. Inert unless the
+    // test arms it for its own helper.
+    if TEST_MW_ARMED.load(Ordering::Acquire)
+        && cur() == TEST_MW_TASK.load(Ordering::Relaxed)
+    {
+        TEST_MW_ENTERED.store(true, Ordering::Release);
+        let mut spins = 0u64;
+        while !TEST_MW_RELEASE.load(Ordering::Acquire) && spins < 500_000_000 {
+            core::hint::spin_loop();
+            spins += 1;
+        }
     }
     unsafe { crate::sync::irq_restore(flags) };
     schedule();
@@ -3123,7 +3272,7 @@ pub fn task_probe(id: usize) -> (u8, u32, bool, u8) {
             State::Blocked => 3,
             State::Finished => 4,
         };
-        (st, t.waiting_on, t.on_cpu.load(Ordering::Acquire), t.home_cpu)
+        (st, t.waiting_on, t.is_owned(), t.home_cpu)
     };
     unsafe { RUNQUEUE.unlock(g) };
     r

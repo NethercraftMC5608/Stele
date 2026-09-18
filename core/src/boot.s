@@ -333,7 +333,8 @@ cpu_switch:
     mov     sp, x2                  // take up where the incoming one did
     stlr    x4, [x3]                // CPUS[cpu].current = next_id (Release:
                                     // pairs with Acquire loads on other CPUs).
-    stlrb   wzr, [x0]               // Release: the outgoing task is off a CPU.
+    mvn     x9, xzr                 // x9 = NO_OWNER (all ones)
+    stlr    x9, [x0]                // Release: the outgoing context is unowned.
 
                                     // All earlier stores -- the saved SP above
                                     // -- are ordered before this one, so a
@@ -355,6 +356,10 @@ cpu_switch:
 // task_exit rather than off the end of its stack.
 .global task_start
 task_start:
+    // Consume the completed-switch record for the switch that started this
+    // task, before interrupts are unmasked and before the body runs.
+    bl      switch_complete_entry
+
     // Unmask interrupts before the task's first instruction.
     //
     // Every other task resumes by returning through irq_entry's epilogue,

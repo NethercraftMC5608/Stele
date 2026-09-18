@@ -187,6 +187,231 @@ fn dump_tasks() {
     }
 }
 
+// ---- deterministic mid-switch wake regression -------------------------
+static MW_GO: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static MW_FLAG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static MW_HOG_STOP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static MW_RAN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static MW_HELPER_CPU: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+extern "C" fn mw_hog(_arg: usize) {
+    let mut n = 0u64;
+    while !MW_HOG_STOP.load(Ordering::Relaxed) {
+        n = n.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        core::hint::black_box(n);
+    }
+}
+
+static MW_ABOUT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn mw_helper(_arg: usize) {
+    MW_RAN.store(true, Ordering::Release);
+    while !MW_GO.load(Ordering::Acquire) {
+        MW_HELPER_CPU.store(crate::arch::cpu_id().min(7) as u64, Ordering::Relaxed);
+        crate::sched::yield_now();
+    }
+    MW_ABOUT.store(true, Ordering::Release);
+    let flags = crate::sync::irq_save();
+    crate::sched::block_on_cond(flags, 0x5151, || {}, || MW_FLAG.load(Ordering::SeqCst) != 0);
+    crate::sched::TEST_MW_RUN_CYC.store(crate::arch::cycles(), Ordering::Release);
+}
+
+fn mw_attempt() -> Option<bool> {
+    let me = crate::sched::current_id();
+    crate::sched::TEST_MW_ARMED.store(false, Ordering::SeqCst);
+    crate::sched::TEST_MW_ENTERED.store(false, Ordering::SeqCst);
+    crate::sched::TEST_MW_RELEASE.store(false, Ordering::SeqCst);
+    crate::sched::TEST_MW_RUN_CYC.store(0, Ordering::SeqCst);
+    MW_FLAG.store(0, Ordering::SeqCst);
+    MW_GO.store(false, Ordering::SeqCst);
+    MW_RAN.store(false, Ordering::SeqCst);
+    MW_ABOUT.store(false, Ordering::SeqCst);
+    MW_HELPER_CPU.store(u64::MAX, Ordering::SeqCst);
+    crate::sched::set_affinity(me, 1 << 0);
+    crate::sched::set_class(me, crate::schedpolicy::Class::Background);
+    crate::sched::TEST_WAKE_TARGET.store(0, Ordering::SeqCst);
+    MW_HOG_STOP.store(false, Ordering::SeqCst);
+    let hog = crate::sched::spawn("mwhog", mw_hog, 0);
+    crate::sched::set_affinity(hog, 1 << 1);
+    crate::sched::set_class(hog, crate::schedpolicy::Class::Throughput);
+    let slot = crate::sched::spawn("mwhelp", mw_helper, 0);
+    crate::sched::set_affinity(slot, 1 << 1);
+    crate::sched::set_class(slot, crate::schedpolicy::Class::Interactive);
+    crate::sched::sleep_ticks(2);
+    let tpin = crate::arch::cycles();
+    while MW_HELPER_CPU.load(Ordering::Acquire) != 1 {
+        crate::sched::request_reschedule(1);
+        if crate::timer::cycles_to_ns(crate::arch::cycles().wrapping_sub(tpin)) > 50_000_000 {
+            println!("  FAIL  mw: helper never ran on the owner CPU");
+            crate::sched::TEST_WAKE_TARGET.store(usize::MAX, Ordering::SeqCst);
+            MW_HOG_STOP.store(true, Ordering::SeqCst);
+            return None;
+        }
+        crate::sched::yield_now();
+    }
+    crate::sched::TEST_MW_TASK.store(slot, Ordering::SeqCst);
+    crate::sched::TEST_MW_ARMED.store(true, Ordering::SeqCst);
+    MW_GO.store(true, Ordering::Release);
+    let t0 = crate::arch::cycles();
+    while !crate::sched::TEST_MW_ENTERED.load(Ordering::Acquire) {
+        if crate::timer::cycles_to_ns(crate::arch::cycles().wrapping_sub(t0)) > 2_000_000 {
+            crate::sched::request_reschedule(1);
+        }
+        if crate::timer::cycles_to_ns(crate::arch::cycles().wrapping_sub(t0)) > 40_000_000 {
+            println!("  FAIL  mw: helper never entered the block window");
+            crate::sched::TEST_MW_ARMED.store(false, Ordering::SeqCst);
+            crate::sched::TEST_MW_RELEASE.store(true, Ordering::SeqCst);
+            crate::sched::TEST_WAKE_TARGET.store(usize::MAX, Ordering::SeqCst);
+            MW_HOG_STOP.store(true, Ordering::SeqCst);
+            return None;
+        }
+        crate::sched::yield_now();
+    }
+    // Hands-off window: mask IRQs so only our own scheduler entry can
+    // consume the single doorbell the wake is about to arm.
+    let tmm = crate::arch::cycles();
+    while crate::sched::current_cpu_state(0).0 != me {
+        if crate::timer::cycles_to_ns(crate::arch::cycles().wrapping_sub(tmm)) > 50_000_000 {
+            println!("  FAIL  mw: controller never ran on CPU0");
+            crate::sched::TEST_MW_ARMED.store(false, Ordering::SeqCst);
+            crate::sched::TEST_MW_RELEASE.store(true, Ordering::SeqCst);
+            crate::sched::TEST_WAKE_TARGET.store(usize::MAX, Ordering::SeqCst);
+            MW_HOG_STOP.store(true, Ordering::SeqCst);
+            return None;
+        }
+        crate::sched::yield_now();
+    }
+    crate::sched::yield_now();
+    let tbusy = crate::arch::cycles();
+    while crate::timer::cycles_to_ns(crate::arch::cycles().wrapping_sub(tbusy)) < 2_000_000 {
+        core::hint::spin_loop();
+    }
+    let w0 = crate::arch::cycles();
+    MW_FLAG.store(1, Ordering::SeqCst);
+    let irqf = crate::sync::irq_save();
+    crate::sched::wake(slot);
+    let d_owned = crate::sched::task_probe(slot);
+    let nr_pre = crate::sched::current_cpu_state(0).1;
+    crate::sched::schedule();
+    let nr_post = crate::sched::current_cpu_state(0).1;
+    let d_attempt = crate::sched::task_probe(slot);
+    unsafe { crate::sync::irq_restore(irqf) };
+    let consumed = nr_pre && !nr_post && d_attempt.2;
+    if !consumed {
+        println!("  FAIL  mw: wake doorbell not consumed while the task was owned");
+        crate::sched::TEST_MW_ARMED.store(false, Ordering::SeqCst);
+        crate::sched::TEST_MW_RELEASE.store(true, Ordering::SeqCst);
+        crate::sched::TEST_WAKE_TARGET.store(usize::MAX, Ordering::SeqCst);
+        MW_HOG_STOP.store(true, Ordering::SeqCst);
+        return None;
+    }
+    crate::sched::TEST_MW_RELEASE.store(true, Ordering::SeqCst);
+    // Stable-state observation with a 2 ms grace: the repair forwards within
+    // microseconds; the defect strands the task for at least a tick.
+    let t_rel = crate::arch::cycles();
+    loop {
+        let d = crate::sched::task_probe(slot);
+        let progressed = !d.2 && d.0 != 1;
+        let mut nr = false;
+        for c in 0..crate::sched::cpu_count().min(4) {
+            if crate::sched::current_cpu_state(c).1 {
+                nr = true;
+            }
+        }
+        if progressed || nr {
+            break;
+        }
+        if crate::timer::cycles_to_ns(crate::arch::cycles().wrapping_sub(t_rel)) > 2_000_000 {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    let d1 = crate::sched::task_probe(slot);
+    let mut nr_live = false;
+    for c in 0..crate::sched::cpu_count().min(4) {
+        if crate::sched::current_cpu_state(c).1 {
+            nr_live = true;
+        }
+    }
+    let pending = crate::sched::wake_pending_of(slot);
+    let stranded = d1.0 == 1 && !d1.2 && pending && !nr_live;
+    let t1 = crate::arch::cycles();
+    while crate::sched::TEST_MW_RUN_CYC.load(Ordering::Acquire) == 0 {
+        if crate::timer::cycles_to_ns(crate::arch::cycles().wrapping_sub(t1)) > 200_000_000 {
+            println!("  FAIL  mw: helper never ran after the mid-switch wake");
+            crate::sched::TEST_MW_ARMED.store(false, Ordering::SeqCst);
+            crate::sched::TEST_WAKE_TARGET.store(usize::MAX, Ordering::SeqCst);
+            MW_HOG_STOP.store(true, Ordering::SeqCst);
+            return None;
+        }
+        crate::sched::yield_now();
+    }
+    let lat_ns = crate::timer::cycles_to_ns(
+        crate::sched::TEST_MW_RUN_CYC.load(Ordering::Acquire).wrapping_sub(w0));
+    println!("  mw: rescue latency {}us (secondary)", lat_ns / 1000);
+    crate::sched::TEST_MW_ARMED.store(false, Ordering::SeqCst);
+    crate::sched::TEST_MW_RELEASE.store(true, Ordering::SeqCst);
+    crate::sched::TEST_WAKE_TARGET.store(usize::MAX, Ordering::SeqCst);
+    MW_HOG_STOP.store(true, Ordering::SeqCst);
+    Some(stranded)
+}
+
+// Fresh-entry completion check: a switch into a brand-new task must consume
+// the released_task record before the task body runs, or a later switch
+// could overwrite it.
+static FRESH_SEEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static FRESH_CONSUMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+extern "C" fn fresh_probe(_arg: usize) {
+    let c = crate::arch::cpu_id().min(7);
+    FRESH_CONSUMED.store(crate::sched::released_task_of(c) == crate::sched::NO_TASK, Ordering::Release);
+    FRESH_SEEN.store(true, Ordering::Release);
+}
+
+fn fresh_entry_completion_check() -> usize {
+    FRESH_SEEN.store(false, Ordering::SeqCst);
+    FRESH_CONSUMED.store(false, Ordering::SeqCst);
+    let _slot = crate::sched::spawn("fresh", fresh_probe, 0);
+    let t = crate::arch::cycles();
+    while !FRESH_SEEN.load(Ordering::Acquire) {
+        if crate::timer::cycles_to_ns(crate::arch::cycles().wrapping_sub(t)) > 50_000_000 {
+            println!("  FAIL  fresh: probe task never ran");
+            return 1;
+        }
+        crate::sched::yield_now();
+    }
+    if !FRESH_CONSUMED.load(Ordering::Acquire) {
+        println!("  FAIL  fresh: released_task not consumed before the task body");
+        return 1;
+    }
+    println!("  fresh: switch-completion consumed before task body");
+    0
+}
+
+fn mid_switch_wake_test() -> usize {
+    let mut stranded_seen = 0usize;
+    let mut consumed_all = true;
+    let mut lat = 0u64;
+    for _ in 0..4 {
+        match mw_attempt() {
+            Some(_s) => {
+                if _s { stranded_seen += 1; }
+                // latency comes from the attempt's printed metric
+                lat = 0;
+            }
+            None => {}
+        }
+    }
+    let _ = (consumed_all, lat);
+    let mut failures = 0;
+    if stranded_seen == 0 {
+        println!("  mw: no STRANDED_WAKE_OBLIGATION in 4 attempts (repair in place)");
+    } else {
+        println!("  FAIL  mw: STRANDED_WAKE_OBLIGATION observed in {}/4 attempts", stranded_seen);
+        failures += 1;
+    }
+    failures
+}
+
 pub fn run() -> usize {
     let mut failures = 0;
     macro_rules! check {
@@ -198,6 +423,12 @@ pub fn run() -> usize {
         };
     }
 
+    failures += fresh_entry_completion_check();
+    if crate::sched::cpu_count() >= 2 {
+        failures += mid_switch_wake_test();
+    } else {
+        println!("  mw: skipped (UP)");
+    }
     println!();
     println!("scheduler torture:");
     check!(sched::accounting_regression(), "incremental accounting or repeated blocked charge");

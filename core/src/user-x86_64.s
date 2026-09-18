@@ -80,7 +80,9 @@ cpu_switch:
     # for why the order matters. On x86-64 TSO the plain stores below are
     # already the release the protocol needs.
     mov     %r8, (%rcx)             # CPUS[cpu].current = next_id
-    movb    $0, (%rdi)              # the outgoing task is no longer on a CPU
+    movq    $-1, (%rdi)             # owner = NO_OWNER: the outgoing context
+                                    # is unowned (full-width aligned store;
+                                    # x86 TSO keeps the ordering release).
 
     pop     %r15
     pop     %r14
@@ -97,6 +99,7 @@ cpu_switch:
 // the initial stack frame by cpu_switch.
 .global task_start
 task_start:
+    call    switch_complete_entry   # consume the completed-switch record
     sti                             # unmask interrupts for the new task
     mov     %r13, %rdi              # System V AMD64 first parameter is rdi
     call    *%r12                   # entry(arg)
