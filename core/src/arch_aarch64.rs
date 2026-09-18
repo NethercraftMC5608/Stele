@@ -109,8 +109,11 @@ pub fn cpu_id() -> usize {
 pub fn send_ipi(cpu: usize) {
     let cpu = (cpu & 0xff) as u64;
     const SGI_RESCHED: u64 = 1;
-    // Aff1 = 0, InterruptID = 1, Aff0 in bits 19..16, target list in 15..0.
-    let sgi = (SGI_RESCHED << 24) | (cpu << 16) | (1 << cpu);
+    // ICC_SGI1R_EL1: TargetList[15:0], Aff1[23:16], IntID[27:24],
+    // Aff2[39:32], Aff3[55:48]. Aff0 is selected by which TargetList bit
+    // is set, not by a field. All of nk's CPUs sit in cluster Aff3=Aff2=
+    // Aff1=0, so the target is exactly bit `cpu` of TargetList.
+    let sgi = (SGI_RESCHED << 24) | (1u64 << cpu);
     unsafe {
         core::arch::asm!("msr ICC_SGI1R_EL1, {}", "isb", in(reg) sgi, options(nostack));
     }

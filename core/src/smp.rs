@@ -667,7 +667,6 @@ pub unsafe extern "C" fn rust_ap_main_arm(cpu: u64) -> ! {
     // must exist before the first interrupt can be taken.
     core::arch::asm!("msr daifclr, #0xf", options(nomem, nostack));
     println!("  smp:    cpu{} online", cpu);
-    counter_sample_secondary(cpu);
 
     // The same idle loop the x86 APs run: take a local reschedule if one is
     // pending, pick work if there is any, try one steal, otherwise stop.
