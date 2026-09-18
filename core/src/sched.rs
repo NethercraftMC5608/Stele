@@ -2647,6 +2647,38 @@ pub static mut LOST_WAKEUPS: u64 = 0;
 /// The token is the rule: 0 is nk's own generic wait and may be interrupted
 /// by anyone, and anything else names a primitive that only its owner may
 /// wake a task out of.
+/// Wake a task and consume its wait registration in the same critical
+/// section as the Ready transition.
+///
+/// `clear` runs with RUNQUEUE held, and only when the wake actually
+/// happened. The woken task cannot run -- and therefore cannot register a
+/// new wait -- until the lock is released, which removes the ABA window in
+/// which an older wake's cleanup removed a *new* registration for the same
+/// slot.
+pub fn wake_on_locked(id: usize, what: u32, clear: impl FnOnce()) -> bool {
+    let flags = RUNQUEUE.lock();
+    let woke = unsafe {
+        if id >= MAX_TASKS {
+            false
+        } else if TASKS[id].state == State::Blocked {
+            if TASKS[id].waiting_on == what {
+                make_ready(id, what);
+                clear();
+                true
+            } else {
+                false
+            }
+        } else if matches!(TASKS[id].state, State::Ready | State::Running) {
+            false
+        } else {
+            LOST_WAKEUPS += 1;
+            false
+        }
+    };
+    unsafe { RUNQUEUE.unlock(flags) };
+    woke
+}
+
 pub fn wake_on(id: usize, what: u32) -> bool {
     let flags = RUNQUEUE.lock();
     let woke = unsafe {

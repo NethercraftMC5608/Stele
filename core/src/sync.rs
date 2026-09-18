@@ -521,8 +521,14 @@ impl Semaphore {
             if self.waiters[idx].load(SeqCst) & mask == 0 {
                 continue;
             }
-            if sched::wake_on(bit, self.id) {
+            // Consume the registration inside the wake transition: the
+            // woken task cannot run until RUNQUEUE is released, so it cannot
+            // re-register before its old registration is gone. Clearing after
+            // `wake_on` returned (outside the lock) is the ABA window where a
+            // stale wake removed a newer registration.
+            if sched::wake_on_locked(bit, self.id, || {
                 self.waiters[idx].fetch_and(!mask, SeqCst);
+            }) {
                 woken = Some(bit);
                 break;
             }
@@ -673,8 +679,14 @@ impl Mutex {
             if self.waiters[idx].load(SeqCst) & mask == 0 {
                 continue;
             }
-            if sched::wake_on(bit, self.id) {
+            // Consume the registration inside the wake transition: the
+            // woken task cannot run until RUNQUEUE is released, so it cannot
+            // re-register before its old registration is gone. Clearing after
+            // `wake_on` returned (outside the lock) is the ABA window where a
+            // stale wake removed a newer registration.
+            if sched::wake_on_locked(bit, self.id, || {
                 self.waiters[idx].fetch_and(!mask, SeqCst);
+            }) {
                 woken = Some(bit);
                 break;
             }
