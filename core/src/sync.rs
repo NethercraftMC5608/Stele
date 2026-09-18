@@ -112,6 +112,11 @@ impl Spinlock {
         flags
     }
 
+    /// Ticket state, for the freeze dump: (next to issue, now serving).
+    pub fn tickets(&self) -> (u32, u32) {
+        (self.next.load(SeqCst), self.now.load(SeqCst))
+    }
+
     /// # Safety
     /// `flags` came from `lock` on this lock, and the caller still holds it.
     pub unsafe fn unlock(&self, flags: u64) {
@@ -395,22 +400,39 @@ impl Semaphore {
     pub fn down(&self) {
         let me = sched::current_id();
         let me_mask = 1u64 << (me % 64);
+        let mut flags = irq_save();
         loop {
-            let flags = irq_save();
-            let count = self.count.load(SeqCst);
-            if count > 0 {
-                self.count.store(count - 1, SeqCst);
-                self.taker.store(sched::current_uid() as u64, SeqCst);
-                // Taking the token ends this task's interest in the
-                // semaphore, so drop the waiter bit even though the wake
-                // that raced the block means it was never re-armed.
-                // Leaving it set is how a later `up` finds a "waiter"
-                // that is not waiting and loses the wake on it.
-                self.waiters[me / 64].fetch_and(!me_mask, SeqCst);
-                unsafe { irq_restore(flags) };
-                return;
+            // Take a token with one atomic read-modify-write.
+            //
+            // The obvious `load; if > 0 { store(count - 1) }` is not one:
+            // the interrupt mask stops re-entry on *this* CPU and nothing on
+            // any other, so two CPUs could both read the last token, both
+            // store 0 over it, and both return as if they had taken it. The
+            // semaphore then grants two for one `up`, one partner proceeds
+            // without a token, and the pair eventually blocks on each other
+            // with the count at zero -- measured on four ARM CPUs as a
+            // ping-pong pair both asleep, `ph=2`, at the exact moment the
+            // storm's clock ran out. x86's stronger ordering made it rare
+            // enough to survive hundreds of runs.
+            let mut count = self.count.load(SeqCst);
+            while count > 0 {
+                match self.count.compare_exchange_weak(count, count - 1, SeqCst, SeqCst) {
+                    Ok(_) => {
+                        self.taker.store(sched::current_uid() as u64, SeqCst);
+                        // Taking the token ends this task's interest in the
+                        // semaphore, so drop the waiter bit even though the
+                        // wake that raced the block means it was never
+                        // re-armed. Leaving it set is how a later `up` finds
+                        // a "waiter" that is not waiting and loses the wake
+                        // on it.
+                        self.waiters[me / 64].fetch_and(!me_mask, SeqCst);
+                        unsafe { irq_restore(flags) };
+                        return;
+                    }
+                    Err(current) => count = current,
+                }
             }
-            self.waiters[me / 64].fetch_or(1u64 << (me % 64), SeqCst);
+            self.waiters[me / 64].fetch_or(me_mask, SeqCst);
             self.downs.fetch_add(1, SeqCst);
             // Marks this task blocked, restores `flags`, and switches away
             // -- but only after re-checking the count under the scheduler
@@ -420,6 +442,8 @@ impl Semaphore {
             // Without the re-check both partners of a ping-pong can block on
             // each other, each having lost the other's wake.
             sched::block_on_cond(flags, self.id, || self.count.load(SeqCst) > 0);
+            // `block_on_cond` restored interrupts; mask again for the retry.
+            flags = irq_save();
         }
     }
 
@@ -480,18 +504,27 @@ impl Semaphore {
         // `count` while a real waiter slept -- a lost wake with no trace.
         // So clear, try to wake, and keep scanning only while the wake
         // was refused.
+        // Clear the hint only as part of a *successful* transition to
+        // Ready. Clearing it before the wake attempt discarded the only
+        // indication that a waiter existed when the wake was refused (the
+        // waiter had registered but not yet committed `Blocked`); if the
+        // token was then consumed by anyone else, the waiter slept for ever
+        // with no bit and no token. A refusal leaves the hint in place: the
+        // token stays in `count`, and the waiter's protected recheck either
+        // takes it or re-blocks with the hint still set.
         let mut woken = None;
         let start = self.last_woken.load(SeqCst) as usize;
         for step in 1..=128usize {
             let bit = (start + step) % 128;
             let idx = bit / 64;
             let mask = 1u64 << (bit % 64);
-            if self.waiters[idx].load(SeqCst) & mask != 0 {
+            if self.waiters[idx].load(SeqCst) & mask == 0 {
+                continue;
+            }
+            if sched::wake_on(bit, self.id) {
                 self.waiters[idx].fetch_and(!mask, SeqCst);
-                if sched::wake_on(bit, self.id) {
-                    woken = Some(bit);
-                    break;
-                }
+                woken = Some(bit);
+                break;
             }
         }
         unsafe { irq_restore(flags) };
@@ -558,7 +591,19 @@ impl Mutex {
             let flags = irq_save();
             let owner = self.owner.load(SeqCst);
             if owner == NO_OWNER {
-                self.owner.store(me, SeqCst);
+                // Claim with one atomic RMW, for the same reason
+                // `Semaphore::down` takes its token that way: `load` then
+                // `store` lets two CPUs both see it free and both become
+                // owner, which is not a lock at all. Found on ARM; x86's
+                // ordering hid it.
+                if self
+                    .owner
+                    .compare_exchange(NO_OWNER, me, SeqCst, SeqCst)
+                    .is_err()
+                {
+                    unsafe { irq_restore(flags) };
+                    continue;
+                }
                 self.depth.store(1, SeqCst);
                 // See `Semaphore::down`: a taken lock ends the interest,
                 // and a stale bit here would eat a later unlock's wake.
@@ -611,18 +656,27 @@ impl Mutex {
         // pays for in full. In rotation, for the same starvation reason as
         // `Semaphore::up` -- and like there, a refused wake (stale bit)
         // must not end the scan, or the unlock lands on nobody.
+        // Clear the hint only as part of a *successful* transition to
+        // Ready. Clearing it before the wake attempt discarded the only
+        // indication that a waiter existed when the wake was refused (the
+        // waiter had registered but not yet committed `Blocked`); if the
+        // token was then consumed by anyone else, the waiter slept for ever
+        // with no bit and no token. A refusal leaves the hint in place: the
+        // token stays in `count`, and the waiter's protected recheck either
+        // takes it or re-blocks with the hint still set.
         let mut woken = None;
         let start = self.last_woken.load(SeqCst) as usize;
         for step in 1..=128usize {
             let bit = (start + step) % 128;
             let idx = bit / 64;
             let mask = 1u64 << (bit % 64);
-            if self.waiters[idx].load(SeqCst) & mask != 0 {
+            if self.waiters[idx].load(SeqCst) & mask == 0 {
+                continue;
+            }
+            if sched::wake_on(bit, self.id) {
                 self.waiters[idx].fetch_and(!mask, SeqCst);
-                if sched::wake_on(bit, self.id) {
-                    woken = Some(bit);
-                    break;
-                }
+                woken = Some(bit);
+                break;
             }
         }
         unsafe { irq_restore(flags) };
@@ -630,5 +684,50 @@ impl Mutex {
             self.last_woken.store(id as u32, SeqCst);
             sched::yield_now();
         }
+    }
+}
+
+// ---------------------------------------------------------------- console --
+
+/// Serialises whole `print!` calls once more than one CPU can print.
+///
+/// The console used to be lock-free on the grounds that "every other CPU is
+/// parked". Secondaries running nk made that false, and two CPUs printing at
+/// once interleave inside a line: the first four-CPU ARM boot produced one
+/// unreadable smear and swallowed a boot line entirely.
+///
+/// Why it is not simply always locked: the first prints of the boot happen
+/// *before* `paging::init`, with the MMU off. With translation off, memory is
+/// Device-nGnRnE, and an atomic read-modify-write -- a ticket lock's
+/// `fetch_add` -- on Device memory is an abort, not a spin. Measured: taking
+/// this lock from the first `println!` turned the boot into an endless
+/// "!!EXC 0x96000035" (same-EL data abort) before a single banner byte.
+///
+/// So the lock is enabled by `enable_console_lock`, which `smp::bring_up`
+/// calls just before it starts any secondary -- at which point translation is
+/// on and there is something to serialise. Before that the machine is
+/// single-threaded by construction and the plain store of the flag is safe.
+static CONSOLE_LOCK: Spinlock = Spinlock::new();
+static CONSOLE_MP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// From now on, `print!` serialises. Call before starting secondaries.
+pub fn enable_console_lock() {
+    CONSOLE_MP.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Take the console lock if it is in use, or return `None` when this is still
+/// a single-CPU machine (or the MMU is not on yet).
+pub fn console_lock() -> Option<u64> {
+    if !CONSOLE_MP.load(core::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    Some(CONSOLE_LOCK.lock())
+}
+
+/// # Safety
+/// `flags` came from `console_lock` on this lock.
+pub unsafe fn console_unlock(flags: Option<u64>) {
+    if let Some(f) = flags {
+        CONSOLE_LOCK.unlock(f);
     }
 }
