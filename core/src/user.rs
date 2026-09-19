@@ -53,6 +53,38 @@ pub const USER_BASE: u64 = 0x0040_0000;
 /// is what buys the room to find out whether WebKit needs it.
 pub const USER_STACK_TOP: u64 = 0x3F00_0000;
 
+/// The page-in trampoline, one page above the stack in every process.
+///
+/// A file-backed page fault cannot be served from the abort handler: the
+/// read goes through LKL, and entering LKL from the synchronous-abort path
+/// is not equivalent to entering it from a syscall. The abort handler
+/// instead saves the frame, points ELR here and names the page-in syscall in
+/// x8; the ordinary SVC path reads the page and restores the frame.
+pub const TRAMPOLINE_VA: u64 = USER_STACK_TOP;
+
+static mut TRAMPOLINE_PAGE: usize = 0;
+
+fn trampoline_page() -> usize {
+    unsafe {
+        if TRAMPOLINE_PAGE == 0 {
+            let frame = frames::alloc().expect("no frame for the page-in trampoline");
+            core::ptr::write_bytes(frame, 0, PAGE);
+            // svc #0 ; brk #0 -- the brk is unreachable when page-in works.
+            let insns = [0xD400_0001u32, 0xD420_0000u32];
+            core::ptr::copy_nonoverlapping(insns.as_ptr() as *const u8, frame, 8);
+            paging::clean_icache_range(frame as u64, PAGE as u64);
+            TRAMPOLINE_PAGE = frame as usize;
+        }
+        TRAMPOLINE_PAGE
+    }
+}
+
+/// # Safety
+/// `root` is a user address space no process is running in yet.
+pub unsafe fn map_trampoline(root: u64) {
+    paging::map_user(root, TRAMPOLINE_VA, trampoline_page() as u64, PAGE as u64, true);
+}
+
 /// Where anonymous mappings start, growing downward.
 ///
 /// Between the heap growing up from the end of the image and this growing
@@ -276,6 +308,7 @@ pub fn run(p: &Process) -> ! {
 }
 
 /// The register frame `el0_sync_entry` builds, in the order it writes it.
+#[derive(Clone, Copy)]
 #[repr(C)]
 pub struct Frame {
     pub x: [u64; 31],
@@ -325,6 +358,9 @@ pub extern "C" fn rust_el0_sync(frame: &mut Frame) {
         let translation = matches!(esr & 0x3f, 0x04..=0x07);
         if abort && translation {
             if crate::reserve::fault_in(far) {
+                return;
+            }
+            if crate::reserve::defer_file_fault(frame, far) {
                 return;
             }
         }
@@ -422,6 +458,15 @@ fn report_user_fault(frame: &Frame, esr: u64, ec: u64, far: u64) {
 
 fn handle_syscall(frame: &mut Frame) {
     use crate::syscall_nr::nr;
+
+    // Page-in raised from the fault trampoline. Kernel state names the
+    // pending fault; nothing here trusts what the register frame carried.
+    if frame.x[8] == crate::reserve::PAGEIN_SYSCALL {
+        if !crate::reserve::complete_file_fault(frame) {
+            frame.x[0] = (-22i64) as u64;
+        }
+        return;
+    }
 
     // The ABI split. A native NETHOS program arrives here through exactly
     // the same instruction and the same frame as a Linux one -- what differs
@@ -1290,6 +1335,30 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: i64, offset: u64,
         // than refuse: slower and correct beats fast and wrong.
     }
 
+    // Private file mappings are demand-paged the same way: the range and the
+    // file it reads from are recorded, and the first touch of each page
+    // preads that page. Eagerly reading every page made four WebKit processes
+    // mapping one library four resident copies of it, and the frame pool ran
+    // out before the NetworkProcess could start. MAP_POPULATE asks for the
+    // old behaviour and gets it.
+    // Read-only for now: a library's text and read-only data are the bulk
+    // of what four WebKit processes duplicate, and serving them has no
+    // write-back or COW question. Writable private file pages stay eager
+    // until that question has an answer.
+    if !anonymous && !writable && fd >= 0 && flags & MAP_POPULATE == 0 {
+        if fixed {
+            unsafe { crate::paging::unmap_user(current_ttbr0(), at, len) };
+        }
+        crate::reserve::forget(at, len);
+        if crate::reserve::add_file(at, len, writable, executable, fd as i32, offset) {
+            if !fixed {
+                crate::sched::set_user_mmap_next(at);
+            }
+            return at as i64;
+        }
+        // The table is full. Fall through and populate it the old way.
+    }
+
     let mut pages: Vec<*mut u8> = Vec::new();
     let mut iov: Vec<IoVec> = Vec::new();
     // File size distinguishes EOF tail (must stay zero) from a short read
@@ -1519,8 +1588,8 @@ fn sys_mremap(old_addr: u64, old_size: u64, new_size: u64, flags: u64, new_addr:
 
     // Private anonymous: one reservation covering the whole old range, its
     // flags describing what fault_in would map any missing page with.
-    if let Some((writable, exec, none)) = crate::reserve::covering(old_addr, old_len) {
-        if !crate::reserve::add(at, new_len, writable, exec, none) {
+    if let Some((writable, exec, none, backing)) = crate::reserve::covering(old_addr, old_len) {
+        if !crate::reserve::add_backed(at, new_len, writable, exec, none, backing) {
             return -12;
         }
         if none {
@@ -2913,6 +2982,7 @@ pub fn load(
             USER_STACK_SIZE as u64,
             false,
         );
+        map_trampoline(ttbr0);
         crate::arch::tlb_flush_all();
     }
     apply_relocations(ttbr0, &image)?;

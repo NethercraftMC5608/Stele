@@ -709,6 +709,12 @@ pub unsafe fn copy_user_address_space(parent: u64) -> Option<u64> {
                 continue;
             }
             let va = ((i as u64) << L2_SHIFT) | ((j as u64) << L3_SHIFT);
+            // The trampoline is not copied: the child maps the same
+            // permanent frame the parent does.
+            if va == crate::user::TRAMPOLINE_VA {
+                crate::user::map_trampoline(child);
+                continue;
+            }
             let Some(page) = crate::frames::alloc() else {
                 destroy_user_address_space(child);
                 return None;
@@ -894,6 +900,34 @@ pub fn user_to_phys_write(va: u64) -> Option<u64> {
         return None;
     }
     Some((par & 0x0000_ffff_ffff_f000) | (va & 0xfff))
+}
+
+/// Whether the current address space has a translation for `va` at all,
+/// independent of what EL0 is allowed to do with it.
+///
+/// `user_to_phys` asks the MMU (`AT S1E0R`), which applies *read* permission
+/// -- an execute-only or otherwise non-readable resident page comes back as a
+/// fault. A residency test built on it would populate over a page that is
+/// already there. This walks the tables and looks at VALID itself.
+pub fn user_resident(va: u64) -> bool {
+    unsafe {
+        let root = table_of(crate::arch::current_page_table());
+        let mut table = root as *const u64;
+        for shift in [L0_SHIFT, L1_SHIFT, L2_SHIFT] {
+            let e = *table.add(((va >> shift) & 511) as usize);
+            if e & pte::VALID == 0 {
+                return false;
+            }
+            if pte::is_table(e) {
+                table = (e & ADDR) as *const u64;
+                continue;
+            }
+            // A block entry at this level maps the page.
+            return pte::is_block(e);
+        }
+        let e3 = *table.add(((va >> L3_SHIFT) & 511) as usize);
+        e3 & pte::VALID != 0
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -1195,6 +1229,9 @@ pub fn kernel_address_space() -> u64 {
 /// This is a finished, single-threaded process's inactive address space,
 /// created by new_address_space/map_user in USER_BASE's top-level slot only.
 pub unsafe fn destroy_user_address_space(root: u64) {
+    // The promises this space made end with it; the table's slots are a
+    // finite resource shared by every process that will run after it.
+    crate::reserve::forget_space(table_of(root));
     // Only what this address space owns.
     //
     // Its L0, L1 and low L2 are its own copies, and the L3s hanging off that
@@ -1227,7 +1264,15 @@ pub unsafe fn destroy_user_address_space(root: u64) {
                 for j in 0..512 {
                     let e3 = *l3.add(j);
                     if e3 & 1 != 0 {
-                        crate::frames::free((e3 & ADDR) as *mut u8);
+                        let va = ((i as u64) << L2_SHIFT) | ((j as u64) << L3_SHIFT);
+                        // The page-in trampoline is one frame shared by every
+                        // process; it outlives all of them. Freeing it here
+                        // frees a page still mapped elsewhere, and the frame
+                        // allocator's next pop reads a list node another
+                        // process overwrote.
+                        if va != crate::user::TRAMPOLINE_VA {
+                            crate::frames::free((e3 & ADDR) as *mut u8);
+                        }
                     }
                 }
                 crate::frames::free(l3 as *mut u8);
