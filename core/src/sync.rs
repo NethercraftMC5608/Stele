@@ -80,15 +80,30 @@ pub unsafe fn irq_restore(flags: u64) {
 /// with interrupts masked is burning the whole CPU, and on one CPU it is
 /// also uncontended, so the cost model only matters once APs arrive.
 pub struct Spinlock {
+    what: &'static str,
     next: AtomicU32,
     now: AtomicU32,
+    owner: AtomicU32,
 }
+
+const LOCK_FREE: u32 = u32::MAX;
 
 impl Spinlock {
     pub const fn new() -> Self {
         Spinlock {
+            what: "unnamed",
             next: AtomicU32::new(0),
             now: AtomicU32::new(0),
+            owner: AtomicU32::new(LOCK_FREE),
+        }
+    }
+
+    pub const fn named(what: &'static str) -> Self {
+        Spinlock {
+            what,
+            next: AtomicU32::new(0),
+            now: AtomicU32::new(0),
+            owner: AtomicU32::new(LOCK_FREE),
         }
     }
 
@@ -106,8 +121,17 @@ impl Spinlock {
             // A lock that never turns is a deadlock, not a slow machine.
             // Panicking names it; spinning forever hides it behind a hang
             // whose cause has to be reconstructed from a dead stop.
-            assert!(spins < u32::MAX / 2, "spinlock deadlock: ticket {} never served", ticket);
+            assert!(
+                spins < u32::MAX / 2,
+                "spinlock {} deadlock: ticket {} never served, serving {} (task {}; held by task {})",
+                self.what,
+                ticket,
+                self.now.load(SeqCst),
+                crate::sched::current_id(),
+                self.owner.load(SeqCst)
+            );
         }
+        self.owner.store(crate::sched::current_id() as u32, SeqCst);
         crate::arch::memory_barrier();
         flags
     }
@@ -121,6 +145,7 @@ impl Spinlock {
     /// `flags` came from `lock` on this lock, and the caller still holds it.
     pub unsafe fn unlock(&self, flags: u64) {
         crate::arch::memory_barrier();
+        self.owner.store(LOCK_FREE, SeqCst);
         self.now.fetch_add(1, SeqCst);
         irq_restore(flags);
     }
@@ -719,7 +744,7 @@ impl Mutex {
 /// calls just before it starts any secondary -- at which point translation is
 /// on and there is something to serialise. Before that the machine is
 /// single-threaded by construction and the plain store of the flag is safe.
-static CONSOLE_LOCK: Spinlock = Spinlock::new();
+static CONSOLE_LOCK: Spinlock = Spinlock::named("CONSOLE");
 static CONSOLE_MP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// From now on, `print!` serialises. Call before starting secondaries.

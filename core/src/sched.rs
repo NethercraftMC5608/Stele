@@ -917,7 +917,7 @@ static mut STACK_ARENA_NEXT: usize = 0;
 /// `reclaim_finished`, which already holds the runqueue lock, so reusing that
 /// lock here would self-deadlock. Held only for the pool/arena arithmetic --
 /// zeroing a 64 KiB stack happens outside it.
-static STACK_LOCK: crate::sync::Spinlock = crate::sync::Spinlock::new();
+static STACK_LOCK: crate::sync::Spinlock = crate::sync::Spinlock::named("STACK_LOCK");
 
 fn take_stack() -> Option<usize> {
     let flags = STACK_LOCK.lock();
@@ -1164,11 +1164,11 @@ pub fn schedule() -> bool {
 /// on this CPU and nothing on any other. Short sections only -- never held
 /// across cpu_switch, which would serialize all CPUs behind one stack
 /// switch and deadlock the moment two schedule at once.
-static RUNQUEUE: crate::sync::Spinlock = crate::sync::Spinlock::new();
+static RUNQUEUE: crate::sync::Spinlock = crate::sync::Spinlock::named("RUNQUEUE");
 // Serializes task creation: the slot scan reads every task's state and the
 // commit writes a slot, and two concurrent spawns must not take one slot.
 // Lock order is SPAWN -> RUNQUEUE; no path takes RUNQUEUE then SPAWN.
-static SPAWN: crate::sync::Spinlock = crate::sync::Spinlock::new();
+static SPAWN: crate::sync::Spinlock = crate::sync::Spinlock::named("SPAWN");
 
 /// Whether LKL (Linux) is running. It is a single-CPU unikernel: its internal
 /// state assumes one host thread executes Linux code at a time, and nk's
