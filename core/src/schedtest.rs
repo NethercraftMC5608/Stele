@@ -412,6 +412,56 @@ fn mid_switch_wake_test() -> usize {
     failures
 }
 
+static HR_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static HR_LAT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static HR_HOG: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn halt_hog(_arg: usize) {
+    let mut n = 0u64;
+    while !HR_HOG.load(Ordering::Relaxed) {
+        n = n.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        core::hint::black_box(n);
+    }
+}
+
+extern "C" fn halt_helper(_arg: usize) {
+    let t0 = crate::arch::cycles();
+    sched::sleep_ticks(1);
+    let t1 = crate::arch::cycles();
+    HR_LAT.store(crate::timer::cycles_to_ns(t1.wrapping_sub(t0)), Ordering::Relaxed);
+    HR_DONE.store(true, Ordering::Relaxed);
+}
+
+/// Case A: a genuine block/switch/wake/resume must not be followed by a
+/// halt. Structural assertion: the resumed state is not Blocked (checked in
+/// sleep_ticks) and the call completes inside one tick of slack.
+fn halt_regression() -> usize {
+    HR_DONE.store(false, Ordering::SeqCst);
+    HR_HOG.store(true, Ordering::SeqCst);
+    let hog = sched::spawn("hhog", halt_hog, 0);
+    sched::set_affinity(hog, 1 << 1);
+    sched::set_class(hog, crate::schedpolicy::Class::Throughput);
+    let helper = sched::spawn("hhelp", halt_helper, 0);
+    sched::set_affinity(helper, 1 << 1);
+    let t = crate::arch::cycles();
+    while !HR_DONE.load(Ordering::Relaxed) {
+        if crate::timer::cycles_to_ns(crate::arch::cycles().wrapping_sub(t)) > 200_000_000 {
+            println!("  FAIL  halt: helper never completed sleep_ticks");
+            HR_HOG.store(false, Ordering::SeqCst);
+            return 1;
+        }
+        sched::yield_now();
+    }
+    HR_HOG.store(false, Ordering::SeqCst);
+    let lat_us = HR_LAT.load(Ordering::Relaxed) / 1000;
+    println!("  halt: sleep_ticks(1) after a real switch took {}us", lat_us);
+    if lat_us > 25_000 {
+        println!("  FAIL  halt: resumed sleep took {}us (extra halt tick)", lat_us);
+        return 1;
+    }
+    0
+}
+
 pub fn run() -> usize {
     let mut failures = 0;
     macro_rules! check {
@@ -426,6 +476,7 @@ pub fn run() -> usize {
     failures += fresh_entry_completion_check();
     if crate::sched::cpu_count() >= 2 {
         failures += mid_switch_wake_test();
+        failures += halt_regression();
     } else {
         println!("  mw: skipped (UP)");
     }

@@ -2728,7 +2728,7 @@ pub fn sleep_ticks(ticks: u64) {
         //   task that was still Running, refused the wake, and this task
         //   then slept through its own deadline until the *next* tick. The
         //   re-check turns that lost tick into a visible deadline.
-        let blocked = block_on_cond(
+        let was_blocked = block_on_cond(
             flags,
             SLEEP_WAIT,
             // Deadline recorded before blocking, under the runqueue lock, so
@@ -2743,7 +2743,14 @@ pub fn sleep_ticks(ticks: u64) {
         // deadline pending. Halting is exactly right here: the caller
         // asked to be away for a while, the tick is what ends that, and
         // this is the state an idle machine should be sitting in.
-        if blocked {
+        // `blocked == true` has two outcomes: the task was switched away and
+        // has now been woken and physically resumed (state == Running), or
+        // `schedule()` found nothing else runnable and the task is still
+        // Blocked on this CPU. Only the second case needs the halt; halting
+        // after a completed wake inserts an extra tick and exposes the
+        // resumed task to preemption. `blocked()` reads the state under
+        // RUNQUEUE.
+        if was_blocked && unsafe { blocked(cur()) } {
             halt_until_interrupt();
         }
     }
