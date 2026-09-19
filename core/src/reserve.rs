@@ -394,10 +394,19 @@ fn read_page(fd: i32, offset: u64, frame: *mut u8) -> bool {
             // 69 is preadv: one page, one iovec, at the file offset the page
             // is backed by. Short reads are retried at the new offset; a
             // zero-length read is EOF and leaves the tail zeroed.
+            // The iovec and its base are kernel addresses (a frame from the
+            // identity map), but this read can run *inside* another syscall
+            // -- a kernel copy whose destination is a lazy file page. With
+            // `user_syscall` set, nk's shim resolves those pointers as user
+            // addresses, cannot translate the frame, and the preadv comes
+            // back -EFAULT. The same shape as `futex`'s kernel buffer: say
+            // so around the call.
+            let was = crate::sched::set_user_syscall(false);
             let rc = crate::lkl::syscall(
                 69,
                 [fd as i64, &mut iov as *mut IoVec as i64, 1, (offset + done) as i64, 0, 0],
             );
+            crate::sched::set_user_syscall(was);
             if rc < 0 {
                 return false;
             }
