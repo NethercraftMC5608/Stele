@@ -2169,7 +2169,11 @@ fn wait4(pid: i64, status: u64, options: u64) -> i64 {
         //   visible to this re-check (we never sleep) or it arrives after we
         //   are Blocked and wakes us.
         crate::sched::block_on_cond(flags, 0, || {}, || {
-            crate::sched::finished_child(me, pid).is_some()
+            // The runqueue lock is held here; `finished_child` would take it
+            // again and deadlock on a single CPU. The locked variant reads
+            // the same table and asks the caller to hold what it already
+            // does.
+            unsafe { crate::sched::finished_child_locked(me, pid) }.is_some()
                 || crate::signal::interrupt_pending()
         });
     }

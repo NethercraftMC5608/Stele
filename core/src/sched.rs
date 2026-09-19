@@ -2266,15 +2266,24 @@ fn child_of(child: usize, waiter: usize) -> bool {
 /// A child of `parent` that has finished, if there is one.
 pub fn finished_child(parent: usize, want_pid: i64) -> Option<usize> {
     let flags = RUNQUEUE.lock();
-    let found = unsafe {
-        (0..MAX_TASKS).find(|&i| {
-            child_of(i, parent)
-                && TASKS[i].state == State::Finished
-                && (want_pid <= 0 || TASKS[i].linux_pid == want_pid)
-        })
-    };
+    let found = unsafe { finished_child_locked(parent, want_pid) };
     unsafe { RUNQUEUE.unlock(flags) };
     found
+}
+
+/// `finished_child` for a caller that already holds the runqueue lock.
+///
+/// The only correct form inside `block_on_cond`'s `ready`, which runs with
+/// the lock held -- re-locking there is a self-deadlock, not a race.
+///
+/// # Safety
+/// Caller holds RUNQUEUE.
+pub unsafe fn finished_child_locked(parent: usize, want_pid: i64) -> Option<usize> {
+    (0..MAX_TASKS).find(|&i| {
+        child_of(i, parent)
+            && TASKS[i].state == State::Finished
+            && (want_pid <= 0 || TASKS[i].linux_pid == want_pid)
+    })
 }
 
 /// Whether `parent` still has a child that might yet finish. `wait4` blocks
