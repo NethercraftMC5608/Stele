@@ -2922,7 +2922,15 @@ pub fn load(
     // program headers say. musl's `_start` reads `%fs:0x28` (the stack guard)
     // before any syscall, so a missing template is a fault at an address
     // that names no mapping -- not a TLS error, because no TLS exists yet.
-    let (tls_addr, tls_filesz, tls_memsz) = match &image.tls {
+    //
+    // x86 only. aarch64 libcs install their own thread pointer and never read
+    // it before their own setup runs, and the template lives *inside* a
+    // PT_LOAD of an ordinary non-PIE binary -- remapping fresh pages over it
+    // would replace the image's own data with an uninitialized copy.
+    let (tls_addr, tls_filesz, tls_memsz) = if !cfg!(target_arch = "x86_64") {
+        (0, 0, 0)
+    } else {
+    match &image.tls {
         Some(t) => {
             let base = t.address & !(PAGE as u64 - 1);
             let pages = (t.address + t.memsz as u64).div_ceil(PAGE as u64)
@@ -2959,6 +2967,7 @@ pub fn load(
             (t.address, t.filesz, t.memsz)
         }
         None => (0, 0, 0),
+    }
     };
     // The heap starts on the first page boundary past everything the image
     // asked for, so growing it can never land on the program's own bss.
