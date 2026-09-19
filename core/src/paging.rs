@@ -270,7 +270,7 @@ pub const LINUX_VA_SIZE: u64 = 4 << 30;
 /// frame allocator and hands it back from `shmem_init`; it is already mapped,
 /// because nk identity maps RAM.
 pub const LINUX_PHYS_BASE: u64 = 0x5000_0000;
-pub const LINUX_PHYS_SIZE: u64 = 64 << 20;
+pub const LINUX_PHYS_SIZE: u64 = 768 << 20;
 
 /// Make the page tables for Linux's window exist, before any process does.
 ///

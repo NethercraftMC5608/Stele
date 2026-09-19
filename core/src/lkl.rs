@@ -35,7 +35,7 @@ pub fn boot() -> bool {
     crate::sched::set_lkl_active();
     // Memory comes from nk's frame allocator through the host's page_alloc,
     // so this is how much of nk's RAM Linux is allowed to take.
-    let rc = unsafe { lkl_start_kernel(c"mem=64M loglevel=8".as_ptr() as *const u8) };
+    let rc = unsafe { lkl_start_kernel(c"mem=768M loglevel=8".as_ptr() as *const u8) };
     if rc != 0 {
         crate::println!("  linux:  the kernel did not start: {}", rc);
         return false;
