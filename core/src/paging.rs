@@ -270,7 +270,12 @@ pub const LINUX_VA_SIZE: u64 = 4 << 30;
 /// frame allocator and hands it back from `shmem_init`; it is already mapped,
 /// because nk identity maps RAM.
 pub const LINUX_PHYS_BASE: u64 = 0x5000_0000;
+#[cfg(target_arch = "aarch64")]
 pub const LINUX_PHYS_SIZE: u64 = 768 << 20;
+/// x86-64's identity map reaches 2 GiB (the boot map's ceiling), so the
+/// window has to end below it; 448 MiB leaves Linux room under that.
+#[cfg(target_arch = "x86_64")]
+pub const LINUX_PHYS_SIZE: u64 = 448 << 20;
 
 /// Make the page tables for Linux's window exist, before any process does.
 ///

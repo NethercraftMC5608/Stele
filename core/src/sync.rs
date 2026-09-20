@@ -88,10 +88,17 @@ pub struct Spinlock {
     owner_lr: AtomicU64,
 }
 
+#[cfg(target_arch = "aarch64")]
 fn caller_lr() -> u64 {
     let lr: u64;
     unsafe { core::arch::asm!("mov {}, x30", out(reg) lr, options(nomem, nostack)) };
     lr
+}
+
+#[cfg(target_arch = "x86_64")]
+fn caller_lr() -> u64 {
+    // No link register; the diagnostic is aarch64-only.
+    0
 }
 
 const LOCK_FREE: u32 = u32::MAX;
