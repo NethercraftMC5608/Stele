@@ -16,7 +16,7 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 /// Four pages. Generous for what runs here, and cheap; a Linux driver's probe
 /// path is not shy with stack, and a kernel stack overflow with no guard page
 /// silently corrupts whatever is below it.
-const STACK_PAGES: usize = 16;
+const STACK_PAGES: usize = 32;
 /// Sixty-four, because Linux wants them.
 ///
 /// Sixteen was plenty for nk's own threads and is nowhere near enough for a
