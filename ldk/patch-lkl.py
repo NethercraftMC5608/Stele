@@ -1,3 +1,10 @@
+C_LINES = ['', '#include <linux/fs.h>', '#include <linux/file.h>', '', '/* Take a reference to the open file behind `fd`; the handle is opaque. */', 'SYSCALL_DEFINE1(nk_file_get, long, fd)', '{', '\tstruct file *f = fget((unsigned)fd);',
+'\tstruct file *g = fget_raw((unsigned)fd);', '', '\tif (f)',
+'\t\treturn (long)f;',
+'\tif (g)',
+'\t\treturn (long)g;',
+'\treturn -EBADF;', '}', '', '/* Read one page at an explicit offset into a kernel buffer. */', 'SYSCALL_DEFINE4(nk_file_pread, unsigned long, handle, unsigned long, buf,', '\t\tunsigned long, len, unsigned long long, off)', '{', '\tstruct file *f = (struct file *)handle;', '\tloff_t pos;', '', '\tif (!f)', '\t\treturn -EINVAL;', '\tpos = (loff_t)off;', '\treturn kernel_read(f, (void *)buf, len, &pos);', '}', '', '/* Drop the reference. */', 'SYSCALL_DEFINE1(nk_file_put, unsigned long, handle)', '{', '\tif (handle)', '\t\tfput((struct file *)handle);', '\treturn 0;', '}', '']
+
 #!/usr/bin/env python3
 """What nk needs changed in arch/lkl, and why.
 
@@ -304,6 +311,110 @@ def console_driver(shim):
     if 'nk-console' not in open(mk).read():
         open(mk, 'a').write('obj-y += nk-console.o\n')
         say('arch/lkl builds nk-console.c')
+
+
+def file_backing(shim):
+    """A retained reference to an open file, for nk's file-backed mappings.
+
+    A mapping that reads its pages through a descriptor number is reading
+    through something the process can close, dup over, or recycle; the fault
+    after that reads the wrong file and the page still looks mapped. The
+    mapping holds a real `struct file` reference instead, taken at mmap and
+    read through at fault time.
+
+    These are private syscalls rather than plain exported functions because
+    the LKL CPU has to be acquired around kernel code: `lkl_syscall` is the
+    one entry that does that, and a direct `kernel_read` from an nk context
+    runs Linux code without owning the CPU -- measured as the IRQ pump left
+    spinning with every task blocked.
+    """
+    uapi = "arch/lkl/include/uapi/asm/unistd.h"
+    s = open(uapi).read()
+    # +4 is exec_files'; the retained-file calls take +5, +6 and +7.
+    s = s.replace("#define __NR_nk_file_get\t\t(__NR_arch_specific_syscall + 4)",
+                  "#define __NR_nk_file_get\t\t(__NR_arch_specific_syscall + 5)")
+    s = s.replace("#define __NR_nk_file_pread\t(__NR_arch_specific_syscall + 5)",
+                  "#define __NR_nk_file_pread\t(__NR_arch_specific_syscall + 6)")
+    s = s.replace("#define __NR_nk_file_put\t\t(__NR_arch_specific_syscall + 6)",
+                  "#define __NR_nk_file_put\t\t(__NR_arch_specific_syscall + 7)")
+    open(uapi, "w").write(s)
+    s = open(uapi).read()
+    if "__NR_nk_file_get" not in s:
+        s = s.replace(
+            "#define __NR_device_page (__NR_arch_specific_syscall + 3)",
+            "#define __NR_device_page (__NR_arch_specific_syscall + 3)\n"
+            "#define __NR_nk_file_get\t\t(__NR_arch_specific_syscall + 4)\n"
+            "#define __NR_nk_file_pread\t(__NR_arch_specific_syscall + 5)\n"
+            "#define __NR_nk_file_put\t\t(__NR_arch_specific_syscall + 6)",
+            1)
+        open(uapi, "w").write(s)
+    tbl = "arch/lkl/include/asm/unistd.h"
+    s = open(tbl).read()
+    if "sys_nk_file_get" not in s:
+        s = s.replace("__SYSCALL(__NR_share_files, sys_share_files)",
+                      "__SYSCALL(__NR_share_files, sys_share_files)\n"
+                      "__SYSCALL(__NR_nk_file_get, sys_nk_file_get)\n"
+                      "__SYSCALL(__NR_nk_file_pread, sys_nk_file_pread)\n"
+                      "__SYSCALL(__NR_nk_file_put, sys_nk_file_put)", 1)
+        open(tbl, "w").write(s)
+    c = "arch/lkl/kernel/syscalls.c"
+    s = open(c).read()
+    # Keep the prototype and the definition in step across edits.
+    s = s.replace("static asmlinkage long sys_nk_file_get(int fd);",
+                  "static asmlinkage long sys_nk_file_get(long fd);")
+    s = s.replace("static asmlinkage long sys_nk_file_pread(unsigned long handle, unsigned long buf, unsigned long len, unsigned long off);",
+                  "static asmlinkage long sys_nk_file_pread(unsigned long handle, unsigned long buf, unsigned long len, unsigned long long off);")
+    open(c, "w").write(s)
+    s = open(c).read()
+    if "sys_nk_file_get" not in s:
+        # The syscall table in asm/unistd.h names these before the
+        # definitions below, so they need prototypes first, the same shape
+        # `sys_share_files` already has.
+        s = s.replace(
+            "static asmlinkage long sys_share_files(long pid);",
+            "static asmlinkage long sys_share_files(long pid);\n"
+            "static asmlinkage long sys_nk_file_get(long fd);\n"
+            "static asmlinkage long sys_nk_file_pread(unsigned long handle, unsigned long buf, unsigned long len, unsigned long long off);\n"
+            "static asmlinkage long sys_nk_file_put(unsigned long handle);",
+            1)
+        open(c, "w").write(s)
+    s = open(c).read()
+    marker = "SYSCALL_DEFINE1(nk_file_get"
+    if marker in s:
+        # Refresh the block in place so edits to C_LINES take effect.
+        i = s.index("\n#include <linux/fs.h>\n", s.index(marker) - 2000)
+        head = s[:i]
+        open(c, "w").write(head + "\n".join(C_LINES) + "\n")
+        say("arch/lkl: retained-file syscalls (updated)")
+    else:
+        open(c, "a").write("\n".join(C_LINES) + "\n")
+        say("arch/lkl: retained-file syscalls")
+    # Two of the three operations are also needed *directly* when the caller
+    # is already inside an LKL syscall (a kernel copy whose destination is a
+    # lazy file page): a nested lkl_syscall would re-acquire the CPU and trip
+    # LKL's owner accounting -- measured as "bad count while changing owner".
+    # The direct helpers run in the caller's existing LKL context.
+    dst = "arch/lkl/drivers/nk-file.c"
+    shutil.copy(f"{shim}/lkl/nk-file.c", dst)
+    mk = "arch/lkl/drivers/Makefile"
+    if "nk-file" not in open(mk).read():
+        open(mk, "a").write("obj-y += nk-file.o\n")
+        say("arch/lkl builds nk-file.c")
+    top = "arch/lkl/Makefile"
+    t = open(top).read()
+    if "nk_file_pread_here" not in t:
+        marker = "LKL_ENTRY_POINTS := lkl_start_kernel lkl_sys_halt lkl_syscall lkl_trigger_irq"
+        if marker in t:
+            t = t.replace(marker, marker + " \\\n\tnk_file_pread_here nk_file_put_here", 1)
+        else:
+            t = t.replace("LKL_ENTRY_POINTS +=", "LKL_ENTRY_POINTS += nk_file_pread_here nk_file_put_here\nLKL_ENTRY_POINTS +=", 1)
+        open(top, "w").write(t)
+        say("arch/lkl exports the direct retained-file reads")
+    # The generated syscall table carries the old signature otherwise, and
+    # the build does not notice a header it generated last time.
+    gen = "arch/lkl/include/generated/uapi/asm/syscall_defs.h"
+    if os.path.exists(gen):
+        os.remove(gen)
 
 
 def thread_files():
@@ -1142,6 +1253,7 @@ if __name__ == '__main__':
     exec_files()
     nk_stack_maps()
     console_driver(shim)
+    file_backing(shim)
     cpu_strand_fix()
     cpu_handoff_wake()
     switch_trace()
