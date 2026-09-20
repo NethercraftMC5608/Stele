@@ -907,6 +907,30 @@ pub fn user_to_phys_write(va: u64) -> Option<u64> {
     Some((par & 0x0000_ffff_ffff_f000) | (va & 0xfff))
 }
 
+/// Whether the address space rooted at `root` maps `va` at all.
+/// Diagnostic: a switch into a space without the kernel's vectors freezes
+/// the machine the moment any exception is taken.
+pub fn mapped_with_root(root: u64, va: u64) -> bool {
+    // TTBR0 carries the ASID in bits 63:48; the table is below them.
+    let root = root & 0x0000_ffff_ffff_ffff;
+    unsafe {
+        let mut table = table_of(root) as *const u64;
+        for shift in [L0_SHIFT, L1_SHIFT, L2_SHIFT] {
+            let e = *table.add(((va >> shift) & 511) as usize);
+            if e & pte::VALID == 0 {
+                return false;
+            }
+            if pte::is_table(e) {
+                table = (e & ADDR) as *const u64;
+                continue;
+            }
+            return pte::is_block(e);
+        }
+        let e3 = *table.add(((va >> L3_SHIFT) & 511) as usize);
+        e3 & pte::VALID != 0
+    }
+}
+
 /// Whether the current address space has a translation for `va` at all,
 /// independent of what EL0 is allowed to do with it.
 ///

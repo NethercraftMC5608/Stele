@@ -1319,7 +1319,24 @@ pub fn schedule_on(cpu: usize) -> bool {
                 );
             }
             set_shadow(TASKS[next].shadow);
-            crate::arch::set_page_table(TASKS[next].ttbr0);
+            // A space without the kernel's vectors cannot take an exception:
+            // the vector fetch loops forever and the machine is gone.
+            // A task can still reference a space that was torn down (its
+            // L0 has been cleared). Switching to it freezes the machine:
+            // the first exception's vector fetch faults at level 0, and the
+            // entry faults again every time it is taken. Run such a task on
+            // the kernel's own space instead -- its user addresses fault
+            // visibly, which is a process failure rather than a dead
+            // machine -- and say so.
+            if !crate::paging::mapped_with_root(TASKS[next].ttbr0, 0x4008_0800) {
+                crate::println!(
+                    "  !! task {} ({}) has torn-down space {:#x}; running on the kernel's",
+                    next, TASKS[next].name, TASKS[next].ttbr0
+                );
+                crate::arch::set_page_table(crate::paging::kernel_address_space());
+            } else {
+                crate::arch::set_page_table(TASKS[next].ttbr0);
+            }
             crate::arch::set_tls(TASKS[next].tpidr);
             // On x86-64 the kernel stack a trap or syscall lands on is not a
             // register the CPU keeps per task: it is read from the TSS (for an
