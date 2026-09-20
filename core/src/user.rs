@@ -414,6 +414,20 @@ fn report_user_fault(frame: &Frame, esr: u64, ec: u64, far: u64) {
         Some(pa) => unsafe {
             let w = core::ptr::read_volatile(pa as *const u32);
             println!("   insn at pc: {:#010x}", w);
+            // Oracle: what the page around the fault actually contains.
+            match crate::paging::user_to_phys(frame.elr & !4095) {
+                Some(base) => {
+                    let mut bytes = [0u32; 8];
+                    for i in 0..8 {
+                        bytes[i] = core::ptr::read_volatile((base as *const u32).add(i));
+                    }
+                    println!(
+                        "   page at {:#x}: {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
+                        frame.elr & !4095, bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]
+                    );
+                }
+                None => println!("   page at {:#x}: not resident", frame.elr & !4095),
+            }
         },
         None => println!("   insn at pc: unreadable (pc unmapped for EL0)"),
     }
@@ -589,9 +603,12 @@ fn handle_syscall(frame: &mut Frame) {
             record_comm(frame.x[0], frame.x[1]);
         }
         let args: [u64; 6] = frame.x[..6].try_into().unwrap();
-        // The legacy x86-64 calls first: they have no number to forward to,
-        // only an `*at` form to be rewritten into. Everything else goes by
-        // number, which is what `forward` translates.
+        // A close that names a file mapping's pinned descriptor is not the
+        // program's to make: the number is nk's read reference. A bulk close
+        // that would sweep one is preceded by moving the pin out of range.
+        // The legacy x86-64 calls first: they have no number to forward
+        // to, only an `*at` form to be rewritten into. Everything else goes
+        // by number, which is what `forward` translates.
         match x86_legacy(frame.x[8], &args) {
             Some(rc) => rc,
             None => forward(frame.x[8], &args),
@@ -1331,8 +1348,11 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: i64, offset: u64,
             }
             return at as i64;
         }
-        // The table is full. Fall through and populate it the old way rather
-        // than refuse: slower and correct beats fast and wrong.
+        // No metadata, no mapping. Falling back to eager population here
+        // would silently change the memory policy of the mapping because a
+        // table was full -- and for a large library that is a frame
+        // exhaustion failure with no obvious cause.
+        return -12;
     }
 
     // Private file mappings are demand-paged the same way: the range and the
@@ -1356,7 +1376,7 @@ fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: i64, offset: u64,
             }
             return at as i64;
         }
-        // The table is full. Fall through and populate it the old way.
+        return -12;
     }
 
     let mut pages: Vec<*mut u8> = Vec::new();
@@ -2014,6 +2034,9 @@ extern "C" fn forked_entry(arg: usize) {
     // Copying descriptors is the process path only: a thread already has
     // its creator's table, and copying into it would duplicate every entry.
     let inherited = if as_process { crate::lkl::inherit_fds(f.parent_pid) } else { 3 };
+    // The child's descriptor table is a copy of the parent's, so the pins
+    // for file-backed mappings are in it too; its closes must answer for
+    // them the way the parent's do.
     // A child with the parent's 0, 1 and 2 has a console in exactly the way
     // the parent did, and saying otherwise is not a missing feature but a
     // wrong answer: nk's fallback writes descriptor 1 to the UART, so a
@@ -2470,7 +2493,9 @@ fn sys_mprotect(addr: u64, len: u64, prot: u64) -> i64 {
     // Reservations first: pages that have not been touched have nothing to
     // change, and the permissions they will be faulted in with are the only
     // record of this call that will survive to matter.
-    let reserved = crate::reserve::protect(addr, size, writable, exec, prot == 0);
+    let Some(reserved) = crate::reserve::protect(addr, size, writable, exec, prot == 0) else {
+        return -12;
+    };
     if prot == 0 {
         if unsafe { paging::protect_user_none(current_ttbr0(), addr, size) } {
             return 0;

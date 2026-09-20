@@ -84,6 +84,14 @@ pub struct Spinlock {
     next: AtomicU32,
     now: AtomicU32,
     owner: AtomicU32,
+    /// Return address of the last successful acquisition, for diagnosis.
+    owner_lr: AtomicU64,
+}
+
+fn caller_lr() -> u64 {
+    let lr: u64;
+    unsafe { core::arch::asm!("mov {}, x30", out(reg) lr, options(nomem, nostack)) };
+    lr
 }
 
 const LOCK_FREE: u32 = u32::MAX;
@@ -95,6 +103,7 @@ impl Spinlock {
             next: AtomicU32::new(0),
             now: AtomicU32::new(0),
             owner: AtomicU32::new(LOCK_FREE),
+            owner_lr: AtomicU64::new(0),
         }
     }
 
@@ -104,12 +113,14 @@ impl Spinlock {
             next: AtomicU32::new(0),
             now: AtomicU32::new(0),
             owner: AtomicU32::new(LOCK_FREE),
+            owner_lr: AtomicU64::new(0),
         }
     }
 
     /// Take the lock, masking interrupts across the hold.
     /// Returns the saved IRQ state for `unlock`.
     pub fn lock(&self) -> u64 {
+        let entry_lr = caller_lr();
         let flags = irq_save();
         let ticket = self.next.fetch_add(1, SeqCst);
         let mut spins = 0u32;
@@ -123,15 +134,18 @@ impl Spinlock {
             // whose cause has to be reconstructed from a dead stop.
             assert!(
                 spins < u32::MAX / 2,
-                "spinlock {} deadlock: ticket {} never served, serving {} (task {}; held by task {})",
+                "spinlock {} deadlock: ticket {} never served, serving {} (task {} taker_lr {:#x}; held by task {} lr {:#x})",
                 self.what,
                 ticket,
                 self.now.load(SeqCst),
                 crate::sched::current_id(),
-                self.owner.load(SeqCst)
+                entry_lr,
+                self.owner.load(SeqCst),
+                self.owner_lr.load(SeqCst)
             );
         }
         self.owner.store(crate::sched::current_id() as u32, SeqCst);
+        self.owner_lr.store(caller_lr(), SeqCst);
         crate::arch::memory_barrier();
         flags
     }
@@ -146,6 +160,7 @@ impl Spinlock {
     pub unsafe fn unlock(&self, flags: u64) {
         crate::arch::memory_barrier();
         self.owner.store(LOCK_FREE, SeqCst);
+        self.owner_lr.store(0, SeqCst);
         self.now.fetch_add(1, SeqCst);
         irq_restore(flags);
     }

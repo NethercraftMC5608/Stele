@@ -4,48 +4,123 @@
 //! whether or not the program ever looks at it. That is the simplest thing
 //! that works and it is what `MAP_NORESERVE` exists to say is wrong.
 //!
-//! WebKit is the first program here to care. Its allocator reserves address
-//! space in very large blocks -- 128MB at a time -- and commits a fraction of
-//! it. Populating those eagerly costs a frame per page of a region nothing
-//! reads, and the arena runs out long before the machine does: the failure
-//! is `mmapfail range len 0x8000000` with a gigabyte already spoken for.
-//!
 //! So a mapping is recorded here, with what backs it, and mapped nowhere.
 //! The first touch of each page faults, and `fault_in` puts a frame under it:
 //! a zeroed one for anonymous memory, one read from the file for a private
-//! file mapping. That is demand paging, and the table is the process's map
-//! of what its address space means -- resident pages are the kernel's, this
-//! is the promise behind them.
+//! file mapping. Resident pages are the kernel's; this table is the promise
+//! behind them.
+//!
+//! The records belong to the address space that made them, not to a global
+//! pool. A process with hundreds of mappings must not be able to exhaust the
+//! metadata every other process needs: the failure mode of a shared table is
+//! that the next `mmap` silently becomes a different kind of mapping.
 //!
 //! File pages are populated per address space: two processes mapping the same
 //! library each read their own copy on first touch. Sharing one copy between
 //! them is a page cache, and a page cache needs lifetime, partial-unmap and
-//! invalidation semantics that this table does not have yet. Until it does,
-//! not duplicating *untouched* pages is the property that matters.
+//! invalidation semantics that this structure does not have yet. Until it
+//! does, not duplicating *untouched* pages is the property that matters.
 
 use crate::frames;
 use crate::paging;
+use alloc::boxed::Box;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-const MAX: usize = 256;
+/// Address spaces with VMAs. Far above the processes a machine runs at once;
+/// a space's records are released the moment the space is destroyed.
+const MAX_SPACES: usize = 64;
+
+/// Ceiling on records in one address space. Reaching it is a refusal, never
+/// a change of mapping policy.
+const MAX_AREAS: usize = 65536;
 
 /// What turns a fault on a page into its contents.
 #[derive(Clone, Copy, PartialEq)]
 pub enum Backing {
     /// Zero-filled on first touch.
     Anonymous,
-    /// Read from `fd` at `offset + (page - area.start)` on first touch.
-    /// Each address space reads its own pages; see the module comment.
-    /// `dev`/`ino` identify the file the fd named at mmap time, so a page
-    /// can be named without a process-local descriptor.
-    FilePrivate { fd: i32, offset: u64, dev: u64, ino: u64 },
+    /// Read from the retained file at `offset + (page - area.start)` on
+    /// first touch. The reference belongs to the mapping, not to a
+    /// descriptor number: the process may close, dup over or recycle its
+    /// fd without the mapping changing what it reads.
+    FilePrivate { file: *mut FileBacking, offset: u64 },
+}
+
+/// A retained reference to an open file, shared by every VMA record that
+/// maps it. `refs` counts records, not processes, and every change to it
+/// happens under VMA_LOCK.
+pub struct FileBacking {
+    handle: *mut u8,
+    dev: u64,
+    ino: u64,
+    refs: u32,
+}
+
+/// One more record will point at this backing.
+unsafe fn backing_inc(b: &Backing) {
+    if let Backing::FilePrivate { file, .. } = b {
+        (*(*file)).refs += 1;
+    }
+}
+
+/// One record has stopped pointing at this backing; at zero the retained
+/// file reference is dropped and the record freed.
+unsafe fn backing_dec(b: &Backing) {
+    if let Backing::FilePrivate { file, .. } = b {
+        let fb = &mut **file;
+        fb.refs -= 1;
+        if fb.refs == 0 {
+            file_put(fb.handle);
+            drop(Box::from_raw(*file));
+        }
+    }
+}
+
+/// `__NR_arch_specific_syscall` (244) + 5, 6 and 7: the retained-file
+/// calls added to arch/lkl by patch-lkl.py. Private syscalls, so the LKL
+/// CPU is acquired around the kernel code exactly as for any other syscall.
+const NK_FILE_GET: i64 = 249;
+const NK_FILE_PREAD: i64 = 250;
+const NK_FILE_PUT: i64 = 251;
+
+fn file_get(fd: i32) -> *mut u8 {
+    let rc = crate::lkl::syscall(NK_FILE_GET, [fd as i64, 0, 0, 0, 0, 0]);
+    if rc <= 0 {
+        core::ptr::null_mut()
+    } else {
+        rc as *mut u8
+    }
+}
+
+extern "C" {
+    /// Direct helpers for callers already inside an LKL syscall: a nested
+    /// syscall would re-acquire the LKL CPU and trip its owner accounting.
+    fn nk_file_pread_here(handle: *mut u8, buf: *mut u8, len: usize, off: u64) -> i64;
+    fn nk_file_put_here(handle: *mut u8);
+}
+
+fn file_pread(handle: *mut u8, buf: *mut u8, len: usize, off: u64) -> i64 {
+    if crate::sched::in_user_syscall() {
+        unsafe { nk_file_pread_here(handle, buf, len, off) }
+    } else {
+        crate::lkl::syscall(
+            NK_FILE_PREAD,
+            [handle as i64, buf as i64, len as i64, off as i64, 0, 0],
+        )
+    }
+}
+
+fn file_put(handle: *mut u8) {
+    if crate::sched::in_user_syscall() {
+        unsafe { nk_file_put_here(handle) };
+    } else {
+        let _ = crate::lkl::syscall(NK_FILE_PUT, [handle as i64, 0, 0, 0, 0, 0]);
+    }
 }
 
 #[derive(Clone, Copy)]
 struct VmArea {
-    /// The address space this belongs to, so threads sharing one see the
-    /// same areas and two processes at the same address do not.
-    space: u64,
     start: u64,
     end: u64,
     writable: bool,
@@ -53,23 +128,27 @@ struct VmArea {
     /// PROT_NONE: backed, but unreachable from user space.
     none: bool,
     backing: Backing,
-    live: bool,
 }
 
-static mut VMAS: [VmArea; MAX] = [VmArea {
-    space: 0,
-    start: 0,
-    end: 0,
-    writable: false,
-    exec: false,
-    none: false,
-    backing: Backing::Anonymous,
-    live: false,
-}; MAX];
+/// One address space's map, sorted by `start` so lookup is a binary search.
+struct VmMap {
+    areas: Vec<VmArea>,
+}
 
-/// Pages faulted in, by backing, and the bytes handed over doing it. Global
-/// and monotonic: the watchdog prints them next to the frame count, which is
-/// what shows whether demand paging is doing what it claims.
+#[derive(Clone, Copy)]
+struct MapEntry {
+    space: u64,
+    map: *mut VmMap,
+}
+
+/// Serializes every VMA table change. Never held across page population:
+/// callers take a copy of the area they need and release the lock before any
+/// file I/O (see `fault_in`).
+static VMA_LOCK: crate::sync::Spinlock = crate::sync::Spinlock::named("VMA");
+
+static mut MAPS: [Option<MapEntry>; MAX_SPACES] = [None; MAX_SPACES];
+
+/// Pages faulted in, by backing, and the bytes handed over doing it.
 static ANON_FAULTS: AtomicU64 = AtomicU64::new(0);
 static FILE_FAULTS: AtomicU64 = AtomicU64::new(0);
 static FAULT_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -78,56 +157,93 @@ fn space() -> u64 {
     paging::table_of(crate::arch::current_page_table())
 }
 
-fn insert(area: VmArea) -> bool {
-    unsafe {
-        let r = &mut *(&raw mut VMAS);
-        match r.iter_mut().find(|s| !s.live) {
-            Some(slot) => {
-                *slot = area;
-                true
+/// Run `f` on the calling space's map. With `create`, a space with no map yet
+/// gets one; `None` from this function is always "no resources".
+fn with_map<R>(space: u64, create: bool, f: impl FnOnce(&mut VmMap) -> R) -> Option<R> {
+    let g = VMA_LOCK.lock();
+    let result = unsafe {
+        let maps = &mut *(&raw mut MAPS);
+        let idx = match maps.iter().position(|m| matches!(m, Some(e) if e.space == space)) {
+            Some(i) => i,
+            None => {
+                if !create {
+                    VMA_LOCK.unlock(g);
+                    return None;
+                }
+                let Some(free) = maps.iter().position(|m| m.is_none()) else {
+                    VMA_LOCK.unlock(g);
+                    return None;
+                };
+                let map = Box::into_raw(Box::new(VmMap { areas: Vec::new() }));
+                maps[free] = Some(MapEntry { space, map });
+                free
             }
-            None => false,
-        }
-    }
+        };
+        let map = &mut *maps[idx].as_ref().unwrap().map;
+        Some(f(map))
+    };
+    unsafe { VMA_LOCK.unlock(g) };
+    result
 }
 
-/// Record a range as reserved but unmapped. False when the table is full,
-/// which the caller must treat as a refusal rather than ignore: a
-/// reservation nobody recorded is a segfault on first touch.
+/// The last area starting at or before `page`, if it covers it.
+fn find(areas: &[VmArea], page: u64) -> Option<&VmArea> {
+    let idx = match areas.binary_search_by(|a| a.start.cmp(&page)) {
+        Ok(i) => i,
+        Err(0) => return None,
+        Err(i) => i - 1,
+    };
+    let a = &areas[idx];
+    (page >= a.start && page < a.end).then_some(a)
+}
+
+fn overlaps(a: &VmArea, start: u64, end: u64) -> bool {
+    a.start < end && start < a.end
+}
+
+fn insert_sorted(areas: &mut Vec<VmArea>, area: VmArea) -> bool {
+    if areas.len() >= MAX_AREAS {
+        return false;
+    }
+    let idx = match areas.binary_search_by(|a| a.start.cmp(&area.start)) {
+        Ok(i) | Err(i) => i,
+    };
+    areas.insert(idx, area);
+    true
+}
+
+/// Record a range as reserved but unmapped. False is a refusal the caller
+/// must report: a mapping with no record faults with nothing behind it.
 pub fn add(start: u64, len: u64, writable: bool, exec: bool, none: bool) -> bool {
     add_backed(start, len, writable, exec, none, Backing::Anonymous)
 }
 
-/// Record a private file mapping: pages are read from `fd` on first touch.
-///
-/// The mapping outlives the descriptor it was made from -- a loader maps a
-/// library and closes the fd, and the fault that reads its pages comes much
-/// later -- so one reference is pinned with `dup` and the area reads through
-/// that. Like Linux's `struct file` held by an mmap, it is not released when
-/// the area is trimmed or split: the process exit closes it with every other
-/// descriptor, and an fd number stays valid for the life of the process.
+/// Record a private file mapping: pages are read from the retained file on
+/// first touch. The reference is taken here and lives as long as any VMA
+/// record maps the file -- the caller may close its descriptor immediately,
+/// which is what mmap callers do.
 pub fn add_file(start: u64, len: u64, writable: bool, exec: bool, fd: i32, offset: u64) -> bool {
     #[cfg(nk_lkl)]
     {
-        let owned = crate::lkl::syscall(23, [fd as i64, 0, 0, 0, 0, 0]);
-        if owned < 0 {
+        let handle = file_get(fd);
+        if handle.is_null() {
             return false;
         }
-        let (dev, ino) = fstat_identity(owned as i32).unwrap_or((0, 0));
+        let (dev, ino) = fstat_identity(fd).unwrap_or((0, 0));
+        let file = Box::into_raw(Box::new(FileBacking { handle, dev, ino, refs: 1 }));
         let area = VmArea {
-            space: space(),
             start,
             end: start + len,
             writable,
             exec,
             none: false,
-            backing: Backing::FilePrivate { fd: owned as i32, offset, dev, ino },
-            live: true,
+            backing: Backing::FilePrivate { file, offset },
         };
-        if !insert(area) {
-            return false;
+        if with_map(space(), true, |m| insert_sorted(&mut m.areas, area)).unwrap_or(false) {
+            return true;
         }
-        true
+        unsafe { backing_dec(&area.backing) };
+        false
     }
     #[cfg(not(nk_lkl))]
     {
@@ -136,18 +252,72 @@ pub fn add_file(start: u64, len: u64, writable: bool, exec: bool, fd: i32, offse
     }
 }
 
+pub fn add_backed(
+    start: u64,
+    len: u64,
+    writable: bool,
+    exec: bool,
+    none: bool,
+    backing: Backing,
+) -> bool {
+    let area = VmArea { start, end: start + len, writable, exec, none, backing };
+    if with_map(space(), true, |m| insert_sorted(&mut m.areas, area)).unwrap_or(false) {
+        unsafe { backing_inc(&area.backing) };
+        true
+    } else {
+        false
+    }
+}
 
-pub fn add_backed(start: u64, len: u64, writable: bool, exec: bool, none: bool, backing: Backing) -> bool {
-    insert(VmArea {
-        space: space(),
-        start,
-        end: start + len,
-        writable,
-        exec,
-        none,
-        backing,
-        live: true,
-    })
+/// Forget any record overlapping this range, keeping the parts outside it.
+/// Built as a new list and committed only when it is complete: a refused
+/// split leaves the original mapping exactly as it was.
+pub fn forget(start: u64, len: u64) {
+    let end = start + len;
+    let old = with_map(space(), false, |m| {
+        let mut out: Vec<VmArea> = Vec::new();
+        if out.try_reserve(m.areas.len() + 2).is_err() {
+            return None;
+        }
+        for a in &m.areas {
+            if !overlaps(a, start, end) {
+                out.push(*a);
+                continue;
+            }
+            if start <= a.start && a.end <= end {
+                continue; // wholly removed
+            }
+            if start <= a.start {
+                let mut tail = *a;
+                shift_front(&mut tail, end);
+                out.push(tail);
+                continue;
+            }
+            if a.end <= end {
+                let mut head = *a;
+                head.end = start;
+                out.push(head);
+                continue;
+            }
+            let mut head = *a;
+            head.end = start;
+            out.push(head);
+            let mut tail = *a;
+            shift_front(&mut tail, end);
+            out.push(tail);
+        }
+        for a in &out {
+            unsafe { backing_inc(&a.backing) };
+        }
+        Some(core::mem::replace(&mut m.areas, out))
+    }).flatten();
+    // The file references the replaced records held are dropped outside the
+    // lock: `nk_file_put` is an LKL call and is allowed to block.
+    if let Some(old) = old {
+        for a in &old {
+            unsafe { backing_dec(&a.backing) };
+        }
+    }
 }
 
 /// Move an area's front edge forward, carrying a file backing's offset with
@@ -159,195 +329,158 @@ fn shift_front(a: &mut VmArea, new_start: u64) {
     a.start = new_start;
 }
 
-/// Forget any reservation overlapping this range, keeping the parts outside
-/// it. Pages already faulted in are ordinary mappings and are freed by the
-/// caller's own unmap.
-pub fn forget(start: u64, len: u64) {
-    let here = space();
-    let end = start + len;
-    unsafe {
-        let r = &mut *(&raw mut VMAS);
-        for i in 0..MAX {
-            if !(r[i].live && r[i].space == here && r[i].start < end && start < r[i].end) {
-                continue;
-            }
-            let (lo, hi) = (r[i].start, r[i].end);
-            if start <= lo && hi <= end {
-                r[i].live = false;
-                continue;
-            }
-            if start <= lo {
-                shift_front(&mut r[i], end);
-                continue;
-            }
-            if hi <= end {
-                r[i].end = start;
-                continue;
-            }
-            // The range removed sits inside the area: the tail keeps the
-            // promise, with its file offset moved by the same amount.
-            let old = r[i];
-            r[i].end = start;
-            let mut tail = old;
-            shift_front(&mut tail, end);
-            if !insert(tail) {
-                // No record for the tail. Keeping the whole area is the safe
-                // failure: it over-reserves the removed range, which costs
-                // address space, while dropping the tail would turn a later
-                // touch into a fault with no promise behind it.
-                r[i] = old;
-                crate::println!("  reserve: table full; kept a split area whole");
-            }
-        }
-    }
-}
-
-/// Give a new address space the reservations of the one it was copied from.
-///
-/// `fork` copies pages, and a reservation has none: it is a promise that a
-/// range will get one on first touch. Without carrying the promise across,
-/// the child faults on the first byte of an arena its parent could use.
+/// Give a new address space the records of the one it was copied from.
+/// `fork` copies pages, and a promise is not a page: without the records the
+/// child faults on the first byte of an arena its parent could use.
 pub fn inherit(parent: u64, child: u64) {
+    let g = VMA_LOCK.lock();
     unsafe {
-        let r = &mut *(&raw mut VMAS);
-        for i in 0..MAX {
-            if !(r[i].live && r[i].space == parent) {
-                continue;
+        let maps = &mut *(&raw mut MAPS);
+        let idx = maps.iter().position(|m| matches!(m, Some(e) if e.space == parent));
+        let Some(idx) = idx else {
+            VMA_LOCK.unlock(g);
+            return;
+        };
+        let src_len = (*maps[idx].as_ref().unwrap().map).areas.len();
+        let kid = match maps.iter().position(|m| matches!(m, Some(e) if e.space == child)) {
+            Some(i) => i,
+            None => {
+                let Some(free) = maps.iter().position(|m| m.is_none()) else {
+                    VMA_LOCK.unlock(g);
+                    return;
+                };
+                let map = Box::into_raw(Box::new(VmMap { areas: Vec::new() }));
+                maps[free] = Some(MapEntry { space: child, map });
+                free
             }
-            let mut copy = r[i];
-            copy.space = child;
-            match r.iter_mut().find(|s| !s.live) {
-                Some(slot) => *slot = copy,
-                // Out of slots: the child simply has one fewer reservation
-                // than its parent, and faults there as it would have before
-                // MAP_NORESERVE was honoured at all.
-                None => return,
+        };
+        if kid == idx {
+            VMA_LOCK.unlock(g);
+            return;
+        }
+        let parent_map = &*maps[idx].as_ref().unwrap().map;
+        let kid_map = &mut *maps[kid].as_ref().unwrap().map;
+        if kid_map.areas.try_reserve(src_len).is_err() {
+            VMA_LOCK.unlock(g);
+            return;
+        }
+        for i in 0..src_len {
+            if kid_map.areas.len() >= MAX_AREAS {
+                break;
             }
+            let area = parent_map.areas[i];
+            let at = match kid_map.areas.binary_search_by(|a| a.start.cmp(&area.start)) {
+                Ok(i) | Err(i) => i,
+            };
+            kid_map.areas.insert(at, area);
+            unsafe { backing_inc(&area.backing) };
         }
     }
+    unsafe { VMA_LOCK.unlock(g) };
 }
 
-/// Change the permissions a reservation will fault pages in with.
-///
-/// `mprotect` on a range that has never been touched has no pages to change,
-/// and a reservation that does not hear about it goes on handing out pages
-/// with the permissions the mapping was made with. A loader that reserves
-/// read-write and then makes a slice of it executable got exactly that: the
-/// first instruction fetched from the new range faulted, on a page nk had
-/// just mapped non-executable on its behalf.
-///
-/// Returns whether any reservation covered part of the range -- which is how
-/// `mprotect` tells "nothing there" from "nothing there *yet*".
-pub fn protect(start: u64, len: u64, writable: bool, exec: bool, none: bool) -> bool {
-    let here = space();
+/// Change the permissions future faults will use. Returns `None` when the
+/// new records cannot be allocated -- the original map is untouched then.
+pub fn protect(start: u64, len: u64, writable: bool, exec: bool, none: bool) -> Option<bool> {
     let end = start + len;
-    let mut touched = false;
-    unsafe {
-        let r = &mut *(&raw mut VMAS);
-        for i in 0..MAX {
-            if !(r[i].live && r[i].space == here && r[i].start < end && start < r[i].end) {
+    // A space with no records at all has nothing to change permissions for:
+    // that is "touched nothing", not a failure. ld.so's first mprotect --
+    // RELRO on an image nk mapped itself -- arrives before any mmap.
+    if with_map(space(), false, |_| ()).is_none() {
+        return Some(false);
+    }
+    let r = with_map(space(), false, |m| {
+        let mut out: Vec<VmArea> = Vec::new();
+        if out.try_reserve(m.areas.len() + 2).is_err() {
+            return None;
+        }
+        let mut touched = false;
+        for a in &m.areas {
+            if !overlaps(a, start, end) {
+                out.push(*a);
                 continue;
             }
             touched = true;
-            let (lo, hi) = (r[i].start, r[i].end);
-            // The overlap takes the new permissions; whatever of the
-            // reservation lies outside it keeps the old ones, as its own
-            // record. Out of records, the whole reservation changes -- which
-            // is too permissive on the edges and still better than a range
-            // that faults.
-            let head = if lo < start { Some((lo, start)) } else { None };
-            let tail = if end < hi { Some((end, hi)) } else { None };
-            let old = r[i];
-            r[i].start = lo.max(start);
-            r[i].end = hi.min(end);
-            r[i].writable = writable;
-            r[i].exec = exec;
-            r[i].none = none;
-            for piece in [head, tail].into_iter().flatten() {
-                match r.iter_mut().find(|s| !s.live) {
-                    Some(slot) => {
-                        *slot = old;
-                        slot.start = piece.0;
-                        slot.end = piece.1;
-                        if piece.0 != old.start {
-                            // A file-backed piece past the new edge names a
-                            // later byte of the same file.
-                            if let Backing::FilePrivate { offset, .. } = &mut slot.backing {
-                                *offset += piece.0 - old.start;
-                            }
-                        }
-                    }
-                    None => {
-                        r[i].start = lo;
-                        r[i].end = hi;
-                    }
+            if a.start < start {
+                let mut head = *a;
+                head.end = start;
+                out.push(head);
+            }
+            let mut mid = *a;
+            mid.start = a.start.max(start);
+            mid.end = a.end.min(end);
+            mid.writable = writable;
+            mid.exec = exec;
+            mid.none = none;
+            if mid.start != a.start {
+                if let Backing::FilePrivate { offset, .. } = &mut mid.backing {
+                    *offset += mid.start - a.start;
                 }
             }
+            out.push(mid);
+            if end < a.end {
+                let mut tail = *a;
+                shift_front(&mut tail, end);
+                out.push(tail);
+            }
         }
-    }
-    touched
+        for a in &out {
+            unsafe { backing_inc(&a.backing) };
+        }
+        Some((touched, core::mem::replace(&mut m.areas, out)))
+    }).flatten();
+    let r = r.map(|(touched, old)| {
+        for a in &old {
+            unsafe { backing_dec(&a.backing) };
+        }
+        touched
+    });
+    r
 }
 
-/// Where an address sits relative to this space's reservations.
-///
-/// Returns `(inside, last_end, next_start, live)`: whether a reservation
-/// covers it, the end of the nearest one below, the start of the nearest one
-/// above, and how many are live. The fault reporter prints this because
-/// "unmapped" and "reserved but not yet faulted in" produce the identical
-/// translation fault, and the difference is the whole diagnosis.
+/// Where an address sits relative to this space's records. Printed by the
+/// fault reporter: "unmapped" and "reserved but not yet faulted in" produce
+/// the identical translation fault, and the difference is the diagnosis.
 pub fn describe(addr: u64) -> (bool, u64, u64, usize) {
-    let here = space();
     let page = addr & !4095;
-    let (mut inside, mut below, mut above, mut live) = (false, 0u64, u64::MAX, 0usize);
-    unsafe {
-        for s in (*(&raw const VMAS)).iter() {
-            if !(s.live && s.space == here) {
-                continue;
+    with_map(space(), false, |m| {
+        let (mut below, mut above) = (0u64, u64::MAX);
+        for a in &m.areas {
+            if a.end <= page && a.end > below {
+                below = a.end;
             }
-            live += 1;
-            if page >= s.start && page < s.end {
-                inside = true;
-            }
-            if s.end <= page && s.end > below {
-                below = s.end;
-            }
-            if s.start > page && s.start < above {
-                above = s.start;
+            if a.start > page && a.start < above {
+                above = a.start;
             }
         }
-    }
-    (inside, below, if above == u64::MAX { 0 } else { above }, live)
+        let inside = find(&m.areas, page).is_some();
+        (inside, below, if above == u64::MAX { 0 } else { above }, m.areas.len())
+    })
+    .unwrap_or((false, 0, 0, 0))
 }
 
-/// The area covering exactly this range, if one does, with its backing.
-///
-/// `mremap` needs it: growing a private mapping means growing the promise
-/// behind it, and the new range has to carry the same permissions and the
-/// same backing as the old one rather than a guess.
+/// The area covering exactly this range, with its backing.
 pub fn covering(start: u64, len: u64) -> Option<(bool, bool, bool, Backing)> {
-    let here = space();
     let end = start + len;
-    unsafe {
-        (*(&raw const VMAS))
+    with_map(space(), false, |m| {
+        m.areas
             .iter()
-            .find(|s| s.live && s.space == here && s.start <= start && end <= s.end)
-            .map(|s| (s.writable, s.exec, s.none, s.backing))
-    }
+            .find(|a| a.start <= start && end <= a.end)
+            .map(|a| (a.writable, a.exec, a.none, a.backing))
+    })
+    .flatten()
 }
 
-/// How many reservations are live and how much address space they cover,
-/// then what demand paging has served so far.
+/// Live records and address space for this space, then the fault counters.
 pub fn report() {
-    let here = space();
-    let (mut n, mut bytes) = (0usize, 0u64);
-    unsafe {
-        for s in (*(&raw const VMAS)).iter() {
-            if s.live && s.space == here {
-                n += 1;
-                bytes += s.end - s.start;
-            }
+    let (n, bytes) = with_map(space(), false, |m| {
+        let mut bytes = 0u64;
+        for a in &m.areas {
+            bytes += a.end - a.start;
         }
-    }
+        (m.areas.len(), bytes)
+    })
+    .unwrap_or((0, 0));
     crate::println!("  reservations: {} live, {} MiB of address space", n, bytes >> 20);
     let (anon, file, fault_bytes) = (
         ANON_FAULTS.load(Ordering::Relaxed),
@@ -362,196 +495,27 @@ pub fn report() {
     );
 }
 
-/// Drop every reservation belonging to an address space that is going away.
+/// Drop every record belonging to an address space that is going away.
 pub fn forget_space(table: u64) {
-    unsafe {
-        for s in (*(&raw mut VMAS)).iter_mut() {
-            if s.live && s.space == table {
-                s.live = false;
-            }
-        }
-    }
-}
-
-/// Read one page of `fd` at `offset` into `frame`. EOF leaves the rest of
-/// the frame as it was (the caller zeroed it), which is what the tail of a
-/// mapping that ends mid-page must read as. False is a read error the caller
-/// turns into a process-visible fault -- never a partially filled page.
-fn read_page(fd: i32, offset: u64, frame: *mut u8) -> bool {
-    #[cfg(nk_lkl)]
-    {
-        #[repr(C)]
-        struct IoVec {
-            base: u64,
-            len: u64,
-        }
-        let mut done = 0u64;
-        while done < 4096 {
-            let mut iov = IoVec {
-                base: frame as u64 + done,
-                len: 4096 - done,
-            };
-            // 69 is preadv: one page, one iovec, at the file offset the page
-            // is backed by. Short reads are retried at the new offset; a
-            // zero-length read is EOF and leaves the tail zeroed.
-            // The iovec and its base are kernel addresses (a frame from the
-            // identity map), but this read can run *inside* another syscall
-            // -- a kernel copy whose destination is a lazy file page. With
-            // `user_syscall` set, nk's shim resolves those pointers as user
-            // addresses, cannot translate the frame, and the preadv comes
-            // back -EFAULT. The same shape as `futex`'s kernel buffer: say
-            // so around the call.
-            let was = crate::sched::set_user_syscall(false);
-            let rc = crate::lkl::syscall(
-                69,
-                [fd as i64, &mut iov as *mut IoVec as i64, 1, (offset + done) as i64, 0, 0],
-            );
-            crate::sched::set_user_syscall(was);
-            if rc < 0 {
-                return false;
-            }
-            if rc == 0 {
-                break;
-            }
-            done += rc as u64;
-        }
-        true
-    }
-    #[cfg(not(nk_lkl))]
-    {
-        let _ = (fd, offset, frame);
-        false
-    }
-}
-
-/// The syscall the page-in trampoline raises. Not a Linux number: it is
-/// intercepted before any dispatch table is consulted.
-pub const PAGEIN_SYSCALL: u64 = 0x4E4B_5049_4E00; // "NKPIN"
-
-/// One outstanding file-backed page fault, saved by the abort handler and
-/// completed from the SVC path. The frame is the complete EL0 context to
-/// restore; the area is kernel metadata, re-validated on completion.
-#[derive(Clone, Copy)]
-struct PendingFault {
-    page: u64,
-    area: VmArea,
-    frame: crate::user::Frame,
-}
-
-static mut PENDING: [Option<PendingFault>; crate::sched::MAX_TASKS] =
-    [None; crate::sched::MAX_TASKS];
-
-/// Save the frame and redirect ELR at the page-in trampoline.
-///
-/// Called from the abort handler only, and only for file-backed pages. The
-/// handler itself never reads the file: entering LKL from the abort path is
-/// not the syscall path, and the difference is observable (a demand read
-/// there breaks Weston's DRM discovery while the identical read from SVC
-/// context works). Returns false when this is not a file fault, so the
-/// caller can fall back to synchronous handling.
-pub fn defer_file_fault(frame: &mut crate::user::Frame, addr: u64) -> bool {
-    let here = space();
-    let page = addr & !4095;
-    let area = unsafe {
-        match (*(&raw const VMAS))
-            .iter()
-            .find(|s| s.live && s.space == here && page >= s.start && page < s.end)
-        {
-            Some(s) => *s,
-            None => return false,
+    let g = VMA_LOCK.lock();
+    let taken = unsafe {
+        let maps = &mut *(&raw mut MAPS);
+        if let Some(i) = maps.iter().position(|m| matches!(m, Some(e) if e.space == table)) {
+            maps[i].take()
+        } else {
+            None
         }
     };
-    if !matches!(area.backing, Backing::FilePrivate { .. }) {
-        return false;
-    }
-    if paging::user_resident(page) {
-        return false;
-    }
-    let me = crate::sched::current_id();
-    if me >= crate::sched::MAX_TASKS {
-        return false;
-    }
-    unsafe {
-        if (*(&raw const PENDING))[me].is_some() {
-            // One outstanding synchronous fault per task. A second one
-            // before the first completes is a bug; let the normal fault
-            // path deal with the process rather than overwrite the frame.
-            return false;
+    unsafe { VMA_LOCK.unlock(g) };
+    if let Some(e) = taken {
+        let map = unsafe { Box::from_raw(e.map) };
+        for a in &map.areas {
+            unsafe { backing_dec(&a.backing) };
         }
-        (*(&raw mut PENDING))[me] = Some(PendingFault { page, area, frame: *frame });
+        drop(map);
     }
-    frame.x[8] = PAGEIN_SYSCALL;
-    frame.elr = crate::user::TRAMPOLINE_VA;
-    true
 }
 
-/// Complete the pending file-backed page fault for the calling task, from
-/// the ordinary SVC path. Re-validates everything from kernel state: the
-/// trampoline contributes no arguments.
-pub fn complete_file_fault(frame: &mut crate::user::Frame) -> bool {
-    let me = crate::sched::current_id();
-    if me >= crate::sched::MAX_TASKS {
-        return false;
-    }
-    let pending = match unsafe { (*(&raw mut PENDING))[me].take() } {
-        Some(p) => p,
-        None => return false,
-    };
-    // A task that exec'd between fault and SVC would otherwise page in a
-    // stale address space's VMA.
-    if pending.area.space != space() {
-        return false;
-    }
-    if !paging::user_resident(pending.page)
-        && !populate(&pending.area, pending.page)
-    {
-        return false;
-    }
-    // Back to the faulting instruction, with the registers it had.
-    *frame = pending.frame;
-    true
-}
-
-/// Put a page under `addr` if it falls in a reservation.
-///
-/// Called from the EL0 fault handler before it decides the process is at
-/// fault. Returns whether the fault was handled, in which case the
-/// instruction is retried and the program never learns anything happened.
-pub fn fault_in(addr: u64) -> bool {
-    let here = space();
-    let page = addr & !4095;
-    let area = unsafe {
-        match (*(&raw const VMAS))
-            .iter()
-            .find(|s| s.live && s.space == here && page >= s.start && page < s.end)
-        {
-            Some(s) => *s,
-            None => return false,
-        }
-    };
-    // A page that is already mapped is not a missing page: this fault is
-    // about permission, and replacing the frame would throw away what the
-    // program wrote there. Let the fault reporter decide. The test reads the
-    // tables, not `AT S1E0R`: that applies EL0 read permission, under which
-    // a resident execute-only page looks unmapped.
-    if paging::user_resident(page) {
-        return false;
-    }
-    // A file-backed page touched at EL0 goes through the trampoline: the
-    // abort path must not read the file (the read belongs to the syscall
-    // path, see `defer_file_fault`). The same backing arrived at from
-    // uaccess -- a syscall's kernel-side copy into a page of a file mapping
-    // -- is already inside that syscall, so populating here is the same
-    // context the eager path uses. `in_user_syscall` is exactly that
-    // distinction.
-    if matches!(area.backing, Backing::FilePrivate { .. }) && !crate::sched::in_user_syscall() {
-        return false;
-    }
-    populate(&area, page)
-}
-
-/// Fill one page of `area` and map it. Shared by the fault path and the
-/// prefault mode so the A/B differs only in which context calls it.
 fn fstat_identity(fd: i32) -> Option<(u64, u64)> {
     #[cfg(nk_lkl)]
     {
@@ -571,10 +535,145 @@ fn fstat_identity(fd: i32) -> Option<(u64, u64)> {
     }
 }
 
+/// Read one page of `fd` at `offset` into `frame`. EOF leaves the rest of
+/// the frame as it was (the caller zeroed it), which is what the tail of a
+/// mapping that ends mid-page must read as. False is a read error the caller
+/// turns into a process-visible fault -- never a partially filled page.
+fn read_page(file: *mut FileBacking, offset: u64, frame: *mut u8) -> bool {
+    #[cfg(nk_lkl)]
+    {
+        let handle = unsafe { (*file).handle };
+        let mut done = 0u64;
+        while done < 4096 {
+            let rc = file_pread(
+                handle,
+                (frame as u64 + done) as *mut u8,
+                4096 - done as usize,
+                offset + done,
+            );
+            if rc < 0 {
+                return false;
+            }
+            if rc == 0 {
+                break;
+            }
+            done += rc as u64;
+        }
+        true
+    }
+    #[cfg(not(nk_lkl))]
+    {
+        let _ = (file, offset, frame);
+        false
+    }
+}
+
+/// The syscall the page-in trampoline raises. Not a Linux number: it is
+/// intercepted before any dispatch table is consulted.
+pub const PAGEIN_SYSCALL: u64 = 0x4E4B_5049_4E00; // "NKPIN"
+
+/// One outstanding file-backed page fault, saved by the abort handler and
+/// completed from the SVC path.
+#[derive(Clone, Copy)]
+struct PendingFault {
+    space: u64,
+    page: u64,
+    area: VmArea,
+    frame: crate::user::Frame,
+}
+
+static mut PENDING: [Option<PendingFault>; crate::sched::MAX_TASKS] =
+    [None; crate::sched::MAX_TASKS];
+
+/// Save the frame and redirect ELR at the page-in trampoline. Called from the
+/// abort handler only, and only for file-backed pages. Returns false when
+/// this is not a file fault, so the caller can fall back to nearby handling.
+pub fn defer_file_fault(frame: &mut crate::user::Frame, addr: u64) -> bool {
+    let page = addr & !4095;
+    let area = with_map(space(), false, |m| find(&m.areas, page).copied()).flatten();
+    let Some(area) = area else {
+        return false;
+    };
+    if !matches!(area.backing, Backing::FilePrivate { .. }) {
+        return false;
+    }
+    if paging::user_resident(page) {
+        return false;
+    }
+    let me = crate::sched::current_id();
+    if me >= crate::sched::MAX_TASKS {
+        return false;
+    }
+    unsafe {
+        if (*(&raw const PENDING))[me].is_some() {
+            return false;
+        }
+        (*(&raw mut PENDING))[me] = Some(PendingFault { space: space(), page, area, frame: *frame });
+    }
+    frame.x[8] = PAGEIN_SYSCALL;
+    frame.elr = crate::user::TRAMPOLINE_VA;
+    true
+}
+
+/// Complete the pending file-backed page fault for the calling task, from
+/// the ordinary SVC path. Re-validates everything from kernel state.
+pub fn complete_file_fault(frame: &mut crate::user::Frame) -> bool {
+    let me = crate::sched::current_id();
+    if me >= crate::sched::MAX_TASKS {
+        return false;
+    }
+    let pending = match unsafe { (*(&raw mut PENDING))[me].take() } {
+        Some(p) => p,
+        None => return false,
+    };
+    // A task that exec'd between fault and SVC would otherwise page in a
+    // stale address space's VMA.
+    if pending.space != space() {
+        static A: AtomicU64 = AtomicU64::new(0);
+        if A.fetch_add(1, Ordering::Relaxed) < 8 { crate::println!("  pagein: space changed"); }
+        return false;
+    }
+    if !paging::user_resident(pending.page) && !populate(&pending.area, pending.page) {
+        static B: AtomicU64 = AtomicU64::new(0);
+        if B.fetch_add(1, Ordering::Relaxed) < 8 { crate::println!("  pagein: populate failed"); }
+        return false;
+    }
+    *frame = pending.frame;
+    true
+}
+
+/// Put a page under `addr` if it falls in a recorded area.
+///
+/// Called from the EL0 fault handler and from uaccess, before either decides
+/// the process is at fault. Returns whether the fault was handled, in which
+/// case the instruction is retried and the program never learns anything
+/// happened.
+pub fn fault_in(addr: u64) -> bool {
+    let page = addr & !4095;
+    let area = with_map(space(), false, |m| find(&m.areas, page).copied()).flatten();
+    let Some(area) = area else {
+        return false;
+    };
+    // A page that is already mapped is not a missing page: this fault is
+    // about permission. The test reads the tables, not `AT S1E0R`: that
+    // applies EL0 read permission, under which a resident execute-only page
+    // looks unmapped.
+    if paging::user_resident(page) {
+        return false;
+    }
+    // A file-backed page touched at EL0 goes through the trampoline: the
+    // abort path must not read the file. The same backing arrived at from
+    // uaccess -- a syscall's kernel-side copy into a page of a file mapping
+    // -- is already inside that syscall, so populating here is the same
+    // context the eager path uses.
+    if matches!(area.backing, Backing::FilePrivate { .. }) && !crate::sched::in_user_syscall() {
+        return false;
+    }
+    populate(&area, page)
+}
+
+/// Fill one page of `area` and map it.
 fn populate(area: &VmArea, page: u64) -> bool {
-    // alloc() zeroes, which is what an anonymous page must read as, and what
-    // the tail of a short file read keeps reading as. Out of memory here is
-    // a real refusal: say no rather than map something else.
     let Some(frame) = frames::alloc() else {
         return false;
     };
@@ -582,12 +681,12 @@ fn populate(area: &VmArea, page: u64) -> bool {
         Backing::Anonymous => {
             ANON_FAULTS.fetch_add(1, Ordering::Relaxed);
         }
-        Backing::FilePrivate { fd, offset, dev, ino } => {
+        Backing::FilePrivate { file, offset } => {
             let Some(file_off) = offset.checked_add(page - area.start) else {
                 unsafe { frames::free(frame) };
                 return false;
             };
-            if !read_page(fd, file_off, frame) {
+            if !read_page(file, file_off, frame) {
                 unsafe { frames::free(frame) };
                 return false;
             }
@@ -598,9 +697,7 @@ fn populate(area: &VmArea, page: u64) -> bool {
     unsafe {
         // A frame this allocator hands out may have been executable code for
         // a process that has since died, and the I-cache does not snoop the
-        // allocator's zeroing writes. Publish before the PTE exists: the
-        // retried instruction fetch must not see what the last owner of this
-        // frame left in cache.
+        // allocator's zeroing writes. Publish before the PTE exists.
         if area.exec {
             paging::clean_icache_range(frame as u64, 4096);
         }
