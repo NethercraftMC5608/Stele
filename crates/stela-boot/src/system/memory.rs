@@ -134,7 +134,10 @@ pub(super) fn reserve(cores: usize, ram: &[(usize, usize)]) -> Result<EngineMemo
         },
     };
     let free = free_ram()?;
-    let sizes = stela_boot_core::host_memory::sizes(free, cores, cores)?;
+    // A pack read on demand left part of its budget free: the window and
+    // the guest share it.
+    let room = crate::engine::translations::PACK_ROOM.load(core::sync::atomic::Ordering::Acquire);
+    let sizes = stela_boot_core::host_memory::sizes_with_room(free, cores, cores, room)?;
     output::arguments(format_args!(
         "HOST MEMORY free={}M heap={}M code={}M window={}M kept={}M pool={}M guest={}M\n",
         free >> 20,
