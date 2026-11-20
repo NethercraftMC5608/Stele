@@ -1886,6 +1886,21 @@ pub unsafe fn open(
     Vec::leak(core::mem::take(&mut devices.ehci_hosts));
     for host in &devices.hda_hosts {
         let location = &host.location;
+        if let Some(state) = host.wake.from_state {
+            let state = match state {
+                3 => "D3hot",
+                2 => "D2",
+                _ => "D1",
+            };
+            output::arguments(format_args!(
+                "HOST HD AUDIO {location}: woke the controller from {state} to D0\n"
+            ));
+        }
+        if host.wake.decode_enabled {
+            output::arguments(format_args!(
+                "HOST HD AUDIO {location}: turned on the memory decoding firmware left off\n"
+            ));
+        }
         for codec in &host.codecs {
             let graph = &codec.graph;
             match &codec.setup {

@@ -171,6 +171,8 @@ struct Resources<R, T> {
     _construction_failure: Option<hda::ConstructionFailure<Shared<Pci<R>>, T>>,
     retiring_function: Option<Box<Function<OwnedConfig>>>,
     _pin_failure: Option<preparation::PinReleaseFailure>,
+    /// What preparation changed to wake the controller.
+    wake: hda::pci::Wake,
 }
 struct Owner<R, T>(Option<Box<Resources<R, T>>>);
 impl<R, T> Drop for Owner<R, T> {
@@ -246,6 +248,7 @@ impl<R: NativeRegisters, T: audio::Timer + Clone> Native<R, T> {
             _construction_failure: None,
             retiring_function: None,
             _pin_failure: None,
+            wake: hda::pci::Wake::default(),
         })));
         let result = Self::prepare(owner.resources());
         match result {
@@ -261,6 +264,13 @@ impl<R: NativeRegisters, T: audio::Timer + Clone> Native<R, T> {
             }),
         }
     }
+    /// What preparation changed to wake the controller.
+    pub fn wake(&self) -> hda::pci::Wake {
+        self.owner
+            .0
+            .as_ref()
+            .map_or_else(hda::pci::Wake::default, |r| r.wake)
+    }
     fn prepare(r: &mut Resources<R, T>) -> Result<(), Error> {
         crate::bus::pci::power::Timer::check(&r.clock)
             .map_err(|error| Error::Controller(audio::Error::MinimumDelay(error)))?;
@@ -274,9 +284,17 @@ impl<R: NativeRegisters, T: audio::Timer + Clone> Native<R, T> {
         {
             return Err(Error::ForeignOriginalUsers);
         }
+        // Firmware that never used the controller may leave it in D3hot or
+        // with memory decoding off. Enter D0 with decoding on first, as Linux
+        // pci_enable_device does; modern Intel identities get no write, so
+        // the cold entry below still refuses them when they are not ready.
+        // SAFETY: the same exclusive original requester/root and kept BAR
+        // provider as the cold entry below; nothing reads BAR0 before this.
+        r.wake = unsafe { hda::pci::wake_cold(requester.function_mut(), r.bar, &r.clock) }?;
         // SAFETY: actual original requester/root, exact kept BAR provider and
-        // exclusive conventional/D0/decode/firmware exclusion are constructor
-        // prerequisites. No private bind/new DMA occurs in this cold stage.
+        // exclusive conventional/firmware exclusion are constructor
+        // prerequisites, and wake_cold above established D0/decode. No
+        // private bind/new DMA occurs in this cold stage.
         let mut registers = unsafe {
             hda::pci::prepare_cold_with_registers(
                 requester.function_mut(),

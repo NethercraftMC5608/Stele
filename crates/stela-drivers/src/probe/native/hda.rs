@@ -80,6 +80,8 @@ pub struct Host {
     pub codecs: Vec<Codec>,
     pub codec_failures: Vec<CodecFailure>,
     pub discovery_error: Option<audio::Error>,
+    /// What preparation changed to wake the controller from firmware's state.
+    pub wake: hda::pci::Wake,
 }
 impl Host {
     /// Allocate and start a 48 kHz 16-bit stereo cyclic playback stream on the
@@ -122,8 +124,10 @@ impl Drop for ColdOwner {
     }
 }
 /// # Safety
-/// NativeServices ownership, calibrated clock and original D0/decode/power
-/// hold. Conventional identity alone cannot exclude firmware/AML/SMM/DSP users.
+/// NativeServices ownership, calibrated clock and original main power hold;
+/// a controller left in D1 to D3hot or with memory decoding off is brought to
+/// D0 with decoding on before BAR0 is read (`hda::pci::wake_cold`).
+/// Conventional identity alone cannot exclude firmware/AML/SMM/DSP users.
 /// Their original root/backing and competing-owner exclusions remain required.
 /// The separate original IRQ/work retirement producer is currently unavailable:
 /// this factory performs source containment, then retains/refuses before bind.
@@ -230,11 +234,13 @@ pub(in crate::probe) unsafe fn attach(
         Ok(d) => d,
         Err(error) => return Err((Error::HdaNative(error), Some(Box::new(owner)))),
     };
+    let wake = owner.wake();
     Ok(Host {
         location: alloc::format!("{address}"),
         owner,
         codecs: discovery.codecs,
         codec_failures: discovery.codec_failures,
         discovery_error: discovery.discovery_error,
+        wake,
     })
 }

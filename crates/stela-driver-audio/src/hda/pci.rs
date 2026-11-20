@@ -682,6 +682,142 @@ pub unsafe fn prepare_cold_with_registers<'a, C: ConfigSpace, R: Registers>(
     unsafe { prepare_mapped(function, bar0, timer, ownership, registers, false) }
 }
 
+/// What [`wake_cold`] changed, for the boot log.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Wake {
+    /// The PCI power state the function was found in (1, 2 or 3 for D1, D2
+    /// or D3hot) when it had to enter D0; `None` when it was already in D0.
+    pub from_state: Option<u8>,
+    /// Memory decoding was off and has been turned on.
+    pub decode_enabled: bool,
+}
+
+/// Bring a conventional function that firmware left in D1, D2 or D3hot, or
+/// with memory decoding off, to D0 with memory decoding on, so that
+/// `prepare_cold_with_registers` can inspect BAR0. Firmware that never used
+/// the controller may leave it either way. Linux `pci_enable_device` does the
+/// same before `azx_probe` reads the controller: `pci_set_power_state` enters
+/// D0, then `pci_enable_resources` turns memory decoding on.
+///
+/// The sequence is legacy `prepare`'s: identity, subsystem, BAR and
+/// capability checks before any write; decoding and mastering off; the BARs
+/// saved; PMCSR D0 with PME disabled and pending PME kept; the PCI PM settle
+/// time (10 ms from D3hot, 200 us from D2); a D0 readback; the saved BARs
+/// written back when a D3hot exit without No_Soft_Reset cleared them; then
+/// memory decoding on, with bus mastering left off and INTx disabled for the
+/// cold entry.
+///
+/// Identities that require mapped preflight (modern Intel, whose DSP owner
+/// must be inspected before any power or decode change) get no config write,
+/// so the cold entry still refuses them when they are not ready. A function
+/// already in D0 with memory decoding on gets no write either.
+///
+/// # Safety
+/// The platform ownership prerequisites of `prepare_cold_with_registers`
+/// apply, except D0 and memory decoding, which this establishes. Nothing may
+/// access the function's BAR0 mapping before this returns `Ok`.
+pub unsafe fn wake_cold<C: ConfigSpace>(
+    function: &mut Function<C>,
+    bar0: Bar,
+    timer: &impl Timer,
+) -> Result<Wake, AttachError> {
+    timer.check().map_err(AttachError::MinimumDelay)?;
+    let selected = identify(function)?;
+    if selected.requires_mapped_preflight() {
+        return Ok(Wake::default());
+    }
+    let config = function.config();
+    let id = config.read32(regs::VENDOR_ID)?;
+    let class = config.read32(regs::CLASS_REVISION)?;
+    let actual = identity(
+        id as u16,
+        (id >> 16) as u16,
+        [(class >> 24) as u8, (class >> 16) as u8, (class >> 8) as u8],
+    )?;
+    if actual != selected || config.read8(regs::HEADER_TYPE)? & 0x7f != 0 {
+        return Err(AttachError::IdentityChanged);
+    }
+    check_subsystem(config, selected, BoardIdentity::Unknown)?;
+    let (base, _, wide) = validated_bar(config, bar0)?;
+    let (_, caps) = controls_and_capabilities(config, selected)?;
+    // All ones: the function does not answer (D3cold), as the cold entry says.
+    let command = config.read16(regs::COMMAND)?;
+    if command == u16::MAX {
+        return Err(AttachError::PowerNotReady);
+    }
+    let mut sleeping = None;
+    if let Some(pm) = caps.pm {
+        let version = config.read16(pm + 2)? & 7;
+        let value = config.read16(pm + 4)?;
+        if value == u16::MAX {
+            return Err(AttachError::PowerNotReady);
+        }
+        if !(1..=3).contains(&version) {
+            return Err(AttachError::UnsupportedPowerManagement);
+        }
+        if value & PM_STATE != 0 {
+            sleeping = Some((pm + 4, value));
+        }
+    }
+    let decode_off = command & regs::COMMAND_MEMORY == 0;
+    if sleeping.is_none() && !decode_off {
+        return Ok(Wake::default());
+    }
+    // Save the BARs before a D3hot exit can reset them. No BAR or PMCSR
+    // write happens with a live decoder or bus master.
+    let mut bars = [0; 6];
+    for (index, bar) in bars.iter_mut().enumerate() {
+        *bar = config.read32(regs::BASE_ADDRESS_0 + index as u16 * 4)?;
+    }
+    if bars.contains(&u32::MAX) {
+        return Err(AttachError::ConfigurationRejected);
+    }
+    let quiet =
+        command & !(regs::COMMAND_MEMORY | regs::COMMAND_MASTER) | regs::COMMAND_INTX_DISABLE;
+    config.write16(regs::COMMAND, quiet)?;
+    let observed = config.read16(regs::COMMAND)?;
+    if observed == u16::MAX || observed & (regs::COMMAND_MEMORY | regs::COMMAND_MASTER) != 0 {
+        return Err(AttachError::ConfigurationRejected);
+    }
+    let mut wake = Wake::default();
+    if let Some((offset, value)) = sleeping {
+        let state = value & PM_STATE;
+        // PME_Status is W1C: write zero to preserve pending wake evidence.
+        config.write16(offset, value & !(PM_STATE | PM_PME_ENABLE | PM_PME_STATUS))?;
+        delay(
+            timer,
+            match state {
+                3 => 10_000,
+                2 => 200,
+                _ => 0,
+            },
+        )?;
+        let observed = config.read16(offset)?;
+        if observed == u16::MAX || observed & PM_STATE != 0 {
+            return Err(AttachError::PowerTransition);
+        }
+        if state == 3 && value & PM_NO_SOFT_RESET == 0 {
+            for (index, value) in bars.iter().enumerate() {
+                config.write32(regs::BASE_ADDRESS_0 + index as u16 * 4, *value)?;
+            }
+        }
+        wake.from_state = Some(state as u8);
+    }
+    if !bar_matches(config, base, wide)? {
+        return Err(AttachError::InvalidBar);
+    }
+    let enabled = quiet | regs::COMMAND_MEMORY;
+    config.write16(regs::COMMAND, enabled)?;
+    let observed = config.read16(regs::COMMAND)?;
+    if observed == u16::MAX
+        || observed & (regs::COMMAND_MEMORY | regs::COMMAND_MASTER) != regs::COMMAND_MEMORY
+    {
+        return Err(AttachError::ConfigurationRejected);
+    }
+    wake.decode_enabled = decode_off;
+    Ok(wake)
+}
+
 unsafe fn prepare_mapped<'a, C: ConfigSpace, R: Registers>(
     function: &'a mut Function<C>,
     bar0: Bar,

@@ -110,6 +110,14 @@ impl HostAudio {
             }
         }
         let Some((host, info)) = active else {
+            output::arguments(format_args!(
+                "HOST AUDIO no output for the guest's Stela USB Audio: {}\n",
+                if unused.is_empty() {
+                    "no HD Audio controller started (see HOST DEVICE FAILED)"
+                } else {
+                    "no started HD Audio controller could play"
+                }
+            ));
             Vec::leak(unused);
             return None;
         };
