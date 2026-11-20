@@ -12,7 +12,7 @@ a model of Apple silicon hardware. Stela currently presents itself as an M2 Mac 
 >
 > - **Status:** the bridge compiles and its tests pass, but it has **not been tested on real hardware yet**. If you have a PC with a GTX 16 or RTX GPU, please help test it: see [Testers wanted](https://github.com/reece-builds/Stela-Mods/issues/3).
 > - **GTX 10 (Pascal) GPUs are not supported.** An earlier version of this fork said they were, which was wrong: Pascal needs NVIDIA firmware that is signature-locked, as explained in [tylertms/Stela#252](https://github.com/tylertms/Stela/issues/252).
-> - **Test build:** [v0.5.100](https://github.com/reece-builds/Stela-Mods/releases/tag/v0.5.100) is a pre-release with the audio bridge. The earlier GTX 10 downloads were broken and have been removed. Tyler's [official releases](https://github.com/tylertms/Stela/releases) don't include this fork's mods.
+> - **Test build:** [v0.5.101](https://github.com/reece-builds/Stela-Mods/releases/tag/v0.5.101) is a pre-release with the audio bridge. The earlier GTX 10 downloads were broken and have been removed. Tyler's [official releases](https://github.com/tylertms/Stela/releases) don't include this fork's mods.
 
 > [!WARNING]
 Stela is still in development. It is slow and still may not boot on supported hardware. Fixes are on the way, please submit a GitHub Issue with your boot logs if you encounter an error!
