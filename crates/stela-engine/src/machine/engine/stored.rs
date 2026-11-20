@@ -133,6 +133,14 @@ pub struct SharedTranslation {
     page: u64,
     pc: u64,
     context: Digest,
+    /// The guest-physical frame of its fetch page.
+    frame: u64,
+    /// Prepared ahead of any fetch (`ahead.rs`), not offered for the
+    /// pack yet: the PE that first installs it offers it.
+    ahead: bool,
+    /// A block prepared ahead: the entry PCs of its static successors,
+    /// which its first install offers as a fetched block's. None otherwise.
+    successors: Vec<u64>,
 }
 impl SharedTranslation {
     pub fn input(&self) -> &[u8] {
@@ -143,6 +151,34 @@ impl SharedTranslation {
     }
     pub fn preparation(&self) -> &Arc<Preparation> {
         &self.emission.preparation
+    }
+    /// Whether it was prepared ahead of any fetch and not offered since.
+    pub fn ahead(&self) -> bool {
+        self.ahead
+    }
+    /// The entry PCs of its static successors, kept for a block prepared
+    /// ahead.
+    pub fn successors(&self) -> &[u64] {
+        &self.successors
+    }
+    /// The offer of a block prepared ahead, made by the PE that installs it
+    /// first: the store keeps it for the pack as any block compiled anew,
+    /// and its successors (`elsewhere`: in other pages, with the frames
+    /// the installing PE's fetch cache holds) become jobs as a fetched
+    /// block's do.
+    pub(super) fn offer(&self, quiet: bool, elsewhere: Vec<(u64, u64)>) -> Offer {
+        Offer {
+            key: self.key,
+            page: self.page,
+            pc: self.pc,
+            context: self.context,
+            emission: self.emission.clone(),
+            successors: self.successors.clone(),
+            elsewhere,
+            quiet,
+            frame: self.frame,
+            depth: 0,
+        }
     }
     pub(super) fn matches(&self, key: &Digest, pc: u64, context: &Digest, source: &[u8]) -> bool {
         self.key == *key
@@ -204,6 +240,10 @@ pub trait Translations {
     }
     /// A block the engine compiled from a page the store had no entry for.
     fn offer(&mut self, offer: Offer);
+    /// The stored form this translator gives a block of the previous
+    /// translator's pack, of the page whose bytes hash to `key`
+    /// (`refill.rs`), for the store to keep as it keeps an offer's.
+    fn refilled(&mut self, _key: &Digest, _entry: Entry) {}
     /// What a machine's use of the store cost or found, for the store's
     /// counters.
     fn note(&mut self, _event: StoreEvent) {}
@@ -258,9 +298,18 @@ pub struct Offer {
     /// The entry PCs of its static successors, for translation ahead of
     /// execution.
     pub(super) successors: Vec<u64>,
+    /// Those of them in other pages, each with the frame of its page where
+    /// the offering PE's fetch cache held its walk, else 0 (`ahead.rs`).
+    pub(super) elsewhere: Vec<(u64, u64)>,
     /// Compiled for EL0, where the PE holds no lock of the guest's kernel:
     /// a store may take time there for work of its own.
     pub(super) quiet: bool,
+    /// The guest-physical frame of its fetch page, which a PE preparing its
+    /// successors ahead reads (`ahead.rs`).
+    pub(super) frame: u64,
+    /// 0 for a block a fetch compiled; for one prepared ahead, how many
+    /// static successor steps it lies from one (`ahead.rs` DEPTH).
+    pub(super) depth: u8,
 }
 
 impl Offer {
@@ -289,7 +338,10 @@ impl Offer {
             context,
             emission: Arc::new(Emission::new(input, block, preparation)),
             successors: Vec::new(),
+            elsewhere: Vec::new(),
             quiet: false,
+            frame: 0,
+            depth: 0,
         })
     }
     pub fn key(&self) -> Digest {
@@ -336,7 +388,18 @@ impl Offer {
             page: self.page,
             pc: self.pc,
             context: self.context,
+            frame: self.frame,
+            ahead: self.depth > 0,
+            successors: match self.depth > 0 {
+                true => self.successors,
+                false => Vec::new(),
+            },
         })
+    }
+
+    /// Whether it was prepared ahead of any fetch (`ahead.rs`).
+    pub fn ahead(&self) -> bool {
+        self.depth > 0
     }
 
     /// Its block's stored form ([`stored_entry`]).

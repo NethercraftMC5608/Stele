@@ -816,3 +816,25 @@ fn the_translator_id_covers_every_engine_item_its_inputs_name() {
         assert!(unexpected.is_empty(), "{name} names {unexpected:?}");
     }
 }
+
+#[test]
+fn a_stored_record_says_which_entries_it_holds_without_decoding_them() {
+    // add x0, x0, #1; ret, at two offsets.
+    let source = words(&[0x9100_0400, 0xd65f_03c0]);
+    let translator = translator_id();
+    let mut record = Record::new(translator, Digest::of(b"page"));
+    for offset in [8, 64] {
+        record.insert(proved(&source, offset).expect("a stored entry"));
+    }
+    let stored = StoredRecord::of(&record);
+    let context = Digest::of(b"context");
+    for offset in 0..128u16 {
+        assert_eq!(
+            stored.contains(offset, &context),
+            stored.find(offset, &context).is_some(),
+            "{offset}"
+        );
+    }
+    assert!(stored.contains(8, &context) && stored.contains(64, &context));
+    assert!(!stored.contains(8, &Digest::of(b"other")));
+}

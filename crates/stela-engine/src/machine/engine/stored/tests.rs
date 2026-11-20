@@ -15,6 +15,7 @@ pub(crate) struct MemoryStore {
     pub(crate) lookups: usize,
     pub(crate) offers: Vec<Offer>,
     pub(crate) prepared: BTreeMap<(Digest, u64, Digest), Arc<SharedTranslation>>,
+    pub(crate) refilled: Vec<(Digest, Entry)>,
 }
 
 impl Translations for MemoryStore {
@@ -34,6 +35,9 @@ impl Translations for MemoryStore {
     }
     fn offer(&mut self, offer: Offer) {
         self.offers.push(offer);
+    }
+    fn refilled(&mut self, key: &Digest, entry: Entry) {
+        self.refilled.push((*key, entry));
     }
 }
 
