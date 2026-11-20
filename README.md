@@ -7,6 +7,13 @@ A translation-based Apple Silicon layer for x86-64 PCs. It is a UEFI boot
 program with an arm64-to-x86-64 translator, a Metal driver for NVIDIA GPUs and
 a model of Apple silicon hardware. Stela currently presents itself as an M2 Mac mini.
 
+> [!NOTE]
+> **About this fork.** This is a fork of [tylertms/Stela](https://github.com/tylertms/Stela) that keeps up with it and adds one experimental extra: an **audio bridge** that plays macOS's sound through the PC's own HD Audio line-out, speakers or headphones.
+>
+> - **Status:** the bridge compiles and its tests pass, but it has **not been tested on real hardware yet**. If you try it on a PC with a GTX 16 or RTX GPU, please open an issue with your `log.txt`.
+> - **GTX 10 (Pascal) GPUs are not supported.** An earlier version of this fork said they were, which was wrong: Pascal needs NVIDIA firmware that is signature-locked, as explained in [tylertms/Stela#252](https://github.com/tylertms/Stela/issues/252).
+> - **There is no prebuilt download.** The earlier ones were broken and have been removed. Use the [official Stela releases](https://github.com/tylertms/Stela/releases), or build this fork yourself as described under [Build](#build).
+
 > [!WARNING]
 Stela is still in development. It is slow and still may not boot on supported hardware. Fixes are on the way, please submit a GitHub Issue with your boot logs if you encounter an error!
 
