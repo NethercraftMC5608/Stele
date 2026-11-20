@@ -55,8 +55,7 @@ impl Chip {
         if identity.device_type != PhysicalDeviceType::DiscreteGpu {
             return Err(Refusal::NotDiscrete(identity.device_type));
         }
-        const PASCAL_CHIPSETS: [u16; 5] = [0x132, 0x134, 0x136, 0x137, 0x138];
-        if chipset < FIRST_GSP_CHIPSET && !PASCAL_CHIPSETS.contains(&chipset) {
+        if chipset < FIRST_GSP_CHIPSET {
             return Err(Refusal::PreTuring { chipset });
         }
         Self::find(chipset).ok_or(Refusal::UnknownChipset { chipset })

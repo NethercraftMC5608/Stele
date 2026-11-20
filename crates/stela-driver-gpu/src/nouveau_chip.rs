@@ -6,7 +6,6 @@
 /// The GPU generation, which fixes NVK's 3D class and NAK's shader model.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum Architecture {
-    Pascal,
     Turing,
     Ampere,
     Ada,
@@ -35,16 +34,11 @@ const fn chip(chipset: u16, name: &'static str, architecture: Architecture, disp
     }
 }
 
-use Architecture::{Ada, Ampere, Blackwell, Hopper, Pascal, Turing};
+use Architecture::{Ada, Ampere, Blackwell, Hopper, Turing};
 
-/// nouveau's Pascal, Turing and later chipsets; GA100, GH100, GB100 and GB102 are
+/// nouveau's Turing and later chipsets; GA100, GH100, GB100 and GB102 are
 /// compute parts without a display engine.
-pub static CHIPS: [Chip; 29] = [
-    chip(0x132, "GP102", Pascal, true),
-    chip(0x134, "GP104", Pascal, true),
-    chip(0x136, "GP106", Pascal, true),
-    chip(0x137, "GP107", Pascal, true),
-    chip(0x138, "GP108", Pascal, true),
+pub static CHIPS: [Chip; 24] = [
     chip(0x162, "TU102", Turing, true),
     chip(0x164, "TU104", Turing, true),
     chip(0x166, "TU106", Turing, true),
@@ -218,8 +212,8 @@ mod tests {
         let waits = |chipset| Chip::find(chipset).unwrap().waits_for_firmware_boot();
         // TU117 (GTX 16), GA104 (RTX 30), AD107 (RTX 4060).
         assert!(waits(0x167) && waits(0x174) && waits(0x197));
-        // GH100 and GB203 (RTX 5080) have no devinit subdev. GP106 (GTX 1060) boots via VBIOS.
-        assert!(!waits(0x180) && !waits(0x1b3) && !waits(0x136));
+        // GH100 and GB203 (RTX 5080) have no devinit subdev.
+        assert!(!waits(0x180) && !waits(0x1b3));
     }
 
     #[test]
