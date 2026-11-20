@@ -8,11 +8,11 @@ program with an arm64-to-x86-64 translator, a Metal driver for NVIDIA GPUs and
 a model of Apple silicon hardware. Stela currently presents itself as an M2 Mac mini.
 
 > [!NOTE]
-> **About this fork.** This is a fork of [tylertms/Stela](https://github.com/tylertms/Stela) that keeps up with it and adds one experimental extra: an **audio bridge** that plays macOS's sound through the PC's own HD Audio line-out, speakers or headphones.
+> **About this fork.** This is a fork of [tylertms/Stela](https://github.com/tylertms/Stela) that keeps up with it and adds mods and fixes on top. The first mod is an experimental **audio bridge** that plays macOS's sound through the PC's own HD Audio line-out, speakers or headphones.
 >
-> - **Status:** the bridge compiles and its tests pass, but it has **not been tested on real hardware yet**. If you try it on a PC with a GTX 16 or RTX GPU, please open an issue with your `log.txt`.
+> - **Status:** the bridge compiles and its tests pass, but it has **not been tested on real hardware yet**. If you have a PC with a GTX 16 or RTX GPU, please help test it: see [Testers wanted](https://github.com/reece-builds/Stela-Mods/issues/3).
 > - **GTX 10 (Pascal) GPUs are not supported.** An earlier version of this fork said they were, which was wrong: Pascal needs NVIDIA firmware that is signature-locked, as explained in [tylertms/Stela#252](https://github.com/tylertms/Stela/issues/252).
-> - **There is no prebuilt download.** The earlier ones were broken and have been removed. Use the [official Stela releases](https://github.com/tylertms/Stela/releases), or build this fork yourself as described under [Build](#build).
+> - **Test build:** [v0.5.100](https://github.com/reece-builds/Stela-Mods/releases/tag/v0.5.100) is a pre-release with the audio bridge. The earlier GTX 10 downloads were broken and have been removed. Tyler's [official releases](https://github.com/tylertms/Stela/releases) don't include this fork's mods.
 
 > [!WARNING]
 Stela is still in development. It is slow and still may not boot on supported hardware. Fixes are on the way, please submit a GitHub Issue with your boot logs if you encounter an error!
@@ -47,8 +47,10 @@ and supports the Metal3 and Apple7 GPU families.
 
 ## Install
 
-1. Download `stela` from the
-   [releases page](https://github.com/tylertms/Stela/releases).
+1. Download `stela` from this fork's
+   [releases page](https://github.com/reece-builds/Stela-Mods/releases).
+   Tyler's [official releases](https://github.com/tylertms/Stela/releases)
+   don't have this fork's mods.
 2. Run `sudo ./stela` (Linux, macOS) or double-click `stela.exe`
    (Windows).
 3. Choose the USB stick and the installer, then confirm. This erases the USB
