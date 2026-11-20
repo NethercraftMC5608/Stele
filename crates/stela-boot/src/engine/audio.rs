@@ -6,12 +6,14 @@
 //! available, falling back to firmware Line-Out / Speaker ordering and minimal
 //! transport-only codecs such as QEMU's `hda-duplex`).
 //!
-//! During each host service turn, stereo 48 kHz frames are drained from the
-//! guest's USB audio ring outside the HDA lock, converted to 16-bit signed
-//! little-endian PCM, and written ahead of the hardware LPIB playback cursor
-//! under `RestoreRoot::try_enter` (so audio never stalls other cores waiting
-//! for the host drivers' lock). Already-played bytes are scrubbed back to zero
-//! behind LPIB so short sounds never loop on the next cyclic lap.
+//! During each host service turn, the guest's waiting stereo 48 kHz frames
+//! move behind those still pending, under the devices' lock; they are
+//! converted to 16-bit signed little-endian PCM and written ahead of the
+//! hardware LPIB playback cursor under `RestoreRoot::try_enter`, so audio
+//! never stalls other cores waiting for the host drivers' lock. A turn that
+//! finds that lock taken keeps its frames pending for the next turn.
+//! Already-played bytes are scrubbed back to zero behind LPIB so short sounds
+//! never loop on the next cyclic lap.
 use super::{output, storage::RestoreRoot};
 use alloc::{string::String, vec, vec::Vec};
 use stela_boot_core::audio_bridge::{self, CHANNELS, FRAME_BYTES, RingBridge, TARGET_LEAD_BYTES};
@@ -21,8 +23,9 @@ use stela_drivers::{
 };
 use stela_soc::machine::{AppleDevices, UsbAudioStatus};
 
-/// Maximum stereo frames drained per service turn (1,024 frames = 21.33 ms).
-pub(super) const TURN_FRAMES: usize = 1024;
+/// Most stereo frames pending between the guest's speaker and the HD Audio
+/// ring: the ring's target lead (2,048 frames = 42.7 ms).
+const PENDING_FRAMES: usize = TARGET_LEAD_BYTES / FRAME_BYTES;
 
 /// Static silence slice used to scrub played DMA regions without heap allocation.
 static ZERO_CHUNK: [u8; 4096] = [0u8; 4096];
@@ -41,6 +44,11 @@ pub struct HostAudio {
     last_muted: bool,
     last_volume: i16,
     reported_written: u64,
+    /// Guest frames taken and not yet written to the HD Audio ring: a turn
+    /// that found the host drivers' lock taken keeps them for the next.
+    frames: Vec<[i32; CHANNELS]>,
+    pending: usize,
+    status: Option<UsbAudioStatus>,
     pcm_scratch: Vec<u8>,
 }
 
@@ -120,19 +128,19 @@ impl HostAudio {
             last_muted: false,
             last_volume: 0,
             reported_written: 0,
-            pcm_scratch: vec![0u8; TURN_FRAMES * FRAME_BYTES],
+            frames: vec![[0; CHANNELS]; PENDING_FRAMES],
+            pending: 0,
+            status: None,
+            pcm_scratch: vec![0u8; PENDING_FRAMES * FRAME_BYTES],
         })
     }
 
-    /// Drain up to `out.len()` waiting stereo frames and status from the
-    /// guest's virtual USB audio speaker under the devices lock.
-    pub fn queued(
-        devices: &mut AppleDevices,
-        out: &mut [[i32; CHANNELS]],
-    ) -> (usize, Option<UsbAudioStatus>) {
-        let count = devices.audio_take(out);
-        let status = devices.audio_status();
-        (count, status)
+    /// Moves the guest speaker's waiting frames behind those still pending,
+    /// with its status, under the devices' lock.
+    pub fn take(&mut self, devices: &mut AppleDevices) {
+        let pending = self.pending;
+        self.pending += devices.audio_take(&mut self.frames[pending..]);
+        self.status = devices.audio_status();
     }
 
     fn fail(&mut self, what: &str, error: impl core::fmt::Debug) {
@@ -145,10 +153,12 @@ impl HostAudio {
         }
     }
 
-    /// Pump guest PCM frames into the live HDA cyclic playback ring and scrub
-    /// already-played bytes back to silence behind hardware LPIB.
-    pub fn pump(&mut self, frames: &[[i32; CHANNELS]], status: Option<UsbAudioStatus>) {
-        if let Some(st) = status
+    /// Pump the pending guest PCM frames into the live HDA cyclic playback
+    /// ring and scrub already-played bytes back to silence behind hardware
+    /// LPIB. While another core holds the host drivers' lock, the frames
+    /// stay pending.
+    pub fn pump(&mut self) {
+        if let Some(st) = self.status
             && (st.bits != self.last_bits
                 || st.muted != self.last_muted
                 || st.volume != self.last_volume)
@@ -167,11 +177,14 @@ impl HostAudio {
             ));
         }
         if self.failed {
+            // The bridge stopped for the boot: the guest's frames go nowhere.
+            self.pending = 0;
             return;
         }
         // SAFETY: the loader root `storage::open` captured maps the HDA BAR0
         // and coherent DMA ring for the entire boot.
         let Some(_root) = (unsafe { RestoreRoot::try_enter(self.root) }) else {
+            // Another core holds the host drivers: the frames stay pending.
             return;
         };
         let Some(host) = self.host.as_mut() else {
@@ -200,8 +213,10 @@ impl HostAudio {
                 remaining -= chunk;
             }
         }
-        if !frames.is_empty() {
-            let pcm_len = audio_bridge::frames_to_s16le(frames, &mut self.pcm_scratch);
+        let pending = core::mem::take(&mut self.pending);
+        if pending > 0 {
+            let pcm_len =
+                audio_bridge::frames_to_s16le(&self.frames[..pending], &mut self.pcm_scratch);
             let write = self.bridge.plan_write(pcm_len);
             for seg in write.as_slice() {
                 let slice = &self.pcm_scratch[seg.src_offset..seg.src_offset + seg.len];

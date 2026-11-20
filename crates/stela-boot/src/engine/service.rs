@@ -31,7 +31,7 @@
 //! waited; a wait that began before the part is the turn's, in one
 //! `HOST SERVICE LATE` line.
 use super::{audio, bluetooth, host, input, network, nor, output, parallel, power, restore, usb};
-use alloc::{format, string::String, vec, vec::Vec};
+use alloc::{format, string::String, vec::Vec};
 use core::{
     cell::UnsafeCell,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
@@ -113,7 +113,6 @@ pub(super) struct Service {
     usb: Option<usb::HostUsb>,
     bluetooth: Option<bluetooth::HostBluetooth>,
     audio: Option<audio::HostAudio>,
-    audio_frames: Vec<[i32; 2]>,
     network: Option<network::GuestNetwork>,
     nor: Option<nor::HostNor>,
     power: power::HostPowerControl,
@@ -159,11 +158,6 @@ impl Service {
         // The service moves between cores: its stamps across turns are
         // the corrected count, not one core's raw TSC.
         let now = host::fresh_counter();
-        let audio_frames = if audio.is_some() {
-            vec![[0i32; 2]; audio::TURN_FRAMES]
-        } else {
-            Vec::new()
-        };
         Self {
             devices,
             restore,
@@ -171,7 +165,6 @@ impl Service {
             usb,
             bluetooth,
             audio,
-            audio_frames,
             network,
             nor,
             power,
@@ -250,7 +243,6 @@ impl Service {
             usb,
             bluetooth,
             audio,
-            audio_frames,
             network,
             nor,
             power,
@@ -370,9 +362,8 @@ impl Service {
             }
         }
         if let Some(audio) = audio.as_mut().filter(|_| due(AUDIO, true, &mut turn)) {
-            let (count, status) =
-                devices.with(|devices| audio::HostAudio::queued(devices, audio_frames));
-            audio.pump(&audio_frames[..count], status);
+            devices.with(|devices| audio.take(devices));
+            audio.pump();
             lap.part(Part::Audio);
         }
         if due(LOGS, true, &mut turn) {

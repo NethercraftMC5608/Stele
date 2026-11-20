@@ -17,11 +17,15 @@ pub const PERIOD_BYTES: usize = 4096;
 pub const PERIODS: usize = 8;
 /// Total cyclic DMA ring buffer size in bytes.
 pub const RING_BYTES: usize = PERIOD_BYTES * PERIODS;
-/// Target playback lead ahead of hardware LPIB when starting from silence (~21.3 ms).
-pub const TARGET_LEAD_BYTES: usize = PERIOD_BYTES;
-/// Maximum buffered audio kept ahead of hardware LPIB (~149.3 ms), leaving one
-/// full guard period between the write cursor and hardware playback head.
-pub const MAX_LEAD_BYTES: usize = RING_BYTES - PERIOD_BYTES;
+/// Target playback lead ahead of hardware LPIB when starting from silence:
+/// two periods (~42.7 ms), as a host service turn can come 20 ms late while
+/// another core holds the host drivers' lock.
+pub const TARGET_LEAD_BYTES: usize = 2 * PERIOD_BYTES;
+/// Bytes kept free between the write cursor and the hardware playback head:
+/// one full period.
+pub const GUARD_BYTES: usize = PERIOD_BYTES;
+/// Maximum buffered audio kept ahead of hardware LPIB (~149.3 ms).
+pub const MAX_LEAD_BYTES: usize = RING_BYTES - GUARD_BYTES;
 /// Wall-clock gap above which hardware may have lapped the cyclic ring (~140 ms).
 pub const STALL_US: u64 = 140_000;
 
@@ -31,19 +35,12 @@ pub const STALL_US: u64 = 140_000;
 ///
 /// Returns the number of PCM bytes written into `out` (always a multiple of 4).
 pub fn frames_to_s16le(frames: &[[i32; CHANNELS]], out: &mut [u8]) -> usize {
-    let count = frames.len().min(out.len() / FRAME_BYTES);
-    for (frame, dst) in frames[..count]
-        .iter()
-        .zip(out[..count * FRAME_BYTES].chunks_exact_mut(FRAME_BYTES))
-    {
-        let left = (frame[0] >> 16) as i16;
-        let right = (frame[1] >> 16) as i16;
-        let [l0, l1] = left.to_le_bytes();
-        let [r0, r1] = right.to_le_bytes();
-        dst[0] = l0;
-        dst[1] = l1;
-        dst[2] = r0;
-        dst[3] = r1;
+    let (slots, _) = out.as_chunks_mut::<FRAME_BYTES>();
+    let count = frames.len().min(slots.len());
+    for (frame, slot) in frames[..count].iter().zip(slots.iter_mut()) {
+        let [l0, l1] = ((frame[0] >> 16) as i16).to_le_bytes();
+        let [r0, r1] = ((frame[1] >> 16) as i16).to_le_bytes();
+        *slot = [l0, l1, r0, r1];
     }
     count * FRAME_BYTES
 }
@@ -137,7 +134,7 @@ impl RingBridge {
     pub fn new(ring_bytes: usize, lead_bytes: usize) -> Self {
         let ring_bytes = (ring_bytes & !3).max(FRAME_BYTES * 4);
         let lead_bytes = (lead_bytes & !3).clamp(FRAME_BYTES, ring_bytes / 2);
-        let max_lead_bytes = ring_bytes.saturating_sub(lead_bytes).max(lead_bytes);
+        let max_lead_bytes = ring_bytes.saturating_sub(GUARD_BYTES).max(lead_bytes);
         Self {
             ring_bytes,
             lead_bytes,
@@ -335,12 +332,37 @@ mod tests {
     fn caps_writes_to_max_lead_without_overwriting_unplayed_audio() {
         let mut bridge = RingBridge::new(RING_BYTES, TARGET_LEAD_BYTES);
         assert!(bridge.advance_and_plan_scrub(0, 0).is_empty());
-        // First write snaps buffered to TARGET_LEAD_BYTES (4096), leaving MAX_LEAD_BYTES - 4096 = 24576 bytes.
+        // First write snaps buffered to TARGET_LEAD_BYTES, leaving room up to MAX_LEAD_BYTES.
         let plan = bridge.plan_write(40_000);
         assert_eq!(plan.total_bytes(), MAX_LEAD_BYTES - TARGET_LEAD_BYTES);
         assert_eq!(
             bridge.counters().dropped_bytes,
             (40_000 - (MAX_LEAD_BYTES - TARGET_LEAD_BYTES)) as u64
         );
+    }
+
+    #[test]
+    fn a_turn_late_within_the_lead_keeps_streaming_without_a_resync() {
+        let mut bridge = RingBridge::new(RING_BYTES, TARGET_LEAD_BYTES);
+        assert!(bridge.advance_and_plan_scrub(0, 0).is_empty());
+        let first = bridge.plan_write(960);
+        assert_eq!(first.as_slice()[0].ring_offset, TARGET_LEAD_BYTES);
+        // The next turn comes 30 ms later, as when another core held the host
+        // drivers' lock: the hardware played 30 ms (5,760 bytes) meanwhile.
+        let played = 30 * RATE as usize / 1000 * FRAME_BYTES;
+        let scrub = bridge.advance_and_plan_scrub(played as u32, 30_000);
+        assert_eq!(scrub.total_bytes(), played);
+        assert_eq!(bridge.buffered_bytes(), TARGET_LEAD_BYTES + 960 - played);
+        // Fresh audio continues right after the last write: no gap, no resync.
+        let next = bridge.plan_write(960);
+        assert_eq!(next.as_slice()[0].ring_offset, TARGET_LEAD_BYTES + 960);
+    }
+
+    #[test]
+    fn converts_only_the_whole_frames_that_fit() {
+        let frames = [[0x0001_0000, 0x0002_0000]; 3];
+        let mut out = [0xaau8; 10];
+        assert_eq!(frames_to_s16le(&frames, &mut out), 8);
+        assert_eq!(out, [1, 0, 2, 0, 1, 0, 2, 0, 0xaa, 0xaa]);
     }
 }
