@@ -10,9 +10,9 @@ a model of Apple silicon hardware. Stela currently presents itself as an M2 Mac 
 > [!NOTE]
 > **About this fork.** This is a fork of [tylertms/Stela](https://github.com/tylertms/Stela) that keeps up with it and adds mods and fixes on top. The first mod is an experimental **audio bridge** that plays macOS's sound through the PC's own HD Audio line-out, speakers or headphones.
 >
-> - **Status:** the bridge compiles and its tests pass, but it has **not been tested on real hardware yet**. If you have a PC with a GTX 16 or RTX GPU, please help test it: see [Testers wanted](https://github.com/reece-builds/Stela-Mods/issues/3).
+> - **Status:** the first real-hardware test found that Stela never started the PC's sound chip, so there was no sound. [Test build 3](https://github.com/reece-builds/Stela-Mods/releases/tag/v0.5.102) fixes that, but **nobody has heard sound from it yet**. If you have a PC with a GTX 16 or RTX GPU, please help test it: see [Testers wanted](https://github.com/reece-builds/Stela-Mods/issues/3).
 > - **GTX 10 (Pascal) GPUs are not supported.** An earlier version of this fork said they were, which was wrong: Pascal needs NVIDIA firmware that is signature-locked, as explained in [tylertms/Stela#252](https://github.com/tylertms/Stela/issues/252).
-> - **Test build:** [v0.5.101](https://github.com/reece-builds/Stela-Mods/releases/tag/v0.5.101) is a pre-release with the audio bridge. The earlier GTX 10 downloads were broken and have been removed. Tyler's [official releases](https://github.com/tylertms/Stela/releases) don't include this fork's mods.
+> - **Test build:** [v0.5.102](https://github.com/reece-builds/Stela-Mods/releases/tag/v0.5.102) is a pre-release with the audio bridge. The earlier GTX 10 downloads were broken and have been removed. Tyler's [official releases](https://github.com/tylertms/Stela/releases) don't include this fork's mods.
 
 > [!WARNING]
 Stela is still in development. It is slow and still may not boot on supported hardware. Fixes are on the way, please submit a GitHub Issue with your boot logs if you encounter an error!
@@ -41,7 +41,7 @@ and supports the Metal3 and Apple7 GPU families.
 | Ethernet | Intel I225, I226, I210, I211, I350, 82574L, 82575, 82576, 82579, 82580, I217, I218, I219.<br>Realtek RTL8111, RTL8168, RTL8169, RTL8411, RTL8125, RTL8126, Killer E2600, E3000.<br>Broadcom BCM5720, BCM5761, BCM5762.<br>Aquantia AQC100, AQC107, AQC108, AQC109, AQC111, AQC112, AQC113, AQC114, AQC115C, AQC116C.<br>Qualcomm Atheros AR8131, AR8132, AR8151, AR8152, AR8161, AR8162, AR8171, AR8172, Killer E2200, E2400, E2500.<br>USB: Realtek RTL8152, RTL8153, RTL8156, ASIX AX88179, AX88178A, AX88772, CDC ECM and NCM. |
 | Wi-Fi | None currently supported. |
 | Bluetooth | None currently supported. |
-| Audio | Experimental: the guest's USB speaker plays through the PC's HD Audio analog output (line-out, speakers or headphones). Not yet tested on real hardware. |
+| Audio | Experimental: the guest's USB speaker plays through the PC's HD Audio analog output (line-out, speakers or headphones). Not yet confirmed working on real hardware. |
 | USB | xHCI (USB 3) and EHCI controllers, hubs, USB disks. |
 | Input | USB keyboards and mice. PS/2 keyboards, mice and Synaptics or Elantech touchpads. |
 
