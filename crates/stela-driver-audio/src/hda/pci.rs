@@ -641,6 +641,9 @@ fn validated_bar<C: ConfigSpace>(config: &C, bar0: Bar) -> Result<(u64, u64, boo
 /// Modern Intel identities require this path: read-only PCI/MMIO ownership
 /// preflight precedes every PCI mutation. No temporary power/decode operation
 /// is used to inspect an unknown DSP owner. Legacy `prepare` refuses these IDs.
+/// For the cold entry, [`wake_cold`] may first bring such a function to D0
+/// with memory decoding on, as Linux does for the legacy class, and changes
+/// nothing else.
 /// The returned adapter keeps the exact PCI function and mandatory reset
 /// policy; use its `config()` when constructing the controller.
 ///
@@ -707,10 +710,16 @@ pub struct Wake {
 /// memory decoding on, with bus mastering left off and INTx disabled for the
 /// cold entry.
 ///
-/// Identities that require mapped preflight (modern Intel, whose DSP owner
-/// must be inspected before any power or decode change) get no config write,
-/// so the cold entry still refuses them when they are not ready. A function
-/// already in D0 with memory decoding on gets no write either.
+/// Identities that require mapped preflight (modern Intel) get a gentler
+/// form: bus mastering and INTx are left as found, and a function found with
+/// bus mastering on gets no write, so the cold entry still refuses it when it
+/// is not ready. Stela admits these only with the legacy class 0x040300,
+/// which Linux `snd_intel_dsp_driver_probe` sends to the legacy HDA driver
+/// (0x040100 and 0x040380 mean a DSP, for SOF or SST), and `azx_create` then
+/// calls `pcim_enable_device` before it maps BAR0 or reads GCAP. The
+/// read-only mapped preflight that follows still refuses a controller that a
+/// processing owner holds. A function already in D0 with memory decoding on
+/// gets no write either.
 ///
 /// # Safety
 /// The platform ownership prerequisites of `prepare_cold_with_registers`
@@ -723,9 +732,8 @@ pub unsafe fn wake_cold<C: ConfigSpace>(
 ) -> Result<Wake, AttachError> {
     timer.check().map_err(AttachError::MinimumDelay)?;
     let selected = identify(function)?;
-    if selected.requires_mapped_preflight() {
-        return Ok(Wake::default());
-    }
+    // Modern Intel: no bus mastering or INTx change (see above).
+    let gentle = selected.requires_mapped_preflight();
     let config = function.config();
     let id = config.read32(regs::VENDOR_ID)?;
     let class = config.read32(regs::CLASS_REVISION)?;
@@ -763,6 +771,11 @@ pub unsafe fn wake_cold<C: ConfigSpace>(
     if sleeping.is_none() && !decode_off {
         return Ok(Wake::default());
     }
+    // Something may own a modern Intel function that is bus mastering, so
+    // it is left to the cold entry's refusal rather than turned off.
+    if gentle && command & regs::COMMAND_MASTER != 0 {
+        return Ok(Wake::default());
+    }
     // Save the BARs before a D3hot exit can reset them. No BAR or PMCSR
     // write happens with a live decoder or bus master.
     let mut bars = [0; 6];
@@ -772,9 +785,14 @@ pub unsafe fn wake_cold<C: ConfigSpace>(
     if bars.contains(&u32::MAX) {
         return Err(AttachError::ConfigurationRejected);
     }
-    let quiet =
-        command & !(regs::COMMAND_MEMORY | regs::COMMAND_MASTER) | regs::COMMAND_INTX_DISABLE;
-    config.write16(regs::COMMAND, quiet)?;
+    let quiet = if gentle {
+        command & !regs::COMMAND_MEMORY
+    } else {
+        command & !(regs::COMMAND_MEMORY | regs::COMMAND_MASTER) | regs::COMMAND_INTX_DISABLE
+    };
+    if quiet != command {
+        config.write16(regs::COMMAND, quiet)?;
+    }
     let observed = config.read16(regs::COMMAND)?;
     if observed == u16::MAX || observed & (regs::COMMAND_MEMORY | regs::COMMAND_MASTER) != 0 {
         return Err(AttachError::ConfigurationRejected);
