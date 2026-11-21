@@ -3329,6 +3329,17 @@ fn start_devices(
             if let Some(log) = log {
                 crate::log_file::resume(log);
             }
+            // An erase install restores recoveryOS and installs macOS from it,
+            // and neither needs a GPU, so on a PC whose GPUs Stela cannot run
+            // the whole install would finish before the installed macOS stops
+            // (`gpu_status::install_stop`). Stop before the restore erases
+            // anything; the log just resumed keeps the line.
+            if options.install.is_some()
+                && !options.update_restore
+                && let Some(line) = stela_boot_core::gpu_status::install_stop(&gpus)
+            {
+                output::fatal(line);
+            }
             let work = kernel_work.inspect_err(|reason| {
                 if options.boots_macos() {
                     crate::status::warn(&stela_boot_core::work_status::gpu_without_work(reason));
