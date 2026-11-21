@@ -15,6 +15,7 @@ a model of Apple silicon hardware. Stela currently presents itself as an M2 Mac 
 > | 🔊 **Audio bridge** | Plays macOS's sound through the PC's own HD Audio: line-out, speakers or headphones | 🧪 In [test build 3](https://github.com/reece-builds/Stela-Mods/releases/tag/v0.5.102). Nobody has heard sound from it yet |
 > | ⏰ **Sound chip wake-up** | Starts an onboard sound chip that the PC's firmware left asleep, the way Linux does. It fixes `HD Audio native: Pci(PowerNotReady)` | 🧪 In [test build 3](https://github.com/reece-builds/Stela-Mods/releases/tag/v0.5.102) |
 > | 🔵 **Raptor Lake sound fix** | Lets Intel 600 and 700-series sound chips start. Made by [justpainful](https://github.com/tylertms/Stela/pull/244) | ✅ In `main`, coming in the next test build |
+> | 🌙 **Newer Intel wake-up** | The same wake-up for newer Intel sound chips (6th-gen Core and up), done gently: it only powers the chip on and turns on its memory access, like Linux, and leaves the chip alone if something is using it | ✅ In `main`, coming in the next test build |
 > | 🛑 **GPU check** | Install macOS stops before erasing anything if the PC's GPU can't run macOS, instead of finishing a long install that can never start | ✅ In `main`, coming in the next test build |
 >
 > - 🧪 **Help test it:** if you have a PC with a GTX 16 or RTX GPU, see [Testers wanted](https://github.com/reece-builds/Stela-Mods/issues/3).
