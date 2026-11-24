@@ -499,6 +499,12 @@ pub extern "C" fn rust_main(magic: u64, info: u64) -> ! {
             if option_env!("NK_STELA_IRQ_TEST").is_some() {
                 stela_nk::irq_probe();
             }
+            // The M2 board's UART, watchdog and AIC mounted from a
+            // DeviceTree, with a guest taking the UART's RX interrupt.
+            #[cfg(feature = "stela")]
+            if option_env!("NK_STELA_BOARD_TEST").is_some() {
+                stela_nk::board_probe();
+            }
             println!();
             // LKL's numbers, not x86-64's: `ldk lkl` builds with ARCH=lkl on
             // both hosts, so the table is asm-generic wherever nk runs. 172 is

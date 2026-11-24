@@ -249,6 +249,11 @@ require it to pass; both the rebuilt x86 archive and cached arm64 archive pass.
   that exclude CPU 0. `sched::dedicate_cpu` gives an AP to one task (guest
   vCPUs) and masks its tick. Never give a Linux-ABI task an affinity without
   CPU 0.
+- **Take AIC offsets from the parsed layout, never a constant.** The M2's
+  AICv2 has MAX_IRQ 0x1000 (mask-clear array at 0x6600), not the 0x400 of
+  unit-test fixtures; a guest probe with hard-coded offsets unmasks the wrong
+  input and simply never gets an IRQ. `stela-soc-data`'s `test-support`
+  feature works on nk (`no_std`) since `test_chip` needs `std` explicitly.
 - **Host device work reaches a guest as a line plus a kick.** Set the line
   (an atomic the board's `Devices::lines` forwards into the AIC model), then
   IPI the dedicated core on vector 0xed. A kick that arrives while the guest

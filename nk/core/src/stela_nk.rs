@@ -8,7 +8,7 @@ mod fault;
 mod host;
 mod ram;
 pub(crate) use fault::recover_native_fault;
-pub(crate) use host::{irq_probe, kicked, timer_probe};
+pub(crate) use host::{board_probe, irq_probe, kicked, timer_probe};
 
 /// Owns the sole identity mapping of one code frame; no writable view escapes.
 struct Code(*mut u8);

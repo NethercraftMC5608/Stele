@@ -2,6 +2,8 @@
 //! These builders grant no mapping, executor or native effect permission.
 use super::*;
 use crate::Result;
+#[allow(unused_imports)] // the prelude has it under std
+use alloc::vec;
 pub const PMGR: &str = "pmgr1,t8112";
 /// Existing unit fixtures explicitly declare an affine synthetic map.
 /// Production callers supply Node::translate_range, never this adapter.

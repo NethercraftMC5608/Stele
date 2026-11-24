@@ -613,6 +613,24 @@ nk task on CPU 2 raises the device line 5 ms later and IPIs CPU 3 (vector
 input 32), the device acknowledged (line low), `run` to have returned
 `Stop::Waiting` and the core to have halted and been kicked at least once.
 
+### The M2 board's UART, watchdog and AIC from a DeviceTree
+
+```sh
+NK_STELA_BOARD_TEST=1 NK_SMP=1 NK_AP_LAYER=4 NK_LKL_LIB=$PWD/ldk/build/lkl-x86_64/libnklkl.a \
+  cargo build --release --features stela --target x86_64-unknown-none --target-dir target-stela-board
+python3 tests/run-dedicated-x86.py --kernel target-stela-board/x86_64-unknown-none/release/nk \
+  --initrd /path/to/initrd.cpio --require STELA_BOARD_PASS --output target-stela-board-run
+```
+
+The probe parses `stela-soc-data`'s M2-shaped DeviceTree fixture with
+`board::board` and places the UART, watchdog and AIC on `AppleDevices` at the
+addresses it gives. The guest gets only those addresses and the AIC layout's
+offsets: it enables the AIC, unmasks the UART's input, turns on the UART's
+RX-timeout interrupt and waits in WFI. nk types `nk\n` into the console from
+CPU 2 and kicks CPU 3. `STELA_BOARD_PASS` needs the UART to take the three
+bytes, the AIC event to be the UART's input (0x102e3), and the console to
+receive the guest's uppercase echo `NK\n`.
+
 ### Linux timers at their deadlines
 
 ```sh

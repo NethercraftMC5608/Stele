@@ -323,6 +323,18 @@ What Stela's runtime needs from the kernel underneath it.
         (`nk/tests/run-stela-x86.py`, 2026-11-25; uncommitted).
         The UART also passes through a distinct virtual mapping with the ARM
         MMU enabled; the full ADT-described board remains open.
+  - [x] The board's first devices mounted from a DeviceTree on nk
+        (`core/src/stela_nk/host/board.rs`): `stela_soc_data::board::board`
+        parses an M2-shaped tree (chip 0x8112) and its UART (0x235200000,
+        AIC input 739), watchdog and AICv2 (0x23b0c0000, MAX_IRQ 0x1000) are
+        placed on `stela_soc::machine::AppleDevices` as `stela-runtime`'s
+        mount places them. nk types `nk\n` into the board's console from
+        CPU 2 and kicks CPU 3; the UART raises its RX-timeout interrupt, the
+        AIC delivers event 0x102e3, and the guest echoes `NK\n` uppercased
+        through UTXH. 3/3 runs (`NK_STELA_BOARD_TEST`, `run-dedicated-x86.py
+        --require STELA_BOARD_PASS`, 2026-11-25). The tree is stela-soc-data's
+        fixture, not a real ADT read from disk, and only these three devices
+        are placed: no PMGR, DARTs, storage or memory controllers yet.
 - [ ] `stela-loader`: load the boot bundle and kernelcache that `stela-cli`
       prepares for macOS 27 from a disk LKL reads.
 - [ ] Hand off to the macOS 27 kernel. Done when: XNU's first serial output

@@ -55,9 +55,25 @@ fn timed_out() {
     TIMED_OUT.store(true, Ordering::Release);
 }
 
+/// A kick not yet taken by the core it woke.
+static KICK: AtomicBool = AtomicBool::new(false);
+
 /// From the IDT, after EOI: the halt it ended is all a kick is for.
 pub(crate) fn kicked() {
     KICKS.fetch_add(1, Ordering::AcqRel);
+    KICK.store(true, Ordering::Release);
+}
+
+/// Wake dedicated core `cpu` for host device work.
+pub(super) fn kick(cpu: usize) {
+    if let Some(apic) = crate::lapic::apic_id(cpu) {
+        unsafe { crate::lapic::send_ipi(apic, KICK_VECTOR) };
+    }
+}
+
+/// Whether a kick arrived since the last look, consuming it.
+pub(super) fn take_kick() -> bool {
+    KICK.swap(false, Ordering::AcqRel)
 }
 
 /// Whether host device work woke this core (for `BootHost::wait_for_interrupt`).
@@ -177,9 +193,7 @@ extern "C" fn helper(_: usize) {
     }
     RAISED.store(crate::timer::time_ns(), Ordering::Release);
     HOST_LINE.store(true, Ordering::Release);
-    if let Some(apic) = crate::lapic::apic_id(GUEST_CPU) {
-        unsafe { crate::lapic::send_ipi(apic, KICK_VECTOR) };
-    }
+    kick(GUEST_CPU);
 }
 
 pub(crate) fn irq_probe() -> bool {

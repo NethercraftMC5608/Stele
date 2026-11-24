@@ -407,8 +407,9 @@ impl Chip {
 
 /// The chip the runtime's unit tests build their default CPUs and machines
 /// for: `STELA_TEST_CHIP`, or [`Chip::DEFAULT`]. A test that fixes its chip
-/// does not call it.
-#[cfg(any(test, feature = "test-support"))]
+/// does not call it. Needs `std` for the environment: a `no_std` host (nk)
+/// may enable `test-support` for its pure fixtures without it.
+#[cfg(any(test, all(feature = "test-support", feature = "std")))]
 pub fn test_chip() -> Chip {
     extern crate std;
     std::env::var("STELA_TEST_CHIP").map_or(Chip::DEFAULT, |name| {

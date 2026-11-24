@@ -9,8 +9,10 @@ use stela_engine::machine::{
     exception::Pstate, identification, mmu, Cpu, CpuProfile, Host, InstallError, Machine,
     NativeCode, NativeExit, NoDevices, Regime, Stop,
 };
+mod board;
 mod irq;
 mod shadow;
+pub(crate) use board::board_probe;
 pub(crate) use irq::{irq_probe, kicked};
 
 // The pinned system-mode ABI borrows callee-saved host registers. Keep them
@@ -227,9 +229,9 @@ impl Host for BootHost {
         use core::sync::atomic::Ordering;
         self.waits += 1;
         if self.hrtimer {
-            // A host device's line (`irq`) ends the halt as well: the
-            // engine then finds the PE's IRQ pin raised.
-            while !GUEST_TIMER.swap(false, Ordering::AcqRel) && !irq::host_line() {
+            // Host device work ends the halt as well -- a raised line or
+            // a kick (`irq`): the engine then advances the devices.
+            while !GUEST_TIMER.swap(false, Ordering::AcqRel) && !irq::host_line() && !irq::take_kick() {
                 unsafe { core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack)) };
             }
             return;

@@ -24,4 +24,6 @@ stela-engine = { path = "../../crates/stela-engine", default-features = false, o
 stela-contracts = { path = "../../crates/stela-contracts", default-features = false, optional = true }
 stela-crypto = { path = "../../crates/stela-crypto", features = ["force-software"], optional = true }
 stela-soc = { path = "../../crates/stela-soc", default-features = false, optional = true }
-stela-soc-data = { path = "../../crates/stela-soc-data", default-features = false, optional = true }
+# test-support: the M2-shaped DeviceTree fixture the board probe mounts
+# until a real ADT is read from disk.
+stela-soc-data = { path = "../../crates/stela-soc-data", default-features = false, features = ["test-support"], optional = true }
