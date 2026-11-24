@@ -109,13 +109,20 @@ LKL's drivers attach to real hardware. Pick one reference PC (from Phase 0).
         fallback. QEMU finds multifunction devices, 32/64-bit BAR addresses,
         and NVMe behind a PCIe root port; host tests cover multiple segments
         and nonzero start buses (2026-11-24; uncommitted).
-  - [ ] LKL attachment, BAR sizing/assignment, DMA mapping, Linux IRQ binding.
-        Inventory alone neither attaches Linux drivers nor enables DMA.
-        Native-width config writes and bounded MSI/MSI-X capability/table
-        programming are now available; device ownership and teardown remain
-        responsibilities of the future LKL PCI bridge.
+  - [x] LKL attachment in QEMU: `lkl_pci_x86.rs` serves LKL's `pci_ops`
+        (native-width config, BARs mapped uncached -- high 64-bit BARs through
+        a kernel MMIO window at 12 GiB -- identity DMA, MSI and MSI-X wired to
+        Linux IRQs through device vectors and the LKL IRQ pump). LKL's PCI host
+        is x86-only (`lkl/nk-x86_64.config`). `nk/tests/run-nvme-x86.py`
+        (2026-11-24).
+  - [ ] LKL hosts one PCI device (`lkl_pci=`). More than one needs LKL's
+        host extended (several root buses) or one LKL bus per device.
+  - [ ] INTx (needs ACPI `_PRT`/AML) and multiple-message MSI; BAR
+        assignment when firmware left a BAR unassigned.
 - [ ] Linux drivers on real devices, one class at a time, each from LKL:
-  - [ ] NVMe (`nvme`): read the disk's GPT.
+  - [ ] NVMe (`nvme`): read the disk's GPT. QEMU done: Linux's driver
+        binds, reads the GPT (`nvme0n1: p1`), and busybox reads and writes
+        the partition. Real hardware still open.
   - [ ] Ethernet (`igc`/`e1000e`/`r8169`): DHCP and a ping.
   - [ ] xHCI + HID (`xhci_hcd`, `usbhid`): keyboard input.
   - [ ] HD Audio (`snd_hda_intel`): play a tone.

@@ -145,6 +145,8 @@ pub fn discover(boot: &BootInfo) {
     }
     let config = Hardware;
     let devices = pci::enumerate(&config, windows);
+    #[cfg(nk_lkl)]
+    crate::lkl_pci_x86::choose(&devices);
     for d in &devices {
         println!(
             "  pci:    {:04x}:{:02x}:{:02x}.{} {:04x}:{:04x} class {:02x}:{:02x}:{:02x}",
@@ -239,6 +241,28 @@ impl pci::Config for Hardware {
         };
         unsafe { CONFIG_LOCK.unlock(flags) };
         Some(value)
+    }
+}
+impl Hardware {
+    /// One byte at its own address. LKL writes single-byte registers
+    /// (cache line size, latency timer, interrupt line); widening them to a
+    /// read-modify-write of the dword would write back Status's RW1C bits.
+    pub(crate) fn write8(&self, bdf: pci::Bdf, offset: u16, value: u8) -> bool {
+        let Some(address) = Self::address(bdf, offset) else {
+            return false;
+        };
+        let flags = CONFIG_LOCK.lock();
+        unsafe {
+            match address {
+                Address::Ecam(address) => core::ptr::write_volatile(address as *mut u8, value),
+                Address::Legacy(address, port) => {
+                    core::arch::asm!("out dx,eax",in("dx")0xcf8u16,in("eax")address,options(nostack));
+                    core::arch::asm!("out dx,al",in("dx")port,in("al")value,options(nostack));
+                }
+            }
+            CONFIG_LOCK.unlock(flags);
+        }
+        true
     }
 }
 impl pci::ConfigWrite for Hardware {

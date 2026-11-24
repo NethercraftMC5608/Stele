@@ -285,3 +285,25 @@ the handler mask was saved after adding the self-block bit, so only the
 first signal ran. Saving the interrupted mask fixes repeated delivery.
 Both complete probes now pass. Nested handlers, full native-ABI signal
 behavior and complete Linux signal ABI compatibility are not claimed.
+
+## NVMe through LKL's PCI bridge (x86-64)
+
+Linux's own `nvme` driver, attached through nk's `pci_ops`
+(`core/src/lkl_pci_x86.rs`): nk chooses the first NVMe controller from its
+inventory and passes it as `lkl_pci=`, maps the BAR (QEMU's 64-bit BAR at
+768 GiB goes through the kernel MMIO window at 12 GiB), programs MSI-X for
+Linux's IRQs, and serves DMA by identity. Needs an x86 archive built with
+`lkl/nk-x86_64.config` (PCI, PCI_MSI, BLK_DEV_NVME, GPT).
+
+```sh
+python3 ldk/ldk.py lkl --arch x86_64
+NK_LKL_LIB=$PWD/ldk/build/lkl-x86_64/libnklkl.a \
+  cargo build --release --target x86_64-unknown-none --target-dir target-hx
+python3 tests/run-nvme-x86.py --kernel target-hx/x86_64-unknown-none/release/nk
+```
+
+It writes a 16 MiB GPT disk, boots q35 with `-device nvme`, and requires the
+bridge markers plus Linux's `nvme0n1: p1`, which needs config space, BAR
+access, DMA and interrupt completion all working. `NVME_PASS` on success.
+Verified by hand on 2026-11-24 as well: from busybox, `/dev/nvme0n1p1` exists,
+sector 1 reads `EFI PART`, and 1 MiB writes and a full-partition read complete.

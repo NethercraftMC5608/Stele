@@ -152,6 +152,13 @@ require it to pass; both the rebuilt x86 archive and cached arm64 archive pass.
   packed 12-byte event under `__x86_64__`, including x86 LKL. Repacking it as
   an asm-generic 16-byte event corrupts data and multi-event strides. Use
   `nk/tests/run-epoll-x86.py` to exercise all three wait variants.
+- **Linux PCI drivers go through `lkl_pci_x86.rs`.** LKL hosts exactly one
+  PCI device, named by `lkl_pci=` (nk picks the first NVMe). Config writes go
+  at native width (`Hardware::write8/16/32`) because RMW would clear RW1C
+  status bits. BARs above 4 GiB are mapped in the kernel MMIO window at
+  12 GiB, whose directory must exist before the first process. LKL's PCI
+  host is x86-only (`lkl/nk-x86_64.config`): on aarch64 it would route
+  virtio-mmio DMA through `lkl_dma_ops`.
 - **The kernel links at 1 GiB on x86** (`linker-x86_64.ld`), because static
   binaries load at 0x400000 and every process owns the low gigabyte. Each
   address space has private copies of the top three page-table levels, exactly

@@ -275,6 +275,12 @@ void *memcpy(void *dest, const void *src, unsigned long n);
 void *memset(void *s, int c, unsigned long n);
 void *memmove(void *dest, const void *src, unsigned long n);
 
+#ifdef __x86_64__
+/* core/src/lkl_pci_x86.rs: LKL's PCI host over nk's ECAM, MSI/MSI-X and
+ * identity DMA. aarch64 builds LKL without PCI. */
+extern struct lkl_dev_pci_ops nk_pci_ops;
+#endif
+
 struct lkl_host_operations lkl_host_ops = {
 	.print = host_print,
 	.panic = host_panic,
@@ -313,6 +319,9 @@ struct lkl_host_operations lkl_host_ops = {
 
 	.ioremap = host_ioremap,
 	.iomem_access = host_iomem_access,
+#ifdef __x86_64__
+	.pci_ops = &nk_pci_ops,
+#endif
 
 	.mmap = host_mmap,
 	.munmap = host_munmap,

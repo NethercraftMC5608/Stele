@@ -337,6 +337,75 @@ pub unsafe fn reserve_linux_window() {
     crate::arch::memory_barrier();
 }
 
+/// A kernel window for device MMIO that the low 4 GiB identity map does not
+/// reach: firmware puts 64-bit BARs high (QEMU's NVMe at 768 GiB), and real
+/// PCs do the same. 1 GiB at 12 GiB, inside PML4[0] and clear of the identity
+/// map (0-4 GiB) and Linux's window (4-8 GiB).
+#[cfg(target_arch = "x86_64")]
+pub const MMIO_VA_BASE: u64 = 12 << 30;
+#[cfg(target_arch = "x86_64")]
+pub const MMIO_VA_SIZE: u64 = 1 << 30;
+#[cfg(target_arch = "x86_64")]
+static MMIO_NEXT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Create the MMIO window's directory before any process exists, for the
+/// same reason as `reserve_linux_window`: address spaces copy the kernel's
+/// upper tables by pointer, so a directory made later would be missing from
+/// every process created before it -- and Linux drives devices from inside a
+/// process's syscalls, on that process's CR3.
+///
+/// # Safety
+/// The frame allocator is up and no process exists yet.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn reserve_mmio_window() {
+    let l0 = table_of(kernel_address_space()) as *mut u64;
+    let va = MMIO_VA_BASE;
+    let l1 = next_table(l0.add(((va >> L0_SHIFT) & 511) as usize));
+    let l1e = l1.add(((va >> L1_SHIFT) & 511) as usize);
+    assert!(
+        *l1e & pte::VALID == 0 || !pte::is_block(*l1e),
+        "the MMIO window overlaps a block mapping at {va:#x}"
+    );
+    next_table(l1e);
+    crate::arch::memory_barrier();
+}
+
+/// Map `[phys, phys+len)` uncached, supervisor-only and non-executable into
+/// the MMIO window, in 2 MiB pages, and return the virtual address of `phys`.
+/// Bump-allocated: device mappings live as long as the machine.
+///
+/// # Safety
+/// `reserve_mmio_window` has run, and the range is device memory, not RAM.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn map_mmio_high(phys: u64, len: u64) -> Option<u64> {
+    use core::sync::atomic::Ordering;
+    let lo = phys & !(BLOCK_2MB - 1);
+    let hi = phys.checked_add(len)?.div_ceil(BLOCK_2MB) * BLOCK_2MB;
+    let span = hi - lo;
+    let off = MMIO_NEXT
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            (n + span <= MMIO_VA_SIZE).then_some(n + span)
+        })
+        .ok()?;
+    let l0 = table_of(kernel_address_space()) as *const u64;
+    let e0 = *l0.add(((MMIO_VA_BASE >> L0_SHIFT) & 511) as usize);
+    let l1 = (e0 & ADDR) as *const u64;
+    let e1 = *l1.add(((MMIO_VA_BASE >> L1_SHIFT) & 511) as usize);
+    if !is_table(e1) {
+        return None; // reserve_mmio_window has not run
+    }
+    let pd = (e1 & ADDR) as *mut u64;
+    let mut i = 0;
+    while i < span {
+        let va = MMIO_VA_BASE + off + i;
+        *pd.add(((va >> L2_SHIFT) & 511) as usize) =
+            (lo + i) | pte::VALID | pte::WRITABLE | pte::HUGE | pte::PCD | pte::PWT | pte::NX;
+        i += BLOCK_2MB;
+    }
+    crate::arch::tlb_flush_all();
+    Some(MMIO_VA_BASE + off + (phys - lo))
+}
+
 /// Map physical pages into Linux's window.
 ///
 /// EL1 only: this is Linux's memory, not a process's, and a process that

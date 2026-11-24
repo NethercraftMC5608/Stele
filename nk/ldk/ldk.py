@@ -672,10 +672,14 @@ python3 /shim/ldk/patch-lkl.py /shim
 #
 # So: when nk.config changes, start from defconfig. Deterministic, and the
 # only cost is a full rebuild on a file that changes rarely.
-WANT=$(md5sum /shim/lkl/nk.config | cut -d" " -f1)
+# An architecture's own fragment (lkl/nk-<arch>.config) follows the shared
+# one and is part of the hash; cat-ing nk.config alone hashes exactly as
+# md5sum of the file did, so an architecture without one is not rebuilt.
+WANT=$(cat /shim/lkl/nk.config /shim/lkl/nk-__ARCH__.config 2>/dev/null | md5sum | cut -d" " -f1)
 if [ ! -f .config ] || [ "$(cat .nk-config-hash 2>/dev/null)" != "$WANT" ]; then
   make ARCH=lkl defconfig >/dev/null
   cat /shim/lkl/nk.config >> .config
+  if [ -f /shim/lkl/nk-__ARCH__.config ]; then cat /shim/lkl/nk-__ARCH__.config >> .config; fi
   make ARCH=lkl olddefconfig >/dev/null
   echo "$WANT" > .nk-config-hash
   echo "  configured: from arch/lkl defconfig plus kernel/lkl/nk.config"
@@ -729,6 +733,7 @@ ld -r -o /tmp/c.o /out/lkl.o /out/nk-host.o
 nm --undefined-only /tmp/c.o | awk '{print "    " $2}' | sort -u
 """
     script = script.replace("__KCFLAGS__", kcflags)
+    script = script.replace("__ARCH__", arch)
     # aarch64 keeps build/lkl so every existing path and script still finds
     # it; a second architecture gets its own directory beside it.
     out = BUILD / ("lkl" if arch == "aarch64" else f"lkl-{arch}")

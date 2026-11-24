@@ -153,6 +153,8 @@ pub mod pci_irq;
 mod pci_irq_test;
 #[cfg(target_arch = "x86_64")]
 mod pci_msix_test;
+#[cfg(all(nk_lkl, target_arch = "x86_64"))]
+pub mod lkl_pci_x86;
 
 /// Where boot-x86_64.s hands over.
 ///
@@ -291,7 +293,9 @@ pub extern "C" fn rust_main(magic: u64, info: u64) -> ! {
     // copies the top of the kernel's tables and Linux must be in all of them.
     #[cfg(nk_lkl)]
     unsafe {
-        paging::reserve_linux_window()
+        paging::reserve_linux_window();
+        #[cfg(target_arch = "x86_64")]
+        paging::reserve_mmio_window()
     };
 
     sched::init();
@@ -599,7 +603,9 @@ pub extern "C" fn rust_main(dtb: *const u8) -> ! {
     // copies the top of the kernel's tables and Linux must be in all of them.
     #[cfg(nk_lkl)]
     unsafe {
-        paging::reserve_linux_window()
+        paging::reserve_linux_window();
+        #[cfg(target_arch = "x86_64")]
+        paging::reserve_mmio_window()
     };
 
     sched::init();
