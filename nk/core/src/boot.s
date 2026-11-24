@@ -1,0 +1,377 @@
+// Entry from QEMU. x0 holds the physical address of the flattened device
+// tree; the arm64 boot protocol guarantees that, and it is the only thing
+// this kernel knows about the machine, so it is preserved all the way into
+// Rust rather than being clobbered by the setup below.
+
+.section ".text.boot", "ax"
+.global _start
+
+// The arm64 Linux image header, 64 bytes, exactly as
+// Documentation/arch/arm64/booting.rst defines it.
+//
+// nk is not Linux and does not want to be, but this header is the only way to
+// be told what machine you are on. Handed an ELF, QEMU loads the segments,
+// jumps to the entry point and stops there: no bootloader stub, no device
+// tree, x0 zero. Measured -- a scan of the first 2MB of RAM found no FDT
+// magic and nothing but zeroes at the bottom of memory. Handed an image with
+// this header it takes the Linux path instead: it places a generated DTB in
+// RAM and enters with x0 pointing at it, which is the entire boot protocol nk
+// needs. The same header is also what GRUB, U-Boot and the EFI stub look for,
+// so this is not a QEMU workaround.
+//
+// text_offset 0x80000 with flags bit 3 clear asks to be loaded 512KB above the
+// start of RAM, which on `virt` is 0x40080000 -- the address linker.ld links
+// for. nk is not position-independent, so that has to be an agreement rather
+// than a hope.
+_start:
+    b       real_start              // code0: the branch is also the first instruction
+    .long   0                       // code1: unused
+    .quad   0x0000000000080000      // text_offset
+    .quad   __image_end - _start    // image_size, BSS and boot stack included
+    .quad   0                       // flags: LE, page size unspecified, fixed base
+    .quad   0                       // res2
+    .quad   0                       // res3
+    .quad   0                       // res4
+    .long   0x644d5241              // magic, "ARM\x64"
+    .long   0                       // res5: PE/COFF header offset; nk is not an EFI image
+
+real_start:
+    mov     x19, x0                 // stash the DTB pointer; x0 is about to go
+
+    // QEMU starts every CPU the -smp count asks for, all at _start. Only
+    // affinity 0 goes on; the rest wait in park until Stage 1 has an SMP
+    // bring-up path. Without this, several CPUs race to zero the same BSS.
+    mrs     x1, mpidr_el1
+    and     x1, x1, #0xff
+    cbnz    x1, park
+
+    // With `-M virt,virtualization=on` (or under some firmware) we arrive at
+    // EL2 instead of EL1. Everything below assumes EL1, so drop if needed.
+    mrs     x0, CurrentEL
+    lsr     x0, x0, #2
+    cmp     x0, #2
+    b.ne    at_el1
+
+    mov     x0, #(1 << 31)          // HCR_EL2.RW: EL1 runs AArch64, not AArch32
+    msr     hcr_el2, x0
+
+    // Let EL1 read the counters, and make its virtual counter equal the
+    // physical one. nk uses the *virtual* timer (see timer.rs), so CNTVOFF is
+    // the line that matters here -- left at whatever reset gave it, EL1's idea
+    // of the time is offset from the machine's by an arbitrary amount.
+    //
+    // This path only runs when nk boots at EL2. Under a hypervisor it does
+    // not, EL2 is not ours, and no amount of setup here can grant EL1 the
+    // physical timer -- which is exactly why the virtual one is used.
+    mrs     x0, cnthctl_el2
+    orr     x0, x0, #3              // EL1PCTEN | EL1PCEN
+    msr     cnthctl_el2, x0
+    msr     cntvoff_el2, xzr        // EL1's virtual counter starts at 0
+
+    mov     x0, #0x3c5              // DAIF all masked, return to EL1h (own SP)
+    msr     spsr_el2, x0
+    adr     x0, at_el1
+    msr     elr_el2, x0
+    eret
+
+at_el1:
+    // Let EL1 use FP and SIMD.
+    //
+    // CPACR_EL1.FPEN is 0 out of reset, which traps every FP and SIMD
+    // instruction to EL1 as "SIMD/FP access trapped". nk's own code never
+    // uses either -- it is built -mgeneral-regs-only -- so this was not
+    // needed until Linux was linked in, and Linux's generic code uses SIMD
+    // freely (a memcpy is enough).
+    //
+    // nk does not save or restore these registers across a context switch,
+    // which is correct only while nothing holds live FP state across one.
+    // The moment user space runs floating-point code, cpu_switch has to grow
+    // the other 512 bytes.
+    mrs     x0, cpacr_el1
+    orr     x0, x0, #(3 << 20)      // FPEN: do not trap
+    msr     cpacr_el1, x0
+    isb
+
+    ldr     x0, =__stack_top
+    mov     sp, x0
+
+    // Zero the BSS. Rust assumes it: every `static mut` and every zeroed
+    // static lives here, and QEMU does not guarantee the memory is clean.
+    ldr     x0, =__bss_start
+    ldr     x1, =__bss_end
+0:  cmp     x0, x1
+    b.hs    1f
+    str     xzr, [x0], #8
+    b       0b
+1:
+
+    ldr     x0, =__vectors
+    msr     vbar_el1, x0
+    isb
+
+    mov     x0, x19                 // rust_main(dtb: *const u8)
+    bl      rust_main
+    // rust_main is -> !, so this is only reached if it ever stops being that.
+
+// ---------------------------------------------------- secondary CPUs --
+//
+// Every CPU the machine starts arrives at `real_start`, and the ones that
+// are not affinity 0 come here. They arrive with the MMU off, no stack, BSS
+// not yet zeroed and no vectors loaded -- the boot CPU has not run a single
+// instruction of its own setup yet -- so this path may touch nothing but the
+// mailbox until it is deliberately released.
+//
+// It waits for a magic value rather than a boolean: the mailbox lives in
+// .bss, and a CPU that arrived before the boot CPU zeroed it could read a
+// stale non-zero word and proceed early. No plausible garbage equals the
+// magic, and zero -- what it will be once BSS is cleared -- does not.
+//
+// The boot CPU has caches on and these CPUs have them off, so the release is
+// a clean-and-sev on that side and a plain read here. See `ap_release`.
+park:
+    ldr     x2, =AP_MAILBOX
+    ldr     w5, =0x4e4b4150         // "NKAP": the release magic
+    mov     x3, x1                  // this CPU's affinity, from above
+wait_release:
+    wfe
+    ldr     w4, [x2]
+    cmp     w4, w5
+    b.ne    wait_release
+
+    // Released. Record this CPU in the mailbox so the boot CPU can report
+    // which ones answered, then wait to be given a stack and the MMU
+    // parameters. `reached` starts at offset 8; entries are cpu+1 so that a
+    // zeroed mailbox means "nobody".
+    add     x5, x2, #8
+    add     w6, w3, #1
+    str     w6, [x5, x3, lsl #2]
+stage2:
+    wfe
+    b       stage2
+
+// ---------------------------------------------------- PSCI secondary --
+//
+// Where PSCI `CPU_ON` is told to start a secondary. Under HVF the parked
+// path above is never taken: HVF does not start secondary vCPUs at the kernel
+// entry at all, so they exist only after `CPU_ON`, and this is their first
+// instruction. Measured, not assumed -- releasing the parked CPUs at `-smp 4`
+// produced zero arrivals, and the same image arrives through here instead.
+//
+// The CPU starts with the MMU off at the physical address it was given, which
+// is this label's link address: the image is loaded at 0x40080000 and linked
+// there, so physical and virtual agree until translation is turned on. x0
+// carries whatever context `CPU_ON` was called with.
+//
+// Milestone 2 stops here: record the arrival so the boot CPU can report it,
+// and nothing else. Stacks, translation and Rust come next, one stage at a
+// time, because each of them can fail in a way that looks like the CPU never
+// starting at all.
+.global secondary_entry
+secondary_entry:
+    mrs     x1, mpidr_el1
+    and     x1, x1, #0xff           // this CPU's affinity (AFF0)
+    ldr     x2, =AP_MAILBOX
+    add     x5, x2, #8              // &reached[0]
+    add     w6, w1, #1              // cpu + 1; zero means "never arrived"
+    str     w6, [x5, x1, lsl #2]
+
+    // Its own stack, published by the boot CPU before . Loaded
+    // before translation is on, from identity-mapped .bss, which is the
+    // only reason it can be loaded at all -- SP has to exist before the
+    // code that turns the MMU on can run.
+    add     x5, x2, #40             // &stack_top[0]
+    ldr     x6, [x5, x1, lsl #3]
+    add     sp, x6, #0
+
+    // cpu index in x0, then into Rust: translation, vectors and the rest
+    // are per-CPU and handled there.
+    add     x0, x1, #0
+    bl      rust_ap_main_arm
+secondary_wait:
+    wfe
+    b       secondary_wait
+
+
+// The vector table. Sixteen entries, each exactly 0x80 bytes, in the fixed
+// order the architecture defines: four exception kinds (sync, IRQ, FIQ,
+// SError) for each of four sources (current EL on SP0, current EL on SPx,
+// lower EL in AArch64, lower EL in AArch32).
+//
+// Every entry currently reports and halts. x0 is clobbered without being
+// saved, which is fine only because nothing here returns -- the moment an
+// entry needs to `eret`, it needs a full register save first.
+
+.section ".text.vectors", "ax"
+
+.macro VENTRY id
+.balign 0x80
+    mov     x0, #\id
+    mrs     x1, esr_el1
+    mrs     x2, far_el1
+    mrs     x3, elr_el1
+    mov     x4, x30                 // the link register: who called the code that faulted
+    mov     x5, sp
+    b       rust_exception
+.endm
+
+// An IRQ, unlike every other entry here, returns -- so it saves state first.
+//
+// x0-x30 plus ELR_EL1 and SPSR_EL1: everything the interrupted code could be
+// holding. x19-x28 are callee-saved and rust_irq will preserve them, but they
+// are saved anyway because the scheduler switches stacks inside this handler,
+// and the frame is then also what the *other* task returns through.
+//
+// No stack switch. The handler runs on the interrupted task's own kernel
+// stack, which is what makes a context switch from here work at all: the
+// frame stays behind on the outgoing stack and is still there, untouched,
+// whenever that task is next chosen.
+.macro VENTRY_IRQ
+.balign 0x80
+    b       irq_entry
+.endm
+
+// A system call, or a fault in user space. Its own entry rather than
+// irq_entry's because it must also save SP_EL0 -- which holds the user's
+// stack pointer on the way in and the current task pointer on the way out.
+.macro VENTRY_EL0_SYNC
+.balign 0x80
+    b       el0_sync_entry
+.endm
+
+.global __vectors
+.balign 2048
+__vectors:
+    VENTRY 0        // current EL, SP0:  synchronous
+    VENTRY_IRQ      // current EL, SP0:  IRQ  (nk runs on SPx; cannot happen)
+    VENTRY 2        // current EL, SP0:  FIQ
+    VENTRY 3        // current EL, SP0:  SError
+    VENTRY 4        // current EL, SPx:  synchronous
+    VENTRY_IRQ      // current EL, SPx:  IRQ  <- the only one that fires
+    VENTRY 6        // current EL, SPx:  FIQ
+    VENTRY 7        // current EL, SPx:  SError
+    VENTRY_EL0_SYNC // lower EL, AArch64: synchronous  <- system calls
+    .balign 128
+    b       el0_irq_entry // same full user frame as SVC, on SP_EL1
+    VENTRY 10       // lower EL, AArch64: FIQ
+    VENTRY 11       // lower EL, AArch64: SError
+    VENTRY 12       // lower EL, AArch32: synchronous
+    VENTRY 13       // lower EL, AArch32: IRQ
+    VENTRY 14       // lower EL, AArch32: FIQ
+    VENTRY 15       // lower EL, AArch32: SError
+
+
+// 272 bytes: 31 general registers, then ELR_EL1 and SPSR_EL1. Sixteen-byte
+// aligned throughout, which the architecture requires of SP at every point an
+// exception could be taken -- including inside this handler.
+.section ".text", "ax"
+irq_entry:
+    sub     sp, sp, #272
+    stp     x0,  x1,  [sp, #16 * 0]
+    stp     x2,  x3,  [sp, #16 * 1]
+    stp     x4,  x5,  [sp, #16 * 2]
+    stp     x6,  x7,  [sp, #16 * 3]
+    stp     x8,  x9,  [sp, #16 * 4]
+    stp     x10, x11, [sp, #16 * 5]
+    stp     x12, x13, [sp, #16 * 6]
+    stp     x14, x15, [sp, #16 * 7]
+    stp     x16, x17, [sp, #16 * 8]
+    stp     x18, x19, [sp, #16 * 9]
+    stp     x20, x21, [sp, #16 * 10]
+    stp     x22, x23, [sp, #16 * 11]
+    stp     x24, x25, [sp, #16 * 12]
+    stp     x26, x27, [sp, #16 * 13]
+    stp     x28, x29, [sp, #16 * 14]
+    mrs     x0, elr_el1
+    mrs     x1, spsr_el1
+    stp     x30, x0,  [sp, #16 * 15]
+    str     x1,       [sp, #16 * 16]
+
+    bl      rust_irq
+
+    ldr     x1,       [sp, #16 * 16]
+    ldp     x30, x0,  [sp, #16 * 15]
+    msr     elr_el1, x0
+    msr     spsr_el1, x1
+    ldp     x0,  x1,  [sp, #16 * 0]
+    ldp     x2,  x3,  [sp, #16 * 1]
+    ldp     x4,  x5,  [sp, #16 * 2]
+    ldp     x6,  x7,  [sp, #16 * 3]
+    ldp     x8,  x9,  [sp, #16 * 4]
+    ldp     x10, x11, [sp, #16 * 5]
+    ldp     x12, x13, [sp, #16 * 6]
+    ldp     x14, x15, [sp, #16 * 7]
+    ldp     x16, x17, [sp, #16 * 8]
+    ldp     x18, x19, [sp, #16 * 9]
+    ldp     x20, x21, [sp, #16 * 10]
+    ldp     x22, x23, [sp, #16 * 11]
+    ldp     x24, x25, [sp, #16 * 12]
+    ldp     x26, x27, [sp, #16 * 13]
+    ldp     x28, x29, [sp, #16 * 14]
+    add     sp, sp, #272
+    eret
+
+
+// cpu_switch(prev_on_cpu, prev_sp, next_sp, next_current, next_id)
+//
+// x0 = outgoing task's on_cpu byte, x1 = &outgoing TASKS[cur].sp,
+// x2 = incoming sp, x3 = &CPUS[cpu].current, x4 = incoming task id.
+//
+// The saved SP is stored before the release store below, and the incoming
+// task is named current before it runs.
+.global cpu_switch
+cpu_switch:
+    sub     sp, sp, #96
+    stp     x19, x20, [sp, #16 * 0]
+    stp     x21, x22, [sp, #16 * 1]
+    stp     x23, x24, [sp, #16 * 2]
+    stp     x25, x26, [sp, #16 * 3]
+    stp     x27, x28, [sp, #16 * 4]
+    stp     x29, x30, [sp, #16 * 5]
+
+    mov     x8, sp
+    str     x8, [x1]                // TASKS[cur].sp = sp: the saved context
+    mov     sp, x2                  // take up where the incoming one did
+    stlr    x4, [x3]                // CPUS[cpu].current = next_id (Release:
+                                    // pairs with Acquire loads on other CPUs).
+    mvn     x9, xzr                 // x9 = NO_OWNER (all ones)
+    stlr    x9, [x0]                // Release: the outgoing context is unowned.
+
+                                    // All earlier stores -- the saved SP above
+                                    // -- are ordered before this one, so a
+                                    // consumer that Acquire-observes
+                                    //  sees the saved context.
+    ldp     x19, x20, [sp, #16 * 0]
+    ldp     x21, x22, [sp, #16 * 1]
+    ldp     x23, x24, [sp, #16 * 2]
+    ldp     x25, x26, [sp, #16 * 3]
+    ldp     x27, x28, [sp, #16 * 4]
+    ldp     x29, x30, [sp, #16 * 5]
+    add     sp, sp, #96
+    ret                             // to wherever x30 came from: the other task
+
+
+// Where a task begins. sched.rs builds a frame whose x30 is this label and
+// whose x19/x20 hold the entry point and its argument, so the `ret` above
+// lands here with everything already in place. A task that returns falls into
+// task_exit rather than off the end of its stack.
+.global task_start
+task_start:
+    // Consume the completed-switch record for the switch that started this
+    // task, before interrupts are unmasked and before the body runs.
+    bl      switch_complete_entry
+
+    // Unmask interrupts before the task's first instruction.
+    //
+    // Every other task resumes by returning through irq_entry's epilogue,
+    // whose `eret` restores SPSR_EL1 and with it the interrupt mask. A brand
+    // new task has no such frame -- cpu_switch simply `ret`s here -- so it
+    // inherits DAIF exactly as the timer handler left it, which is masked,
+    // because the CPU masks interrupts on exception entry.
+    //
+    // The symptom is precise and misleading: the first task starts, runs, and
+    // then the whole machine stops. Nothing has crashed. It is spinning with
+    // the only thing that could ever preempt it switched off.
+    msr     daifclr, #0xf
+    mov     x0, x20
+    blr     x19
+    b       task_exit
