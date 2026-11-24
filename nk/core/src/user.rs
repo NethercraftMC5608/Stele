@@ -893,10 +893,55 @@ fn signal_dispatch(_frame: &Frame) -> i64 {
 /// Hand a call to Linux, with its pointers copied across.
 #[cfg(nk_lkl)]
 fn forward(nr: u64, args: &[u64; 6]) -> i64 {
-    match crate::syscall::forward(nr, args) {
+    let rc = match crate::syscall::forward(nr, args) {
         Some(ret) => ret,
         None => -38, // -ENOSYS: no Linux to forward to
+    };
+    #[cfg(target_arch = "x86_64")]
+    let rc = lkl_interrupted(rc);
+    rc
+}
+
+/// A call Linux interrupted for a signal Linux raised itself.
+///
+/// Some signals are born inside Linux: an itimer's SIGALRM (glibc's `alarm`
+/// is `setitimer`, forwarded as-is), a socket's SIGPIPE/SIGIO. Linux marks
+/// them pending on the process's LKL task, which makes every blocking call
+/// return at once -- but nk keeps each process's dispositions and pending set
+/// itself, so the handler never ran and the signal was never consumed:
+/// busybox ping called recvfrom three million times after its first reply.
+///
+/// So on an interrupted return: move what LKL has pending for this task into
+/// nk's set (where `deliver` runs the handler on the way back to user space)
+/// and dequeue it on LKL's side. And never let -ERESTART* (-512..-516) escape:
+/// those are kernel-internal, and -512 is nk's own "frame already set"
+/// sentinel for rt_sigreturn. They become -EINTR; SA_RESTART is not honoured.
+///
+/// x86-64 only for now; aarch64 has the same gap.
+#[cfg(all(nk_lkl, target_arch = "x86_64"))]
+fn lkl_interrupted(rc: i64) -> i64 {
+    if rc != -4 && !(-516..=-512).contains(&rc) {
+        return rc;
     }
+    // Drain with rt_sigtimedwait (asm-generic 137) over every signal and a
+    // zero timeout: each call dequeues one pending signal or returns -EAGAIN.
+    // Not rt_sigpending -- that reports only signals that are pending *and
+    // blocked*, and nothing is blocked on LKL's side, so it said "none" while
+    // recvfrom kept returning -EINTR. Kernel buffers for the duration.
+    let me = crate::sched::current_id();
+    let lpid = crate::sched::linux_pid(me);
+    let all: u64 = !((1u64 << (9 - 1)) | (1u64 << (19 - 1))); // not SIGKILL/SIGSTOP
+    let zero: [i64; 2] = [0, 0];
+    let was = crate::sched::set_user_syscall(false);
+    for _ in 0..64 {
+        let sig = crate::lkl::syscall(137, [&raw const all as i64, 0, zero.as_ptr() as i64, 8, 0, 0]);
+        if sig <= 0 || sig > 64 {
+            break;
+        }
+        let _ = crate::signal::post(lpid, sig as u64);
+    }
+    crate::sched::set_user_syscall(was);
+    if rc == -4 { rc } else { -4 }
 }
 
 /// # poll(fds, nfds, timeout_ms)

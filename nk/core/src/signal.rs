@@ -246,6 +246,8 @@ pub fn sigaction(sig: u64, action: u64, old: u64) -> i64 {
             flags,
             restorer,
         });
+        #[cfg(target_arch = "x86_64")]
+        mirror_to_lkl(sig, handler);
         // A handler installed for a pending signal makes it deliverable:
         // wake the task in case it is waiting in `sigsuspend` or `pause`.
         if handler != SIG_DFL && handler != SIG_IGN {
@@ -253,6 +255,35 @@ pub fn sigaction(sig: u64, action: u64, old: u64) -> i64 {
         }
     }
     0
+}
+
+/// Tell Linux what this process does with `sig`, coarsely.
+///
+/// nk keeps the real dispositions; Linux keeps its own for the process's LKL
+/// task, and those were all SIG_DFL. So a signal Linux raises itself -- an
+/// itimer's SIGALRM, a socket's SIGPIPE -- took Linux's *default* action,
+/// which for SIGALRM is terminate: Linux marked the task dying, every
+/// interruptible wait returned -EINTR from then on, and busybox ping spun in
+/// recvfrom after its first reply instead of running its alarm handler.
+///
+/// Linux only needs to know caught / ignored / default. A caught signal gets
+/// a placeholder handler there (never run: LKL tasks do not return to user
+/// space through Linux), so Linux interrupts the wait and leaves the signal
+/// pending; `user::lkl_interrupted` then moves it to nk, which runs the real
+/// handler. Kernel buffers; the LKL-side struct is the asm-generic
+/// handler/flags/restorer/mask layout.
+#[cfg(target_arch = "x86_64")]
+fn mirror_to_lkl(sig: u64, handler: u64) {
+    if sig == SIGKILL || sig == SIGSTOP || sig == 0 || sig > 64 {
+        return;
+    }
+    const PLACEHOLDER: u64 = 2; // neither SIG_DFL (0) nor SIG_IGN (1)
+    let lkl_handler = if handler == SIG_DFL || handler == SIG_IGN { handler } else { PLACEHOLDER };
+    let act: [u64; 4] = [lkl_handler, 0, 0, 0];
+    let was = sched::set_user_syscall(false);
+    // asm-generic rt_sigaction = 134
+    let _ = crate::lkl::syscall(134, [sig as i64, act.as_ptr() as i64, 0, 8, 0, 0]);
+    sched::set_user_syscall(was);
 }
 
 /// # rt_sigprocmask(how, set, oldset)
