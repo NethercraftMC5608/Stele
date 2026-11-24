@@ -307,3 +307,25 @@ bridge markers plus Linux's `nvme0n1: p1`, which needs config space, BAR
 access, DMA and interrupt completion all working. `NVME_PASS` on success.
 Verified by hand on 2026-11-24 as well: from busybox, `/dev/nvme0n1p1` exists,
 sector 1 reads `EFI PART`, and 1 MiB writes and a full-partition read complete.
+
+## Ethernet: e1000e, DHCP and ping (x86-64)
+
+Linux's `e1000e` driver through the same bridge, on its own root bus beside
+an NVMe disk (`lkl_pci=` takes a list since `patch-lkl.py`'s
+`multi_pci_devices`). busybox `ifconfig eth0 up`, `udhcpc` against QEMU's
+user-mode network, and `ping -c 3 10.0.2.2`.
+
+```sh
+python3 ldk/ldk.py lkl --arch x86_64        # e1000e, AF_PACKET, -mno-red-zone
+NK_LKL_LIB=$PWD/ldk/build/lkl-x86_64/libnklkl.a \
+  cargo build --release --target x86_64-unknown-none --target-dir target-hx
+python3 tests/run-net-x86.py --kernel target-hx/x86_64-unknown-none/release/nk \
+  --busybox /path/to/static/x86_64/busybox
+```
+
+`NET_PASS` needs the link up, a lease (`LEASE eth0 10.0.2.15`), three replies
+and 0% loss. It found three x86 problems, all fixed in the same change:
+the clock froze inside syscalls (udelay spun for ever), LKL was built with
+the userspace red zone (interrupt frames overwrote driver locals), and a
+signal Linux raised itself (ping's SIGALRM) took Linux's default action.
+Verified 2026-11-25 with `NK_SMP=1 NK_AP_LAYER=4` and without.

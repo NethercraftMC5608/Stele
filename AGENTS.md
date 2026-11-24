@@ -159,6 +159,17 @@ require it to pass; both the rebuilt x86 archive and cached arm64 archive pass.
   12 GiB, whose directory must exist before the first process. LKL's PCI
   host is x86-only (`lkl/nk-x86_64.config`): on aarch64 it would route
   virtio-mmio DMA through `lkl_dma_ops`.
+- **LKL on x86 is built with `-mno-red-zone`** (`ldk.py`, KCFLAGS and the
+  nk-host.c compile). Linux runs at ring 0 under nk, where interrupts push
+  onto the current stack; with the userspace red zone, device interrupts
+  overwrote driver locals. Rebuilding the archive is required after pulling.
+- **The x86 clock is the TSC** (`timer::time_ns`, `nk_time_ns`). Syscalls run
+  with IF masked, so a tick-based clock froze and LKL's `udelay` spun forever.
+- **Signals Linux raises itself** (itimer SIGALRM, SIGPIPE) are moved to nk on
+  an interrupted return (`user::lkl_interrupted`, draining with
+  `rt_sigtimedwait`), and caught dispositions are mirrored into LKL
+  (`signal::mirror_to_lkl`) so Linux doesn't take the default action. x86
+  only so far; aarch64 has the same gap.
 - **The kernel links at 1 GiB on x86** (`linker-x86_64.ld`), because static
   binaries load at 0x400000 and every process owns the low gigabyte. Each
   address space has private copies of the top three page-table levels, exactly

@@ -115,15 +115,19 @@ LKL's drivers attach to real hardware. Pick one reference PC (from Phase 0).
         Linux IRQs through device vectors and the LKL IRQ pump). LKL's PCI host
         is x86-only (`lkl/nk-x86_64.config`). `nk/tests/run-nvme-x86.py`
         (2026-11-24).
-  - [ ] LKL hosts one PCI device (`lkl_pci=`). More than one needs LKL's
-        host extended (several root buses) or one LKL bus per device.
+  - [x] Several PCI devices: `lkl_pci=` takes a list, one root bus each
+        (`ldk/patch-lkl.py: multi_pci_devices`); nk passes NVMe and the first
+        Ethernet controller (2026-11-25).
   - [ ] INTx (needs ACPI `_PRT`/AML) and multiple-message MSI; BAR
         assignment when firmware left a BAR unassigned.
 - [ ] Linux drivers on real devices, one class at a time, each from LKL:
   - [ ] NVMe (`nvme`): read the disk's GPT. QEMU done: Linux's driver
         binds, reads the GPT (`nvme0n1: p1`), and busybox reads and writes
         the partition. Real hardware still open.
-  - [ ] Ethernet (`igc`/`e1000e`/`r8169`): DHCP and a ping.
+  - [ ] Ethernet (`igc`/`e1000e`/`r8169`): DHCP and a ping. QEMU done
+        for `e1000e`: link up, DHCP lease, 3/3 pings
+        (`nk/tests/run-net-x86.py`, 2026-11-25). Real hardware, and
+        `igc`/`r8169`, still open.
   - [ ] xHCI + HID (`xhci_hcd`, `usbhid`): keyboard input.
   - [ ] HD Audio (`snd_hda_intel`): play a tone.
   - [ ] Wi-Fi (`iwlwifi` + firmware): associate. (Stela has no Wi-Fi at all.)
