@@ -1,0 +1,172 @@
+# Roadmap: macOS 27 on nk + LKL
+
+The ordered checklist for getting from where Stele and nk are today to a
+macOS 27 desktop on an x86-64 PC, with Stela's translator and M2 model running
+on nk, and the PC hardware driven by unmodified Linux drivers through LKL.
+Read [AGENTS.md](AGENTS.md) first for the architecture and the names.
+
+Each phase depends on the one before it. Each item says when it counts as
+done. `[x]` means done and verified, and the item names where.
+
+Stela itself already installs and boots macOS 27 (`stela-cli` handles `27.x`
+restore images). So the macOS side is solved once. The work below is mostly
+moving that proven path onto a new host.
+
+---
+
+## Phase 0: baseline on Stela as it is
+
+Know what "working" looks like before changing the host.
+
+- [ ] Build Stele unchanged (`cargo xtask dist`) and boot macOS 27 on one
+      supported PC (GTX 16 / RTX GPU, supported NIC). Done when: login screen.
+- [ ] Save that boot's log (`stela log --output`) as the reference: device
+      order, timing, the first guest serial lines. Done when: committed under
+      `docs/reference/`.
+- [ ] Write down which Stela drivers that machine used (storage, NIC, audio,
+      USB, GPU). These are the ones LKL must replace first.
+
+## Phase 1: nk x86-64 userland (QEMU)
+
+Branch `nk-x86-userland` in the NETHOS repo.
+
+- [x] Boot, 4 CPUs, scheduler torture, LKL starts (`smp-sleep-halt-fix`).
+- [x] Ring 3 with a static binary: 1 GiB link, private low page tables,
+      `syscall_entry` stack index, TLS pages (`9826149`, `04f4650`, `7b87594`).
+- [x] fork / vfork / execve (`4827970`, `5d8edac`).
+- [x] 309 syscalls translated by name, `stat` converted, legacy calls (`5d8edac`).
+- [x] Signals with handlers and `rt_sigreturn` (`ae78a27`).
+- [x] `cpu_id` rbx truncation (`72b0b82`); open flags to arm64 values, epoll
+      repacking (`08d835e`).
+- [x] Harness `/nk-init` runs to the end; `ls`, `find`, pipes, file I/O.
+- [ ] Exercise epoll (a small static test program). Done when: epoll_wait
+      returns the right fd and data.
+- [ ] Dynamically linked programs: `ld-linux-x86-64.so`, glibc, `dlopen`.
+      Done when: a dynamic `python3 -c 'print(1)'` runs.
+- [ ] Threads on x86: `clone(CLONE_THREAD)` with the x86 argument order,
+      futex, TLS per thread. Done when: a pthread test with 8 threads passes.
+- [ ] Return-value-before-signal ordering on aarch64 (fixed on x86 only).
+      Done when: the aarch64 probes still pass with it.
+- [ ] `LKL_CPU_SEED` derived at build time instead of hand-edited.
+- [ ] Merge `nk-x86-userland` with `nk-initrd-builder` and push.
+
+## Phase 2: nk on a real PC
+
+LKL's drivers attach to real hardware. Pick one reference PC (from Phase 0).
+
+- [ ] Boot path: GRUB Multiboot2 on UEFI (already parsed by
+      `bootinfo_x86.rs`), or nk's own EFI stub. Done when: nk's banner on serial
+      or framebuffer on real hardware.
+- [ ] A console that works without serial: UEFI GOP framebuffer text, and
+      later netconsole. Done when: the boot log can be read on screen.
+- [ ] ACPI: RSDP → XSDT → MADT (CPUs, IOAPIC, LAPIC address), MCFG (PCIe
+      ECAM), FADT (reset, power off). Replace the q35 assumptions in `smp.rs`
+      and `lapic.rs`. Done when: all CPUs come up on the real machine.
+- [ ] IOAPIC and MSI/MSI-X delivery into nk's interrupt path.
+- [ ] PCIe enumeration and LKL's PCI host ops (`lkl_dev_pci_ops` in
+      `host_ops.h`): config space, BARs, DMA mapping, MSI-X. Done when: LKL logs
+      PCI devices.
+- [ ] Linux drivers on real devices, one class at a time, each from LKL:
+  - [ ] NVMe (`nvme`): read the disk's GPT.
+  - [ ] Ethernet (`igc`/`e1000e`/`r8169`): DHCP and a ping.
+  - [ ] xHCI + HID (`xhci_hcd`, `usbhid`): keyboard input.
+  - [ ] HD Audio (`snd_hda_intel`): play a tone.
+  - [ ] Wi-Fi (`iwlwifi` + firmware): associate. (Stela has no Wi-Fi at all.)
+- [ ] LKL's single-CPU bottleneck measured on real I/O (disk throughput,
+      network). Decide whether it's acceptable for a guest. If not, plan
+      multi-CPU LKL or per-device threading.
+- [ ] Optional: move LKL from 6.12 to a newer tree if a needed driver is missing.
+
+## Phase 3: nk as a host for a translated guest
+
+What Stela's runtime needs from the kernel underneath it.
+
+- [ ] Guest memory: large physically contiguous regions (several GiB), 2 MiB
+      pages, mapped where the engine expects. Done when: the engine's memory
+      service allocates guest RAM on nk.
+- [ ] Dedicated cores: pin guest vCPU threads, keep LKL and nk's own work on
+      other CPUs. Done when: a busy loop on a vCPU core is not preempted.
+- [ ] Executable memory for translated code (W^X handling, icache is coherent
+      on x86), and fault handling the engine can hook (guest page faults, MMIO
+      traps). Done when: a page fault in translated code reaches an engine
+      callback.
+- [ ] High-resolution timers and a clean way to inject guest interrupts.
+- [ ] Decide the isolation model: translated guest code at ring 0 inside nk
+      (like stela.efi), at ring 3, or in VMX non-root. Record it in AGENTS.md.
+
+## Phase 4: Stela's translator inside nk
+
+- [ ] Build `stela-compiler`, `stela-engine`, `stela-contracts`,
+      `stela-formats` for `x86_64-unknown-none` with `default-features = false`.
+      `stela-boot` already does this for UEFI, so it should mostly work. Done
+      when: they link into nk.
+- [ ] A host trait between `stela-runtime` and its host (memory, timers, I/O,
+      logging), with nk as one implementation and stela.efi as the other.
+- [ ] Run translated arm64 blocks inside nk (the equivalent of `stela-dev
+      run-blocks`). Done when: a known block sequence gives the same final
+      state as on Stela.
+- [ ] Pointer authentication, AMX, NEON/SVE paths verified on nk the same way.
+
+## Phase 5: the M2 machine and macOS 27's early boot
+
+- [ ] `stela-soc` + `stela-soc-data` (the T8112 device models) running on nk.
+- [ ] `stela-loader`: load the boot bundle and kernelcache that `stela-cli`
+      prepares for macOS 27 from a disk LKL reads.
+- [ ] Hand off to the macOS 27 kernel. Done when: XNU's first serial output
+      matches the Phase 0 reference.
+- [ ] Get as far as the root filesystem mount on the reference timeline.
+
+## Phase 6: device bridges (fake Apple device → Linux)
+
+Each bridge replaces one Stela driver class with LKL. Order follows what macOS
+needs to reach a login screen.
+
+- [ ] Storage: the guest's Apple NVMe/ANS → an LKL block device (the macOS
+      partition). Done when: macOS mounts its APFS volumes.
+- [ ] Display, basic: guest framebuffer → LKL DRM/KMS on the real GPU. Done
+      when: the macOS boot screen shows.
+- [ ] Input: guest USB keyboard and mouse → LKL evdev.
+- [ ] Network: guest Ethernet → an LKL netdev (tap or raw).
+- [ ] Audio: the guest USB speaker → ALSA via LKL (Stele's audio-bridge mod is
+      the same idea on Stela's own driver).
+- [ ] USB passthrough for other devices (optional).
+
+## Phase 7: GPU and Metal
+
+The largest single piece, and the one that makes the desktop usable.
+
+- [ ] Choose the kernel side: Stela's own nouveau port (`stela-driver-gpu`),
+      or Linux nouveau with GSP firmware inside LKL, reached through DRM.
+- [ ] Bring `stela-mesa` (NVK, NIR, NAK) and the Metal device (AIR → NIR)
+      onto nk, on top of that kernel side.
+- [ ] `stela-gpu-maintenance` installs the guest GPU components into macOS 27.
+- [ ] WindowServer composites with Metal. Done when: the desktop is GPU-drawn.
+
+## Phase 8: macOS 27 installed and usable
+
+- [ ] Install flow: `stela-cli` prepares the USB stick with nk as the host
+      instead of stela.efi, and installs macOS 27 to the internal disk.
+- [ ] Setup Assistant completes; log in; Finder, Safari, Terminal work.
+- [ ] Sleep/wake, shutdown and restart through ACPI (FADT).
+- [ ] A macOS 27.x point update installs and boots.
+- [ ] Performance compared with Stela on the same PC (boot time, a CPU
+      benchmark, disk and network throughput).
+
+## Phase 9: hardening and release
+
+- [ ] Long-running stability: a 24-hour idle and a 4-hour load run without a
+      host stall.
+- [ ] Crash capture: nk panics and LKL oopses saved to disk and readable with
+      `stela log`.
+- [ ] Hardware matrix: two Intel and two AMD PCs, NVIDIA GTX 16 / RTX 20–50.
+- [ ] Release build and a README section for installing Stele-on-nk.
+- [ ] Keep upstream Stela merges working throughout (see AGENTS.md).
+
+---
+
+Notes:
+
+- Running macOS on non-Apple hardware is outside Apple's software licence;
+  Stela's README already makes users responsible for that. Keep that wording.
+- Phase 2 is useful on its own (NETHOS on nk on real hardware), so it's a safe
+  investment even before the macOS work starts paying off.

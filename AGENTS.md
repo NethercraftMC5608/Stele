@@ -80,6 +80,9 @@ Keep: the translator and the Mac model. Replace: the PC drivers, with Linux's.
 - `stela-dev run-blocks`: runs translated code natively on a host. The only
   hosted runner today; a full guest boots only through `stela.efi`.
 
+The full ordered checklist to macOS 27 is in [ROADMAP.md](ROADMAP.md). Tick
+items there as they land, with the commit that did it.
+
 ## nk x86-64: where it stands
 
 Branch **`nk-x86-userland`** (based on `smp-sleep-halt-fix`) in the NETHOS repo.
