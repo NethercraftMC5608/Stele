@@ -44,6 +44,7 @@ its tree in a docker volume for the same reason.
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import os
 import shlex
@@ -60,11 +61,10 @@ BUILD = HERE / "build"
 STUBS = KERNEL / "linux" / "stubs"
 EMUL = KERNEL / "linux" / "emul"
 
-# pkg/ is the project's own ELF reader. Reused rather than reimplemented, and
-# rather than shelling out to nm: the same file already answers this question
-# for packages, and a .o is only an ELF with no program headers.
-sys.path.insert(0, str(ROOT / "pkg"))
-import npkg_elf  # noqa: E402
+# The legacy individual-driver reports use NETHOS's package ELF reader.
+# LKL builds have their own ABI checker and do not need that optional module.
+# Import it only when a legacy report actually analyzes an object: Stele's
+# imported nk tree intentionally does not include the NETHOS package manager.
 
 IMAGE = "nethos-ldk"
 SRC_VOLUME = "nethos-ldk-src"
@@ -126,6 +126,19 @@ def say(msg):
 def die(msg):
     print(f"\033[1;31mERROR:\033[0m {msg}", file=sys.stderr)
     raise SystemExit(1)
+
+
+def legacy_elf():
+    pkg = ROOT / "pkg"
+    if pkg.is_dir() and str(pkg) not in sys.path:
+        sys.path.insert(0, str(pkg))
+    try:
+        return importlib.import_module("npkg_elf")
+    except ModuleNotFoundError as error:
+        if error.name != "npkg_elf":
+            raise
+        die("individual-driver object analysis needs NETHOS pkg/npkg_elf.py on PYTHONPATH; "
+            "the independent 'lkl' command does not need it")
 
 
 def have_docker() -> bool:
@@ -264,7 +277,7 @@ def shim_symbols() -> set[str]:
     """
     provided: set[str] = set()
     for obj in sorted((BUILD / "_shim").glob("*.o")):
-        defined, _ = npkg_elf.symbols(str(obj))
+        defined, _ = legacy_elf().symbols(str(obj))
         provided |= defined
     return provided
 
@@ -294,7 +307,7 @@ def analyse(port: dict) -> dict:
     defined: set[str] = set()
     undefined: set[str] = set()
     for obj in objs:
-        d, u = npkg_elf.symbols(str(obj))
+        d, u = legacy_elf().symbols(str(obj))
         defined |= d
         undefined |= u
 
@@ -308,7 +321,7 @@ def analyse(port: dict) -> dict:
     shim_def: set[str] = set()
     shim_undef: set[str] = set()
     for obj in sorted((BUILD / "_shim").glob("*.o")):
-        d, u = npkg_elf.symbols(str(obj))
+        d, u = legacy_elf().symbols(str(obj))
         shim_def |= d
         shim_undef |= u
 
@@ -328,7 +341,7 @@ def analyse(port: dict) -> dict:
     called: set[str] = set()
     loaded: set[str] = set()
     for obj in objs + sorted((BUILD / "_shim").glob("*.o")):
-        c, l = npkg_elf.references(str(obj))
+        c, l = legacy_elf().references(str(obj))
         called |= c
         loaded |= l
 
@@ -626,6 +639,14 @@ def cmd_lkl(args):
     say(f"Fetching lkl/linux for {arch} (shallow; a few minutes the first time)")
     subprocess.run(["docker", "volume", "create", volume],
                    check=True, stdout=subprocess.DEVNULL)
+    # A fresh Docker installation may not have the per-architecture builder
+    # image. Build it from this checkout instead of trying to pull a private
+    # local image name from Docker Hub. Existing builder images are reused.
+    probe = subprocess.run(["docker", "image", "inspect", image],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if probe.returncode != 0:
+        say(f"Building {image} for {platform}")
+        subprocess.run(["docker", "build", "--platform", platform, "-t", image, str(HERE)], check=True)
     script = """
 set -e
 command -v git >/dev/null || { apt-get update -qq && apt-get install -y -qq git; } >/dev/null 2>&1
@@ -697,7 +718,11 @@ cp arch/lkl/include/uapi/lkl.h /out/ 2>/dev/null || true
 strip --strip-debug lkl.o -o /out/lkl.o
 gcc -c -ffreestanding -fno-stack-protector -fno-PIE -mgeneral-regs-only \
     -Wall -Wextra -Wno-unused-parameter -I/out /shim/lkl/nk-host.c -o /out/nk-host.o
-rm -f /out/libnklkl.a && ar rcs /out/libnklkl.a /out/lkl.o /out/nk-host.o
+rm -f /out/libnklkl.a.tmp && ar rcs /out/libnklkl.a.tmp /out/lkl.o /out/nk-host.o
+# Verify the private syscall table before publishing the new archive.
+# A failed build leaves the prior archive intact.
+python3 /shim/ldk/lkl_abi.py /out/libnklkl.a.tmp
+mv /out/libnklkl.a.tmp /out/libnklkl.a
 echo "  lkl.o: $(stat -c%s /out/lkl.o) bytes stripped"
 echo "  the whole Linux kernel still wants, from nk:"
 ld -r -o /tmp/c.o /out/lkl.o /out/nk-host.o

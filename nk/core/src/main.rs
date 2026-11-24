@@ -135,6 +135,24 @@ global_asm!(include_str!("interrupts-x86_64.s"), options(att_syntax));
 
 #[cfg(target_arch = "x86_64")]
 pub mod bootinfo_x86;
+#[cfg(target_arch = "x86_64")]
+pub mod acpi;
+#[cfg(target_arch = "x86_64")]
+pub mod pci;
+#[cfg(target_arch = "x86_64")]
+mod platform_x86;
+#[cfg(target_arch = "x86_64")]
+pub mod irq_x86;
+#[cfg(target_arch = "x86_64")]
+pub mod device_irq_x86;
+#[cfg(target_arch = "x86_64")]
+pub mod ioapic;
+#[cfg(target_arch = "x86_64")]
+pub mod pci_irq;
+#[cfg(target_arch = "x86_64")]
+mod pci_irq_test;
+#[cfg(target_arch = "x86_64")]
+mod pci_msix_test;
 
 /// Where boot-x86_64.s hands over.
 ///
@@ -146,6 +164,7 @@ pub mod bootinfo_x86;
 #[no_mangle]
 pub extern "C" fn rust_main(magic: u64, info: u64) -> ! {
     unsafe { uart_x86::console().init() };
+    unsafe { lapic::discover_base() };
     println!();
     println!("NETHOS kernel (nk) {} -- x86_64", env!("CARGO_PKG_VERSION"));
     println!("  magic: {:#x}  info: {:#x}", magic, info);
@@ -158,6 +177,7 @@ pub extern "C" fn rust_main(magic: u64, info: u64) -> ! {
 
     let boot = match magic as u32 {
         0x50564800 => unsafe { bootinfo_x86::parse_pvh(info) },
+        0x36d76289 => unsafe { bootinfo_x86::parse_multiboot2(info) },
         _ => None,
     };
 
@@ -208,7 +228,12 @@ pub extern "C" fn rust_main(magic: u64, info: u64) -> ! {
     // unusable until nk maps high memory.
     const MAPPED_LIMIT: usize = 4 * 1024 * 1024 * 1024;
 
-    let mut reserved = [initrd, linux];
+    // GRUB's ACPI RSDP copy lives inside its info block. Keep that block
+    // intact until firmware discovery, even if the loader placed it in RAM
+    // above nk's image. Frame allocations require page-aligned exclusions.
+    let loader_info = boot.info_range.map(|(s,e)|
+        ((s as usize)&!4095,(e as usize).div_ceil(4096)*4096)).unwrap_or((0,0));
+    let mut reserved = [initrd, linux, loader_info];
     reserved.sort_unstable();
 
     let mut highest_end = 0usize;
@@ -259,6 +284,8 @@ pub extern "C" fn rust_main(magic: u64, info: u64) -> ! {
 
     // Reserve 192MB for the kernel heap, matching the aarch64 heap bump.
     unsafe { heap::init(192) };
+
+    platform_x86::discover(&boot);
 
     // Before any process exists, because every address space nk creates
     // copies the top of the kernel's tables and Linux must be in all of them.
@@ -317,6 +344,8 @@ pub extern "C" fn rust_main(magic: u64, info: u64) -> ! {
         lapic::calibrate_timer();
     }
 
+    ioapic::route_pit();
+
     println!();
     println!("Stage 1 up on x86-64. Unmasking interrupts.");
     sched::enable();
@@ -366,6 +395,9 @@ pub extern "C" fn rust_main(magic: u64, info: u64) -> ! {
             println!("  timer:  !! no tick after {} spins -- PIT or PIC not delivering", spins);
         }
     }
+
+    pci_irq_test::run();
+    pci_msix_test::run();
 
     // Exercise the context switch and timer: two threads alternating
     extern "C" fn test_worker(id: usize) {
@@ -1208,49 +1240,25 @@ struct LklCpu {
     shutdown_sem: *mut u8,
 }
 
-/// The linked address of LKL's `cpu` global (a local symbol: `b cpu`, so it
-/// cannot be named from Rust). Derived with `llvm-nm` on the linked ELF.
-///
-/// This is a hazard: it is a hardcoded address for a symbol the linker is
-/// free to move, and it has gone stale at least once -- an unrelated change
-/// shifted it by 0x800 and nothing said so, because a stale address does not
-/// fault. It reads whatever now lives there as an `LklCpu`, and the wait
-/// graph reports an owner, count and sleeper tally that are entirely
-/// plausible and belong to a different structure.
-///
-/// `check_lkl_cpu_addr` compares it against the offset build.rs read out of
-/// the archive, so a stale constant is reported at boot instead of being
-/// believed.
-///
-/// Per-architecture: the same symbol in the same archive lands at a
-/// different address because nk's own sections are sized differently.
-#[cfg(all(nk_lkl, target_arch = "aarch64"))]
-const LKL_CPU_SEED: usize = 0x0000000040e29eb8;
-#[cfg(all(nk_lkl, target_arch = "x86_64"))]
-const LKL_CPU_SEED: usize = 0x0000000040e7ca60;
-
-/// Where `cpu` actually is, once `check_lkl_cpu_addr` has confirmed it.
-///
-/// The seed above is only a starting guess. Any edit to nk relinks the image
-/// and moves every file-local bss symbol with it, so a constant is stale the
-/// moment the next build runs -- and a stale one does not fault, it reports a
-/// wait graph belonging to whatever else now lives there. The search below
-/// finds the real one at boot and everything after reads it from here.
+// build.rs exposes LKL's file-local cpu under a namespaced global in a
+// private archive. The linker supplies the address after layout/relocation.
 #[cfg(nk_lkl)]
-static mut LKL_CPU_FOUND: usize = LKL_CPU_SEED;
+unsafe extern "C" {
+    static nk_lkl_cpu: LklCpu;
+}
 
 #[cfg(nk_lkl)]
 #[inline]
 fn lkl_cpu_addr() -> usize {
-    unsafe { *(&raw const LKL_CPU_FOUND) }
+    &raw const nk_lkl_cpu as usize
 }
 
 /// Does `addr` hold something shaped like LKL's `cpu`?
 ///
 /// Called after `lkl_start_kernel`, so both semaphores are allocated and
 /// nk's own allocator is the one that made them: a pointer it does not
-/// recognise is not a semaphore, which is a far stronger test than "not
-/// null" and is what makes scanning for the structure safe.
+/// recognise is not a semaphore. This validates layout/initialization at
+/// the linked address without searching unrelated memory.
 #[cfg(nk_lkl)]
 fn looks_like_lkl_cpu(addr: usize) -> bool {
     if addr & 7 != 0 {
@@ -1264,44 +1272,14 @@ fn looks_like_lkl_cpu(addr: usize) -> bool {
         && c.sleepers < 1_000_000
 }
 
-/// Verify `LKL_CPU_ADDR` still names LKL's `cpu`.
-///
-/// build.rs records the symbol's offset within lkl.o's bss. The linked
-/// address must sit that far above the start of the bss region LKL's objects
-/// contributed -- not an exact test, since nk's own bss is in there too, but
-/// it catches the case that actually happens: the constant left behind by a
-/// relink while everything else moved.
+/// Validate the live layout once Linux initialized its semaphores. The
+/// symbol address is exact; an incompatible layout is an error, not a reason
+/// to sweep unrelated kernel memory for something that looks plausible.
 #[cfg(nk_lkl)]
 fn check_lkl_cpu_addr() {
-    let off = option_env!("NK_LKL_CPU_BSS_OFFSET")
-        .and_then(|o| usize::from_str_radix(o.trim_start_matches("0x"), 16).ok())
-        .unwrap_or(0);
-
-    // The seed first: when the constant is still right this costs one read.
-    if looks_like_lkl_cpu(LKL_CPU_SEED) {
-        unsafe { LKL_CPU_FOUND = LKL_CPU_SEED };
-        println!("  lkl cpu: address {LKL_CPU_SEED:#x} verified (bss offset {off:#x})");
-        return;
-    }
-
-    // It moved. Sweep outwards from the seed rather than over all of memory:
-    // the symbol travels with nk's bss, which grows and shrinks by kilobytes
-    // between builds, not megabytes -- and a bounded search cannot wander
-    // into a device window and read a register.
-    const REACH: usize = 8 << 20;
-    for delta in (8..REACH).step_by(8) {
-        for addr in [LKL_CPU_SEED.wrapping_add(delta), LKL_CPU_SEED.wrapping_sub(delta)] {
-            if looks_like_lkl_cpu(addr) {
-                unsafe { LKL_CPU_FOUND = addr };
-                println!(
-                    "  lkl cpu: seed {LKL_CPU_SEED:#x} was stale, found at {addr:#x} \
-                     (bss offset {off:#x}) -- update LKL_CPU_SEED"
-                );
-                return;
-            }
-        }
-    }
-    println!("  lkl cpu: !! no `cpu` found near {LKL_CPU_SEED:#x} -- re-derive with llvm-nm");
+    let address = lkl_cpu_addr();
+    assert!(looks_like_lkl_cpu(address), "linked LKL cpu layout/initialization mismatch at {address:#x}");
+    println!("  lkl cpu: linked address {address:#x} verified");
 }
 
 #[cfg(nk_lkl)]

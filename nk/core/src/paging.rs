@@ -70,6 +70,36 @@ const ATTR_NORMAL: u64 = 1;
 
 const GB: u64 = 1 << 30;
 
+/// Mark an existing x86 boot identity range as supervisor-only, uncached
+/// MMIO. Called before APs/user address spaces exist. Rounds to the boot
+/// map's 2 MiB leaves; callers must ensure those leaves contain no RAM.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn identity_mmio(start: u64, end: u64) -> bool {
+    if start >= end || end > 1<<32 { return false; }
+    let root = table_of(crate::arch::current_page_table()) as *mut u64;
+    let lo = start & !(BLOCK_2MB-1);
+    let hi = end.div_ceil(BLOCK_2MB)*BLOCK_2MB;
+    // Validate every leaf first; this only changes the initial huge map.
+    for va in (lo..hi).step_by(BLOCK_2MB as usize) {
+        let e0 = *root.add(((va>>39)&511) as usize);
+        if e0 & pte::VALID == 0 { return false; }
+        let pdpt = table_of(e0) as *const u64;
+        let e1 = *pdpt.add(((va>>30)&511) as usize);
+        if e1 & pte::VALID == 0 || pte::is_block(e1) { return false; }
+        let pd = table_of(e1) as *const u64;
+        let e2 = *pd.add(((va>>21)&511) as usize);
+        if e2 & pte::VALID == 0 || !pte::is_block(e2) || e2 & 0x000f_ffff_ffe0_0000 != va { return false; }
+    }
+    for va in (lo..hi).step_by(BLOCK_2MB as usize) {
+        let pdpt = table_of(*root.add(((va>>39)&511) as usize)) as *const u64;
+        let pd = table_of(*pdpt.add(((va>>30)&511) as usize)) as *mut u64;
+        let entry = pd.add(((va>>21)&511) as usize);
+        *entry = (*entry | pte::PCD | pte::PWT | pte::NX) & !pte::USER;
+    }
+    crate::arch::tlb_flush_all();
+    true
+}
+
 /// What nk maps as Device memory, rounded outwards to 2MB blocks.
 ///
 /// From the machine rather than from a guess would be better, and the device

@@ -44,6 +44,10 @@ without the owner asking.
 | Language | Rust workspace + vendored C (Linux, Mesa, LLVM, xnu submodules) | Rust `no_std` kernel in `kernel/`, Python/shell elsewhere |
 | Licence | GPL-2.0-or-later | `kernel/core` separately licensed; `kernel/linux` GPL-2.0 |
 
+nk was also imported into this repository as `nk/` (`c4cad58`, `207fbb4`);
+continue host work there unless cross-repository changes are needed. It has
+its own Rust workspace and stable toolchain; run its cargo commands in `nk/`.
+
 Code may move from Stele into nk, but anything copied into `kernel/core`
 makes that part GPL-2.0-or-later. Say so in the commit when you do it.
 
@@ -92,19 +96,30 @@ ring 3, static busybox, `fork`/`vfork`/`execve`, signals with handlers and
 `stat` converted between layouts. The harness `/nk-init` script runs to the
 end. Next gaps, in order:
 
-`ls`, `find`, pipelines and file I/O work too (open flags translated); epoll
-records are repacked but no test program has exercised epoll yet.
+`ls`, `find`, pipelines and file I/O work too (open flags translated). The
+epoll probe now passes on nk + LKL with four active QEMU CPUs; see
+`nk/tests/README.md`. x86 LKL already uses packed events, so no repacking.
 
-1. Test epoll and dynamically linked programs (the harness is static busybox).
-2. The same syscall-return-before-signal ordering fix on aarch64 (done on x86).
-3. ACPI (MADT, MCFG), PCI enumeration, MSI-X, then LKL's PCI host ops, so
-   real drivers (NVMe, igc/e1000e, r8169, snd_hda_intel) attach.
+1. Dynamic glibc/Python and `dlopen` now pass with the rebuilt x86 LKL archive
+   (`nk/tests/run-dynamic-x86.py`). x86 file faults use the syscall trampoline
+   and preserve all general registers plus FP/SIMD state.
+2. Eight pthread-backed Python threads pass with `--threads`: distinct glibc
+   errno/TLS pointers, timed waits, lock contention and joins on four QEMU CPUs.
+   Signal return ordering and pre-handler mask
+   restoration now pass on aarch64 and x86 (`nk/tests/run-signal-return.py`).
+3. ACPI/MADT/MCFG discovery and read-only PCI inventory now work in QEMU
+   (`nk/tests/run-platform-x86.py`), including sparse APIC IDs and a bridged
+   NVMe. IOAPIC timer routing plus MSI/MSI-X device delivery now pass in
+   QEMU (`nk/tests/run-pci-irq-x86.py`). Next: LKL's PCI host ops, DMA and
+   Linux IRQ bindings, so real Linux drivers attach. FADT registers are
+   discovered; power operations remain open.
 4. Real hardware via GRUB (Multiboot2). Then VT-x, then the Stele translator on nk.
 
 Build and boot (from `kernel/`):
 
 ```bash
 NK_LKL_LIB="$PWD/ldk/build/lkl-x86_64/libnklkl.a" \
+  NK_SMP=1 NK_AP_LAYER=4 \
   cargo build --release --target x86_64-unknown-none --target-dir target-hx
 qemu-system-x86_64 -M q35 -m 4G -smp 4 \
   -kernel target-hx/x86_64-unknown-none/release/nk \
@@ -114,6 +129,15 @@ qemu-system-x86_64 -M q35 -m 4G -smp 4 \
 
 The x86 build needs `NK_LKL_LIB` (modules are cfg'd out without it). Rebuilding
 LKL needs Docker (`colima start`), then `python3 ldk/ldk.py lkl --arch x86_64`.
+`NK_SMP=1` also needs `NK_AP_LAYER=4`: layer zero does not initialize the
+AP scheduler slots and panics on an invalid current-task index.
+The old NETHOS cached x86 archive predates the retained-file ABI fix. The local
+`nk/ldk/build/lkl-x86_64/libnklkl.a` was rebuilt and verified on 2026-11-24;
+use it for dynamic glibc/Python. The reproducer and exact failures are
+documented in `nk/tests/README.md`.
+`python3 nk/ldk/lkl_abi.py <archive>` checks actual private syscall-table
+relocations without Docker. New archive publication and the dynamic runner
+require it to pass; both the rebuilt x86 archive and cached arm64 archive pass.
 
 ## x86 pitfalls already paid for
 
@@ -124,13 +148,19 @@ LKL needs Docker (`colima start`), then `python3 ldk/ldk.py lkl --arch x86_64`.
 - **LKL uses arm64's open flags** (`patch-lkl.py: arm64_open_flags`), so x86
   `O_DIRECTORY`/`O_DIRECT`/`O_LARGEFILE`/`O_NOFOLLOW` are translated in
   `x86_legacy` (`open_flags_in`/`_out`). Any new call taking open flags needs it.
+- **epoll layout follows the build compiler too.** Linux's UAPI selects a
+  packed 12-byte event under `__x86_64__`, including x86 LKL. Repacking it as
+  an asm-generic 16-byte event corrupts data and multi-event strides. Use
+  `nk/tests/run-epoll-x86.py` to exercise all three wait variants.
 - **The kernel links at 1 GiB on x86** (`linker-x86_64.ld`), because static
   binaries load at 0x400000 and every process owns the low gigabyte. Each
   address space has private copies of the top three page-table levels, exactly
   like aarch64. Don't map anything of the kernel's below 1 GiB.
-- **`LKL_CPU_SEED`** in `main.rs` is a hardcoded address of LKL's `cpu` symbol.
-  Any relink can move it; the boot log says `was stale ... update LKL_CPU_SEED`.
-  Get the new value with `nm <nk> | grep ' b cpu$'`.
+- **LKL CPU state is linker-resolved.** `core/build.rs` and `lkl_archive.rs`
+  copy the input archive into OUT_DIR, export/namespace its BSS `cpu` as
+  `nk_lkl_cpu`, and leave the source archive untouched. Rust references that
+  symbol directly and validates its live layout after LKL initializes it.
+  Keep this path; do not reintroduce hardcoded addresses or memory scans.
 - **Entry asm restores registers before using them as indices.** Read the
   per-CPU slot first, then restore user registers (`syscall_entry`). In
   `resume_user`, `r10` carries the user rsp until the iret frame is pushed.
@@ -140,8 +170,25 @@ LKL needs Docker (`colima start`), then `python3 ldk/ldk.py lkl --arch x86_64`.
   through 32-bit registers around CPUID and zeroed rbx's upper half, so a
   syscall result held in rbx came back as `0xffffffef`. A syscall that "returns
   a positive number but should have failed" smells like this.
+- **APIC IDs are hardware identifiers, not scheduler indices.** MADT can have
+  gaps (QEMU with six CPUs/two sockets uses 0,1,2,4,5,6). `lapic` maps them
+  to dense logical slots for `cpu_id`, AP stacks and outgoing IPIs. Never
+  reintroduce an APIC-ID mask or stop probing at the first numeric gap.
+- **Interrupts must not enter LKL directly.** Device vectors use bounded
+  callbacks to acknowledge hardware and `lklirq::raise` to defer Linux work.
+  `lkl_trigger_irq` can block and belongs only in the IRQ pump. The BSP's PIT
+  uses IOAPIC vector 0x40 when MADT routing is usable; AP timers stay at 0xef.
+- **PCI Command and Status share a dword.** Use native 16-bit Command writes:
+  reflecting the Status half of a read/modify/write clears W1C bits. MSI is
+  itself a bus-master write; QEMU interrupt probes temporarily enable BME
+  and restore it, while leaving packet/disk DMA engines stopped.
 - **Signals on x86:** the restorer goes on the stack at `[rsp]`, arguments in
   rdi (`x[13]`), rsi, rdx, and the frame skips the 128-byte red zone.
+- **Save completed returns and interrupted masks.** Set the syscall result
+  before building a signal frame (aarch64 needs this too), and save the mask
+  from before adding the handler/self-block bits. Restoring the temporary
+  mask made only the first signal work. Run `run-signal-return.py` on both
+  architectures after signal changes.
 - **Debug by measurement.** lldb can attach to QEMU's gdbstub (`-s -S`,
   `gdb-remote 1234`); write breakpoint callbacks to a file, since batch output
   is lost when the process is killed. QEMU's `-d int -D file` gives the real faulting

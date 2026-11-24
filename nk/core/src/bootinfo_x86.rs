@@ -31,21 +31,16 @@ pub struct BootInfo {
     pub ram_region_count: usize,
     pub initrd: Option<(u64, u64)>,
     pub cmdline: &'static str,
+    /// Physical RSDP address (PVH), or the loader-owned RSDP copy (MB2).
+    pub rsdp: Option<u64>,
+    pub info_range: Option<(u64, u64)>,
 }
 
 // ------------------------------------------------------------- PVH parser --
 //
 // struct hvm_start_info, defined by Xen and adopted by Linux and QEMU.
-// Offsets on 64-bit:
-//   0x00: magic (4 bytes: "xEn3")
-//   0x04: version
-//   0x08: flags
-//   0x10: memmap_paddr (u64)
-//   0x18: memmap_entries (u32)
-//   0x20: cmdline_paddr (u64)
-//   0x28: rsdp_paddr (u64)
-//   0x30: modlist_paddr (u64)
-//   0x38: nr_modules (u32)
+// The repr(C) layout below follows Xen's hvm_start_info v1. In particular,
+// RSDP is at 0x20, and the memory map pointer is at 0x28.
 #[repr(C)]
 struct HvmStartInfo {
     magic: [u8; 4],
@@ -154,5 +149,79 @@ pub unsafe fn parse_pvh(info_ptr: u64) -> Option<BootInfo> {
         ram_region_count,
         initrd,
         cmdline: "",
+        rsdp: (info.rsdp_paddr != 0).then_some(info.rsdp_paddr),
+        info_range: None,
     })
+}
+
+/// Parse GRUB's bounded, eight-byte-aligned Multiboot2 tag stream.
+///
+/// # Safety
+/// `info_ptr` must name the loader's readable info block in the boot identity map.
+pub unsafe fn parse_multiboot2(info_ptr: u64) -> Option<BootInfo> {
+    if info_ptr == 0 || info_ptr & 7 != 0 || info_ptr.checked_add(8)? > 1<<32 { return None; }
+    let total = core::ptr::read_unaligned(info_ptr as *const u32) as usize;
+    if !(16..=1<<20).contains(&total) || info_ptr.checked_add(total as u64)? > 1<<32 { return None; }
+    parse_multiboot_bytes(core::slice::from_raw_parts(info_ptr as *const u8, total), info_ptr)
+}
+
+pub fn parse_multiboot_bytes(bytes: &[u8], physical_base: u64) -> Option<BootInfo> {
+    let get32 = |b: &[u8], o: usize| -> Option<u32> { Some(u32::from_le_bytes(b.get(o..o+4)?.try_into().ok()?)) };
+    let total = get32(bytes, 0)? as usize;
+    if total != bytes.len() || total < 16 || total & 7 != 0 || get32(bytes, 4)? != 0 { return None; }
+    let mut boot = BootInfo { ram_base: 0, ram_size: 0, ram_regions: [(0,0);MAX_RAM_REGIONS],
+        ram_region_count: 0, initrd: None, cmdline: "", rsdp: None,
+        info_range: Some((physical_base,physical_base.checked_add(total as u64)?)) };
+    let mut new_rsdp = false;
+    let mut at = 8;
+    while at < total {
+        let kind = get32(bytes, at)?;
+        let size = get32(bytes, at+4)? as usize;
+        if size < 8 { return None; }
+        let tag = bytes.get(at..at.checked_add(size)?)?;
+        match kind {
+            0 => {
+                if size != 8 || at+8 != total || boot.ram_region_count == 0 { return None; }
+                if boot.ram_regions[..boot.ram_region_count].windows(2).any(|r| r[0].1 > r[1].0) { return None; }
+                boot.ram_base = boot.ram_regions[0].0;
+                boot.ram_size = boot.ram_regions[0].1-boot.ram_base;
+                return Some(boot);
+            }
+            3 => {
+                if size < 16 { return None; }
+                let lo = get32(tag, 8)? as u64;
+                let hi = get32(tag, 12)? as u64;
+                if hi <= lo { return None; }
+                if boot.initrd.is_none() { boot.initrd = Some((lo,hi)); }
+            }
+            6 => {
+                if size < 16 { return None; }
+                let stride = get32(tag, 8)? as usize;
+                if stride < 24 || get32(tag, 12)? != 0 || (size-16) % stride != 0 { return None; }
+                for entry in tag[16..].chunks_exact(stride) {
+                    if get32(entry,16)? != 1 { continue; }
+                    let lo = u64::from_le_bytes(entry[..8].try_into().ok()?);
+                    let len = u64::from_le_bytes(entry[8..16].try_into().ok()?);
+                    let hi = lo.checked_add(len)?;
+                    let lo = lo.max(0x100000);
+                    if lo >= hi { continue; }
+                    if boot.ram_region_count == MAX_RAM_REGIONS { return None; }
+                    let mut i = boot.ram_region_count;
+                    while i > 0 && boot.ram_regions[i-1].0 > lo {
+                        boot.ram_regions[i] = boot.ram_regions[i-1]; i-=1;
+                    }
+                    boot.ram_regions[i] = (lo,hi);
+                    boot.ram_region_count+=1;
+                }
+            }
+            14 | 15 => {
+                if size < 8 + if kind == 15 {36} else {20} { return None; }
+                if kind == 15 || !new_rsdp { boot.rsdp = Some(physical_base.checked_add(at as u64+8)?); }
+                if kind == 15 { new_rsdp = true; }
+            }
+            _ => {}
+        }
+        at = at.checked_add(size)?.checked_add(7)? & !7;
+    }
+    None // A complete info block must end with its end tag.
 }

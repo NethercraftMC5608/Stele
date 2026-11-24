@@ -59,7 +59,8 @@ pub const USER_STACK_TOP: u64 = 0x3F00_0000;
 /// read goes through LKL, and entering LKL from the synchronous-abort path
 /// is not equivalent to entering it from a syscall. The abort handler
 /// instead saves the frame, points ELR here and names the page-in syscall in
-/// x8; the ordinary SVC path reads the page and restores the frame.
+/// x8 (rax on x86); the ordinary syscall path reads the page and restores
+/// the complete interrupted frame.
 pub const TRAMPOLINE_VA: u64 = USER_STACK_TOP;
 
 static mut TRAMPOLINE_PAGE: usize = 0;
@@ -69,8 +70,11 @@ fn trampoline_page() -> usize {
         if TRAMPOLINE_PAGE == 0 {
             let frame = frames::alloc().expect("no frame for the page-in trampoline");
             core::ptr::write_bytes(frame, 0, PAGE);
-            // svc #0 ; brk #0 -- the brk is unreachable when page-in works.
+            // The trap returns here; page-in runs in ordinary syscall context.
+            #[cfg(target_arch = "aarch64")]
             let insns = [0xD400_0001u32, 0xD420_0000u32];
+            #[cfg(target_arch = "x86_64")]
+            let insns = [0x0B0F_050Fu32, 0]; // syscall ; ud2
             core::ptr::copy_nonoverlapping(insns.as_ptr() as *const u8, frame, 8);
             paging::clean_icache_range(frame as u64, PAGE as u64);
             TRAMPOLINE_PAGE = frame as usize;
@@ -329,6 +333,15 @@ pub extern "C" fn nk_enter_kernel() {
 #[cfg(target_arch = "x86_64")]
 #[no_mangle]
 pub extern "C" fn rust_syscall(frame: &mut Frame) {
+    if frame.x[8] == crate::reserve::PAGEIN_SYSCALL {
+        if !crate::reserve::complete_file_fault(frame) {
+            sys_exit(-11);
+        }
+        // A fault interrupted arbitrary instructions, not a syscall: rcx
+        // and r11 must survive too, so use the full iret restore path.
+        frame.x[16] = 1; // assembly restores FP state, then returns with iret
+        return;
+    }
     handle_syscall(frame);
 }
 
@@ -495,10 +508,10 @@ fn handle_syscall(frame: &mut Frame) {
     if crate::sched::nethos_abi() {
         let args: [u64; 6] = frame.x[..6].try_into().unwrap();
         let ret = crate::nethos_abi::dispatch(frame.x[8], &args);
+        frame.x[0] = ret as u64;
         if crate::signal::deliver(frame) {
             return;
         }
-        frame.x[0] = ret as u64;
         return;
     }
 
@@ -647,17 +660,14 @@ fn handle_syscall(frame: &mut Frame) {
     // The return value first, so a signal delivered now saves it with the
     // rest of the interrupted context and `rt_sigreturn` brings it back.
     // Delivering first saved x[0] while it still held the first argument.
-    // x86-64 only for now: aarch64 has the same ordering and needs the same
-    // change once it can be verified there.
-    #[cfg(target_arch = "x86_64")]
-    {
-        frame.x[0] = ret as u64;
-    }
+    // Both architectures must snapshot the completed syscall, never its
+    // original first argument. The -512 sigreturn sentinel above already
+    // restored the whole frame and must not reach this assignment.
+    frame.x[0] = ret as u64;
     #[cfg(nk_lkl)]
     if crate::signal::deliver(frame) {
         return;
     }
-    frame.x[0] = ret as u64;
 }
 
 /// Write `clock_gettime`'s answer without entering Linux, if nk has it.
@@ -1039,52 +1049,6 @@ fn x86_legacy(nr: u64, a: &[u64; 6]) -> Option<i64> {
         out
     }
 
-    /// A Linux call on nk's own buffers: pointers are kernel addresses for
-    /// its duration, as in `sys_poll`.
-    fn kcall(lkl_nr: u64, args: [u64; 6]) -> i64 {
-        let was = crate::sched::set_user_syscall(false);
-        let rc = crate::lkl::syscall(lkl_nr as i64, args.map(|v| v as i64));
-        crate::sched::set_user_syscall(was);
-        rc
-    }
-
-    /// epoll_wait / epoll_pwait with x86-64's packed `epoll_event`.
-    ///
-    /// x86-64 declares `struct epoll_event` packed: `u32 events; u64 data` in
-    /// 12 bytes. asm-generic pads it to 16. Linux fills 16-byte records into
-    /// nk's buffer and they are repacked into the caller's. The signal mask,
-    /// if any, is copied in too, since the whole call runs on kernel buffers.
-    fn epoll_wait(epfd: u64, events: u64, max: u64, timeout: u64, sigmask: u64, sigsz: u64) -> i64 {
-        let Ok(n) = usize::try_from(max) else { return -22 };
-        if n == 0 || n > 4096 {
-            return -22; // -EINVAL: Linux refuses 0; 4096 bounds nk's heap
-        }
-        let mut kbuf = alloc::vec![0u8; n * 16];
-        let mut mask = [0u8; 8];
-        let mask_ptr = if sigmask != 0 {
-            if crate::uaccess::copy_from_user(&mut mask, sigmask).is_err() {
-                return crate::uaccess::EFAULT;
-            }
-            mask.as_ptr() as u64
-        } else {
-            0
-        };
-        let rc = kcall(22, [epfd, kbuf.as_mut_ptr() as u64, max, timeout, mask_ptr, if sigmask != 0 { sigsz } else { 0 }]);
-        if rc <= 0 {
-            return rc;
-        }
-        let got = rc as usize;
-        let mut out = alloc::vec![0u8; got * 12];
-        for i in 0..got {
-            out[i * 12..i * 12 + 4].copy_from_slice(&kbuf[i * 16..i * 16 + 4]);
-            out[i * 12 + 4..i * 12 + 12].copy_from_slice(&kbuf[i * 16 + 8..i * 16 + 16]);
-        }
-        match crate::uaccess::copy_to_user(events, &out) {
-            Ok(()) => rc,
-            Err(e) => e,
-        }
-    }
-
     /// asm-generic's `struct stat` -> x86-64's, in the caller's buffer.
     ///
     /// LKL fills the 128-byte asm-generic layout; an x86-64 program reads a
@@ -1124,25 +1088,15 @@ fn x86_legacy(nr: u64, a: &[u64; 6]) -> Option<i64> {
         // openat(AT_FDCWD, path, flags, mode)
         x86::OPEN => at(56, [CWD, a[0], open_flags_in(a[1]), a[2], 0, 0]),
         x86::OPENAT => at(56, [a[0], a[1], open_flags_in(a[2]), a[3], 0, 0]),
-        // epoll_ctl(epfd, op, fd, event): the 12-byte x86 record, padded.
-        233 => {
-            if a[3] == 0 {
-                at(21, [a[0], a[1], a[2], 0, 0, 0])
-            } else {
-                let mut x = [0u8; 12];
-                if crate::uaccess::copy_from_user(&mut x, a[3]).is_err() {
-                    crate::uaccess::EFAULT
-                } else {
-                    let mut g = [0u8; 16];
-                    g[0..4].copy_from_slice(&x[0..4]);
-                    g[8..16].copy_from_slice(&x[4..12]);
-                    kcall(21, [a[0], a[1], a[2], g.as_ptr() as u64, 0, 0])
-                }
-            }
-        }
-        // epoll_wait(epfd, events, max, timeout) and epoll_pwait(..., mask, size)
-        232 => epoll_wait(a[0], a[1], a[2], a[3], 0, 0),
-        281 => epoll_wait(a[0], a[1], a[2], a[3], a[4], a[5]),
+        // Linux's uapi eventpoll.h packs epoll_event when __x86_64__ is
+        // defined, including ARCH=lkl built with the native x86 compiler.
+        // Both sides use 12-byte records: repacking to 16 bytes corrupts
+        // data and the stride of multi-event results. Keep user pointers
+        // under LKL's copy_to/from_user checks, just like other forwards.
+        233 => at(21, *a), // epoll_ctl
+        232 => at(22, [a[0], a[1], a[2], a[3], 0, 0]), // epoll_wait -> pwait
+        281 => at(22, *a), // epoll_pwait
+        441 => at(441, *a), // epoll_pwait2 (64-bit timespec on both sides)
         // fcntl's flag-word commands: F_GETFL (3) and F_SETFL (4).
         x86::FCNTL if a[1] == 4 => at(25, [a[0], 4, open_flags_in(a[2]), 0, 0, 0]),
         x86::FCNTL if a[1] == 3 => {

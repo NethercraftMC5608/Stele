@@ -65,6 +65,15 @@ pub unsafe fn pic_eoi(irq: u8) {
     outb(PIC1_CMD, PIC_EOI);
 }
 
+/// Caller serializes PIC changes with local interrupts masked.
+pub unsafe fn pic_mask(irq: u8, masked: bool) {
+    assert!(irq < 16);
+    let port = if irq < 8 {PIC1_DATA} else {PIC2_DATA};
+    let bit = 1 << (irq%8);
+    let current = inb(port);
+    outb(port,if masked {current|bit} else {current&!bit});
+}
+
 // ------------------------------------------------------------------ IDT --
 //
 // 256 entries, each 16 bytes. Descriptors are 64-bit interrupt gates:
@@ -186,13 +195,13 @@ pub unsafe extern "C" fn x86_trap(frame: *mut TrapFrame) {
     let f = &mut *frame;
     match f.vector {
         // IRQ 0: the timer.
-        32 => {
+        32 | 0x40 => {
             // EOI before any switch, not after. `cpu_switch` does not return
             // here -- it returns into some other task -- so an EOI placed
             // after it is never reached, the PIC still considers IRQ 0 in
             // service, and the timer ticks exactly once. This is the same
             // trap the aarch64 path documents at its `gic::eoi`.
-            pic_eoi(0);
+            if f.vector == 32 { pic_eoi(0); } else { crate::lapic::eoi(); }
             crate::timer::on_tick();
             crate::hostops::tick_timers();
 
@@ -259,6 +268,13 @@ pub unsafe extern "C" fn x86_trap(frame: *mut TrapFrame) {
                 crate::sched::schedule();
             }
         }
+        // Device MSI/MSI-X and explicitly routed IOAPIC interrupts. Device
+        // callbacks acknowledge their source before EOI; LKL work runs in
+        // its IRQ pump rather than blocking this interrupt frame.
+        0x50..=0xdf => {
+            crate::device_irq_x86::dispatch(f.vector as u8);
+            crate::lapic::eoi();
+        }
         // The remaining PIC lines: acknowledge so the controller does not
         // wedge on an unacknowledged interrupt.
         33..=47 => {
@@ -285,6 +301,18 @@ pub unsafe extern "C" fn x86_trap(frame: *mut TrapFrame) {
             let cr2: u64;
             core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack));
             if crate::reserve::fault_in(cr2) {
+                return;
+            }
+            let mut saved = crate::user::Frame {
+                x: [0; 31], elr: f.rip, spsr: f.rflags, sp: f.rsp,
+            };
+            saved.x[..16].copy_from_slice(&[
+                f.rax, f.rsi, f.rdx, f.r10, f.r8, f.r9, f.rbx, f.rbp,
+                0, f.r12, f.r13, f.r14, f.r15, f.rdi, f.rcx, f.r11,
+            ]);
+            if crate::reserve::defer_file_fault(&mut saved, cr2) {
+                f.rax = saved.x[8];
+                f.rip = saved.elr;
                 return;
             }
             report_trap(f, 14);

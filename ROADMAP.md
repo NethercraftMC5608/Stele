@@ -39,15 +39,35 @@ Branch `nk-x86-userland` in the NETHOS repo.
 - [x] `cpu_id` rbx truncation (`72b0b82`); open flags to arm64 values, epoll
       repacking (`08d835e`).
 - [x] Harness `/nk-init` runs to the end; `ls`, `find`, pipes, file I/O.
-- [ ] Exercise epoll (a small static test program). Done when: epoll_wait
-      returns the right fd and data.
-- [ ] Dynamically linked programs: `ld-linux-x86-64.so`, glibc, `dlopen`.
-      Done when: a dynamic `python3 -c 'print(1)'` runs.
-- [ ] Threads on x86: `clone(CLONE_THREAD)` with the x86 argument order,
-      futex, TLS per thread. Done when: a pthread test with 8 threads passes.
-- [ ] Return-value-before-signal ordering on aarch64 (fixed on x86 only).
-      Done when: the aarch64 probes still pass with it.
-- [ ] `LKL_CPU_SEED` derived at build time instead of hand-edited.
+- [x] Exercise epoll (a small static test program): `epoll_wait`,
+      `epoll_pwait`, `epoll_pwait2` return the right fd and 64-bit data on
+      nk + LKL in QEMU with four active CPUs. Removed the incorrect 16-byte
+      conversion: x86 LKL already uses packed 12-byte events. Reproducer:
+      `nk/tests/run-epoll-x86.py` (verified 2026-11-24; uncommitted).
+- [x] Dynamically linked programs: `ld-linux-x86-64.so`, glibc, Python 3.13
+      prints `1`, imports ctypes, and calls `libm.cos(0.0)` through `dlopen`.
+      Rebuilt x86 LKL with corrected retained-file syscalls; archive ABI guard
+      passes. Added x86 file-page trampoline, full register return and syscall
+      FP/SIMD preservation. `nk/tests/run-dynamic-x86.py` passes on four-CPU
+      q35 QEMU (2026-11-24; uncommitted).
+- [x] Threads on x86: eight pthread-backed Python threads simultaneously
+      reach a barrier, retain distinct glibc errno/TLS and Python thread-local
+      values across timed waits, increment a locked counter 160 times and join.
+      `nk/tests/run-dynamic-x86.py --threads` passes on four QEMU CPUs
+      (2026-11-24; uncommitted). Robust-list/rseq remain unsupported; this does
+      not verify cancellation, owner-death recovery or all pthread APIs.
+- [x] Return-value-before-signal ordering on aarch64: measured `kill()`
+      restoring its PID argument instead of zero, then fixed the shared
+      return path. Also fixed saving the temporary handler mask, which
+      blocked all later deliveries on both architectures. The freestanding
+      `nk/tests/run-signal-return.py` probes pass on QEMU virt/aarch64
+      (one CPU) and q35/x86-64 (four CPUs), including repeated delivery,
+      handler masks and blocked/pending signals (2026-11-24; uncommitted).
+- [x] Removed `LKL_CPU_SEED` and runtime BSS searches. The build makes a
+      private archive exporting `nk_lkl_cpu`; the final linker supplies its
+      address. Live layout checks and QEMU boots pass on both architectures;
+      `nk/tests/lkl-archive.rs` tests x86/arm64 fixtures and input immutability
+      (2026-11-24; uncommitted).
 - [ ] Merge `nk-x86-userland` with `nk-initrd-builder` and push.
 
 ## Phase 2: nk on a real PC
@@ -62,10 +82,38 @@ LKL's drivers attach to real hardware. Pick one reference PC (from Phase 0).
 - [ ] ACPI: RSDP → XSDT → MADT (CPUs, IOAPIC, LAPIC address), MCFG (PCIe
       ECAM), FADT (reset, power off). Replace the q35 assumptions in `smp.rs`
       and `lapic.rs`. Done when: all CPUs come up on the real machine.
+  - [x] QEMU discovery: PVH RSDP, legacy BIOS scan, bounded/checksummed
+        RSDT/XSDT, MADT (including overrides/x2APIC records), MCFG, FADT
+        register metadata. Host tests also cover GRUB Multiboot2 ACPI tags.
+        MADT drives AP startup and logical-slot → physical-APIC IPIs;
+        sparse IDs `0,1,2,4,5,6` boot successfully. MMIO is supervisor-only
+        and uncached. See `nk/tests/run-platform-x86.py` and
+        `nk/tests/platform-x86.rs` (2026-11-24; uncommitted).
+  - [ ] Verify the GRUB boot path, ACPI topology and all CPUs on a real PC.
+        FADT discovery does not yet implement reset/shutdown or AML `_S5`.
 - [ ] IOAPIC and MSI/MSI-X delivery into nk's interrupt path.
+  - [x] QEMU: PIT routed through its MADT IRQ0 override and IOAPIC, PIC IRQ0
+        masked, correct LAPIC EOI. Device vectors `0x50..0xdf` dispatch
+        bounded callbacks and can defer an LKL IRQ to the existing pump.
+        MSI (EDU) and MSI-X (82574) each deliver and acknowledge three actual
+        device-generated interrupts, then restore configuration/table state.
+        ECAM, sparse APIC IDs and CF8/CFC/PIC fallback all pass alongside
+        ring-3 epoll. `nk/tests/run-pci-irq-x86.py`, 21 host tests
+        (2026-11-24; uncommitted).
+  - [ ] Real hardware, PCI INTx `_PRT` routing, and delivery to an attached
+        Linux driver's ISR. The QEMU probes do not attach LKL drivers.
 - [ ] PCIe enumeration and LKL's PCI host ops (`lkl_dev_pci_ops` in
       `host_ops.h`): config space, BARs, DMA mapping, MSI-X. Done when: LKL logs
       PCI devices.
+  - [x] Read-only nk inventory via MCFG ECAM, plus segment-zero CF8/CFC
+        fallback. QEMU finds multifunction devices, 32/64-bit BAR addresses,
+        and NVMe behind a PCIe root port; host tests cover multiple segments
+        and nonzero start buses (2026-11-24; uncommitted).
+  - [ ] LKL attachment, BAR sizing/assignment, DMA mapping, Linux IRQ binding.
+        Inventory alone neither attaches Linux drivers nor enables DMA.
+        Native-width config writes and bounded MSI/MSI-X capability/table
+        programming are now available; device ownership and teardown remain
+        responsibilities of the future LKL PCI bridge.
 - [ ] Linux drivers on real devices, one class at a time, each from LKL:
   - [ ] NVMe (`nvme`): read the disk's GPT.
   - [ ] Ethernet (`igc`/`e1000e`/`r8169`): DHCP and a ping.

@@ -460,12 +460,13 @@ pub fn deliver(frame: &mut crate::user::Frame) -> bool {
     // A handler. Block the signal itself unless `SA_NODEFER`, plus the
     // handler's mask; unblock on `rt_sigreturn`.
     sched::clear_signal_pending(me, bit(sig));
-    let mut mask = sched::signal_mask(me) | act.mask;
+    let saved_mask = mask;
+    let mut handler_mask = saved_mask | act.mask;
     if act.flags & SA_NODEFER == 0 {
-        mask |= bit(sig);
+        handler_mask |= bit(sig);
     }
-    sched::set_signal_mask(me, mask);
-    build_frame(frame, me, sig, &act);
+    sched::set_signal_mask(me, handler_mask);
+    build_frame(frame, me, sig, &act, saved_mask);
     true
 }
 
@@ -478,7 +479,7 @@ pub fn deliver(frame: &mut crate::user::Frame) -> bool {
 /// number, `x1` a pointer to `siginfo`, `x2` a pointer to `ucontext`.
 /// `rt_sigreturn` (139) restores everything from the `ucontext`.
 #[cfg(nk_lkl)]
-fn build_frame(frame: &mut crate::user::Frame, me: usize, sig: u64, act: &Action) {
+fn build_frame(frame: &mut crate::user::Frame, me: usize, sig: u64, act: &Action, saved_mask: u64) {
     // 128 (siginfo) + 4560 (ucontext) + 128 (restorer gap), rounded to
     // keep the stack 16-byte aligned: 128+4560 = 4688, +16 = 4704.
     const FRAME_SIZE: u64 = 4704;
@@ -523,8 +524,10 @@ fn build_frame(frame: &mut crate::user::Frame, me: usize, sig: u64, act: &Action
     uc[16..24].copy_from_slice(&frame.sp.to_le_bytes());
     uc[24..32].copy_from_slice(&0u64.to_le_bytes());
     uc[32..40].copy_from_slice(&0u64.to_le_bytes());
-    let mask = sched::signal_mask(me);
-    uc[40..48].copy_from_slice(&mask.to_le_bytes());
+    // Save the interrupted mask, before adding the signal/handler mask.
+    // Restoring the temporary handler mask permanently blocked the signal
+    // after its first delivery on both architectures.
+    uc[40..48].copy_from_slice(&saved_mask.to_le_bytes());
     // mcontext at uc+176: fault 0, regs[31] = frame x, sp, pc, pstate.
     let m = 176;
     for i in 0..31 {
@@ -542,7 +545,6 @@ fn build_frame(frame: &mut crate::user::Frame, me: usize, sig: u64, act: &Action
     // validates it points at readable memory before restoring.
     uc[0..8].copy_from_slice(&(sp + 128).to_le_bytes());
     // __reserved (m+288, 4096 bytes) stays zero: no extra context.
-    let saved_mask = sched::signal_mask(me);
     if uaccess::copy_to_user(sp, &info).is_err() || uaccess::copy_to_user(sp + 128, &uc).is_err() {
         // The stack cannot hold the frame: the process is out of address
         // space or its pointer is corrupt. Terminate rather than deliver

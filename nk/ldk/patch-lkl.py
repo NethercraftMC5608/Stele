@@ -1,10 +1,3 @@
-C_LINES = ['', '#include <linux/fs.h>', '#include <linux/file.h>', '', '/* Take a reference to the open file behind `fd`; the handle is opaque. */', 'SYSCALL_DEFINE1(nk_file_get, long, fd)', '{', '\tstruct file *f = fget((unsigned)fd);',
-'\tstruct file *g = fget_raw((unsigned)fd);', '', '\tif (f)',
-'\t\treturn (long)f;',
-'\tif (g)',
-'\t\treturn (long)g;',
-'\treturn -EBADF;', '}', '', '/* Read one page at an explicit offset into a kernel buffer. */', 'SYSCALL_DEFINE4(nk_file_pread, unsigned long, handle, unsigned long, buf,', '\t\tunsigned long, len, unsigned long long, off)', '{', '\tstruct file *f = (struct file *)handle;', '\tloff_t pos;', '', '\tif (!f)', '\t\treturn -EINVAL;', '\tpos = (loff_t)off;', '\treturn kernel_read(f, (void *)buf, len, &pos);', '}', '', '/* Drop the reference. */', 'SYSCALL_DEFINE1(nk_file_put, unsigned long, handle)', '{', '\tif (handle)', '\t\tfput((struct file *)handle);', '\treturn 0;', '}', '']
-
 #!/usr/bin/env python3
 """What nk needs changed in arch/lkl, and why.
 
@@ -19,8 +12,41 @@ translation layer on nk's side -- a translation layer is a table with an entry
 per system call, which is the thing this project exists to avoid writing.
 """
 import os
+import re
 import shutil
 import sys
+
+# Exactly one retained reference; do not fget_raw a second reference on the
+# success path, and do not emit literal backslash-t tokens into C source.
+C_LINES = """
+#include <linux/fs.h>
+#include <linux/file.h>
+
+/* Retain the open file, independently of later close/dup/reuse of its fd. */
+SYSCALL_DEFINE1(nk_file_get, long, fd)
+{
+    struct file *f = fget((unsigned)fd);
+    return f ? (long)f : -EBADF;
+}
+
+SYSCALL_DEFINE4(nk_file_pread, unsigned long, handle, unsigned long, buf,
+               unsigned long, len, unsigned long long, off)
+{
+    struct file *f = (struct file *)handle;
+    loff_t pos = (loff_t)off;
+    if (!f)
+        return -EINVAL;
+    return kernel_read(f, (void *)buf, len, &pos);
+}
+
+SYSCALL_DEFINE1(nk_file_put, unsigned long, handle)
+{
+    if (handle)
+        fput((struct file *)handle);
+    return 0;
+}
+""".splitlines()
+
 
 # Four gigabytes of virtual address space for Linux's vmalloc arena, starting
 # at four. nk's paging reserves the same window; the two have to agree.
@@ -330,24 +356,18 @@ def file_backing(shim):
     """
     uapi = "arch/lkl/include/uapi/asm/unistd.h"
     s = open(uapi).read()
-    # +4 is exec_files'; the retained-file calls take +5, +6 and +7.
-    s = s.replace("#define __NR_nk_file_get\t\t(__NR_arch_specific_syscall + 4)",
-                  "#define __NR_nk_file_get\t\t(__NR_arch_specific_syscall + 5)")
-    s = s.replace("#define __NR_nk_file_pread\t(__NR_arch_specific_syscall + 5)",
-                  "#define __NR_nk_file_pread\t(__NR_arch_specific_syscall + 6)")
-    s = s.replace("#define __NR_nk_file_put\t\t(__NR_arch_specific_syscall + 6)",
-                  "#define __NR_nk_file_put\t\t(__NR_arch_specific_syscall + 7)")
+    # exec_files already owns +4. Normalize both fresh and previously
+    # patched trees in one pass: the old code inserted +4/+5/+6 on a fresh
+    # tree and only corrected them on the *next* build, overwriting exec's
+    # syscall slot in the first archive.
+    for name, offset in [("nk_file_get", 5), ("nk_file_pread", 6), ("nk_file_put", 7)]:
+        define = f"#define __NR_{name}\t(__NR_arch_specific_syscall + {offset})"
+        pattern = rf"^#define[ \t]+__NR_{name}[^\n]*$"
+        if re.search(pattern, s, re.MULTILINE):
+            s = re.sub(pattern, lambda _: define, s, flags=re.MULTILINE)
+        else:
+            s += "\n" + define + "\n"
     open(uapi, "w").write(s)
-    s = open(uapi).read()
-    if "__NR_nk_file_get" not in s:
-        s = s.replace(
-            "#define __NR_device_page (__NR_arch_specific_syscall + 3)",
-            "#define __NR_device_page (__NR_arch_specific_syscall + 3)\n"
-            "#define __NR_nk_file_get\t\t(__NR_arch_specific_syscall + 4)\n"
-            "#define __NR_nk_file_pread\t(__NR_arch_specific_syscall + 5)\n"
-            "#define __NR_nk_file_put\t\t(__NR_arch_specific_syscall + 6)",
-            1)
-        open(uapi, "w").write(s)
     tbl = "arch/lkl/include/asm/unistd.h"
     s = open(tbl).read()
     if "sys_nk_file_get" not in s:

@@ -329,10 +329,25 @@ syscall_entry:
     mov     %r14, 88(%rsp)                  # x[11]
     mov     %r15, 96(%rsp)                  # x[12]
     mov     %rdi, 104(%rsp)
+    mov     %rcx, 112(%rsp)                 # x[14], full iret restore
+    mov     %r11, 120(%rsp)                 # x[15]
 
+    // Preserve FP/SIMD even for the hidden page-in syscall: unlike a normal
+    // call, a fault can interrupt vectorized libc code with live XMM values.
     // Call Rust syscall handler: rdi = &mut Frame
     mov     %rsp, %rdi
+    sub     $512, %rsp
+    fxsave  (%rsp)
     call    rust_syscall
+    fxrstor (%rsp)
+    add     $512, %rsp
+    cmpq    $0, 128(%rsp)                  # full fault-frame return?
+    je      4f
+    mov     %rsp, %rdi
+    mov     %cr3, %rsi
+    lea     272(%rsp), %rdx
+    jmp     resume_user
+4:
 
     // Restore callee-saved registers
     mov     48(%rsp), %rbx
@@ -489,6 +504,8 @@ resume_user:
     // r10 last but two: until the pushes above it held the user rsp.
     mov     24(%rdi), %r10
     mov     16(%rdi), %rdx
+    mov     112(%rdi), %rcx
+    mov     120(%rdi), %r11
     mov     104(%rdi), %rdi
 
     iretq
