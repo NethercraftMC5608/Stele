@@ -266,6 +266,10 @@ pub fn calibrate() {
 
     // measured cycles took SAMPLE / PIT_HZ seconds.
     let hz = (measured as u128 * PIT_HZ as u128 / SAMPLE as u128) as u64;
+    // Anchor the TSC clock to the tick count it replaces, so time_ns is
+    // continuous across calibration rather than jumping to "TSC since reset".
+    TSC_BASE_NS.store(ticks().saturating_mul(1_000_000_000 / HZ), Ordering::Relaxed);
+    TSC_BASE.store(crate::arch::cycles(), Ordering::Relaxed);
     CYCLE_HZ.store(hz, Ordering::Relaxed);
     println!("  clock:  TSC {} MHz (measured against PIT channel 2)", hz / 1_000_000);
 }
@@ -303,12 +307,27 @@ pub fn time_ns() -> u64 {
 }
 
 #[cfg(target_arch = "x86_64")]
+static TSC_BASE: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_arch = "x86_64")]
+static TSC_BASE_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Nanoseconds since boot, from the TSC calibrated against the PIT.
+///
+/// It was the tick count, which only moves when the boot CPU takes its timer
+/// interrupt -- and nk's x86 syscall entry masks interrupts (FMASK clears IF)
+/// until something switches away. A Linux driver busy-waiting inside a
+/// syscall therefore watched a clock that could not move: e1000e's
+/// udelay(50) between MDIC polls, reached from `ifconfig eth0 up`, spun for
+/// ever in LKL's __ndelay. The TSC runs regardless of IF, and gives
+/// nanosecond resolution instead of one tick. Before calibration (or if it
+/// failed) this falls back to the tick count.
+#[cfg(target_arch = "x86_64")]
 pub fn time_ns() -> u64 {
-    // Derived from the periodic tick count on x86, where the TSC frequency
-    // varies by model and is not handed to us in an architectural register.
-    // Resolution is one tick, so this cannot time anything shorter than the
-    // tick period; a TSC calibrated against the PIT is the eventual fix.
-    ticks().saturating_mul(1_000_000_000 / HZ)
+    let base = TSC_BASE.load(Ordering::Relaxed);
+    if base == 0 || cycle_hz() == 0 {
+        return ticks().saturating_mul(1_000_000_000 / HZ);
+    }
+    TSC_BASE_NS.load(Ordering::Relaxed) + cycles_to_ns(crate::arch::cycles().wrapping_sub(base))
 }
 
 pub fn on_tick() {

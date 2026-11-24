@@ -366,7 +366,13 @@ pub extern "C" fn nk_tls_get(key: usize) -> *mut u8 {
 
 #[no_mangle]
 pub extern "C" fn nk_time_ns() -> u64 {
-    crate::timer::ticks() * (1_000_000_000 / crate::timer::HZ)
+    // x86: the calibrated TSC, which keeps moving with interrupts masked; see
+    // timer::time_ns. LKL's udelay/ndelay spin on this.
+    if cfg!(target_arch = "x86_64") {
+        crate::timer::time_ns()
+    } else {
+        crate::timer::ticks() * (1_000_000_000 / crate::timer::HZ)
+    }
 }
 
 /// A one-shot timer, checked on the periodic tick.
