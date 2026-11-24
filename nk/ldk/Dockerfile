@@ -8,13 +8,18 @@
 # than on a bind mount -- see payload/bin/nethos-kernel.
 #
 # arm64 host, so the native compiler already targets aarch64 and no
-# CROSS_COMPILE is needed. That is the whole reason the target is aarch64
-# first; an x86 port would want crossbuild-essential-amd64 here.
+# CROSS_COMPILE is needed for it. x86-64 is cross-compiled from the same
+# arm64 image built with CROSS=amd64 (see below and ldk.py's cmd_lkl).
 FROM debian:trixie-slim
 
+# CROSS=amd64 adds the x86-64 cross toolchain, so ldk builds the x86 LKL
+# archive natively on arm64 instead of compiling it under amd64 emulation
+# (which was several times slower and segfaulted gcc at random).
+ARG CROSS=
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential flex bison bc libssl-dev libelf-dev \
         python3 make perl xz-utils cpio kmod rsync \
+        ${CROSS:+crossbuild-essential-$CROSS} \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src

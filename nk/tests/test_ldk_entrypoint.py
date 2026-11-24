@@ -38,6 +38,35 @@ class Entrypoint(unittest.TestCase):
         script = commands[-1][-1]
         self.assertLess(script.index("lkl_abi.py /out/libnklkl.a.tmp"), script.index("mv /out/libnklkl.a.tmp"))
 
+    def test_x86_lkl_cross_compiles_on_an_arm64_docker_host(self):
+        module = runpy.run_path(str(LDK))
+        commands = []
+
+        def run(command, **kwargs):
+            commands.append(command)
+            if command[1:2] == ["info"]:
+                return subprocess.CompletedProcess(command, 0, stdout="aarch64\n")
+            return subprocess.CompletedProcess(command, 1 if command[1:3] == ["image", "inspect"] else 0)
+
+        from types import SimpleNamespace
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp, patch.object(subprocess, "run", side_effect=run):
+            module["cmd_lkl"].__globals__["BUILD"] = Path(tmp)
+            module["cmd_lkl"].__globals__["ROOT"] = Path(tmp)
+            module["cmd_lkl"](SimpleNamespace(arch="x86_64"))
+        builds = [c for c in commands if c[1] == "build"]
+        self.assertEqual(len(builds), 1)
+        self.assertIn("linux/arm64", builds[0])
+        self.assertIn("nethos-ldk-cross-amd64", builds[0])
+        self.assertIn("CROSS=amd64", builds[0])
+        run_cmd = commands[-1]
+        self.assertIn("linux/arm64", run_cmd)
+        script = run_cmd[-1]
+        self.assertIn('CROSS_COMPILE="x86_64-linux-gnu-"', script)
+        self.assertIn("x86_64-linux-gnu-strip", script)
+        self.assertIn("-mno-red-zone", script)
+        self.assertNotIn("__CROSS__", script)
+
 
 if __name__ == "__main__":
     unittest.main()
