@@ -644,6 +644,15 @@ fn handle_syscall(frame: &mut Frame) {
             frame.x[8], frame.x[0], frame.x[1], frame.x[2], frame.elr
         );
     }
+    // The return value first, so a signal delivered now saves it with the
+    // rest of the interrupted context and `rt_sigreturn` brings it back.
+    // Delivering first saved x[0] while it still held the first argument.
+    // x86-64 only for now: aarch64 has the same ordering and needs the same
+    // change once it can be verified there.
+    #[cfg(target_arch = "x86_64")]
+    {
+        frame.x[0] = ret as u64;
+    }
     #[cfg(nk_lkl)]
     if crate::signal::deliver(frame) {
         return;

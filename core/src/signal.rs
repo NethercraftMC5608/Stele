@@ -482,16 +482,23 @@ fn build_frame(frame: &mut crate::user::Frame, me: usize, sig: u64, act: &Action
     // 128 (siginfo) + 4560 (ucontext) + 128 (restorer gap), rounded to
     // keep the stack 16-byte aligned: 128+4560 = 4688, +16 = 4704.
     const FRAME_SIZE: u64 = 4704;
+    // x86-64 code may keep live data in the 128 bytes below rsp (the
+    // System V red zone); a frame built there overwrites it. aarch64 has no
+    // red zone.
+    #[cfg(target_arch = "x86_64")]
+    const RED_ZONE: u64 = 128;
+    #[cfg(not(target_arch = "x86_64"))]
+    const RED_ZONE: u64 = 0;
     let sp = if act.flags & SA_ONSTACK != 0 {
         let (base, size, in_use) = sched::signal_altstack(me);
         if base != 0 && !in_use {
             sched::set_signal_altstack_in_use(me, true);
             base + size - FRAME_SIZE
         } else {
-            frame.sp - FRAME_SIZE
+            frame.sp - RED_ZONE - FRAME_SIZE
         }
     } else {
-        frame.sp - FRAME_SIZE
+        frame.sp - RED_ZONE - FRAME_SIZE
     };
     let sp = sp & !15;
     // siginfo at sp: signo at 0, errno at 4, code at 8, pid at 16, uid
@@ -546,26 +553,53 @@ fn build_frame(frame: &mut crate::user::Frame, me: usize, sig: u64, act: &Action
     // saved mask and whether the altstack was entered. The ucontext on the
     // user stack carries the registers; the kernel carries the rest.
     sched::set_signal_return(me, saved_mask, act.flags & SA_ONSTACK != 0);
-    frame.sp = sp;
-    frame.elr = act.handler;
-    // x30 is the return address, per arm64 `setup_return()`: the restorer
-    // the caller passed when `SA_RESTORER` is set, else nk's own
-    // trampoline -- one page per address space, executable and read-only
-    // (Linux uses its VDSO sigtramp; nk has no VDSO). A returning handler
-    // lands on `rt_sigreturn` (139) either way.
-    frame.x[30] = if act.flags & SA_RESTORER != 0 {
-        act.restorer
-    } else {
-        match trampoline_addr() {
-            Some(t) => t,
-            // Genuinely missing trampoline: a mapping failure, not a
-            // normal path. Poison loudly rather than falling through.
-            None => 0xDEAD_0000_0000_0000,
+    #[cfg(target_arch = "x86_64")]
+    {
+        // x86-64 has no link register: the handler returns through the
+        // word at [rsp], so the restorer goes on the stack, 8 below the
+        // 16-aligned siginfo -- entering the handler with rsp = 8 mod 16,
+        // as if called. Arguments are rdi/rsi/rdx, and on this path rdi is
+        // x[13] (x[0] is rax). The aarch64 shape below put the restorer in
+        // x30, which x86 never reads, and the handler's `ret` popped
+        // si_signo: SIGCHLD jumped to 0x11.
+        //
+        // glibc always registers SA_RESTORER (__restore_rt: rt_sigreturn,
+        // 15). Without one there is nothing x86 to return to yet, so the
+        // poison stays loud.
+        let ret = if act.flags & SA_RESTORER != 0 { act.restorer } else { 0xDEAD_0000_0000_0000 };
+        if uaccess::copy_to_user(sp - 8, &ret.to_le_bytes()).is_err() {
+            crate::user::sys_exit(-(sig as i32));
         }
-    };
-    frame.x[0] = sig;
-    frame.x[1] = sp;
-    frame.x[2] = sp + 128;
+        frame.sp = sp - 8;
+        frame.elr = act.handler;
+        frame.x[0] = 0; // rax: no vector arguments
+        frame.x[13] = sig; // rdi
+        frame.x[1] = sp; // rsi: siginfo
+        frame.x[2] = sp + 128; // rdx: ucontext
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        frame.sp = sp;
+        frame.elr = act.handler;
+        // x30 is the return address, per arm64 `setup_return()`: the restorer
+        // the caller passed when `SA_RESTORER` is set, else nk's own
+        // trampoline -- one page per address space, executable and read-only
+        // (Linux uses its VDSO sigtramp; nk has no VDSO). A returning handler
+        // lands on `rt_sigreturn` (139) either way.
+        frame.x[30] = if act.flags & SA_RESTORER != 0 {
+            act.restorer
+        } else {
+            match trampoline_addr() {
+                Some(t) => t,
+                // Genuinely missing trampoline: a mapping failure, not a
+                // normal path. Poison loudly rather than falling through.
+                None => 0xDEAD_0000_0000_0000,
+            }
+        };
+        frame.x[0] = sig;
+        frame.x[1] = sp;
+        frame.x[2] = sp + 128;
+    }
 }
 
 /// # rt_sigreturn()
