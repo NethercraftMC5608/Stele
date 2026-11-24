@@ -10,6 +10,11 @@ It then runs one-shot high-resolution timers on the dedicated core
 (HRTIMER_PASS: all fire, the core's LAPIC rate matches calibration, and
 lateness stays under the host's delivery step). The boot must then still
 reach the init script.
+
+`--require STELA_TIMER_PASS` instead checks a kernel built with
+NK_STELA_TIMER_TEST=1 and `--features stela`: a translated ARM64 guest on the
+dedicated core arms its generic timer and sleeps in WFI until the hrtimer
+delivers the FIQ (core/src/stela_nk/host.rs, `timer_probe`).
 """
 import argparse
 from pathlib import Path
@@ -24,7 +29,10 @@ def main():
     parser.add_argument("--output", type=Path, default=Path("target-dedicated-run"))
     parser.add_argument("--qemu", default="qemu-system-x86_64")
     parser.add_argument("--timeout", type=float, default=150)
+    parser.add_argument("--require", action="append", default=[],
+                        help="markers to require (default DEDICATED_PASS and HRTIMER_PASS)")
     args = parser.parse_args()
+    want = args.require or ["DEDICATED_PASS", "HRTIMER_PASS"]
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=True)
     log = out / "serial.log"
@@ -46,11 +54,11 @@ def main():
         proc.kill()
         proc.wait()
     for line in text.splitlines():
-        if "dedicated:" in line or "hrtimer:" in line:
+        if "dedicated:" in line or "hrtimer:" in line or "STELA_TIMER:" in line:
             print(line.strip())
-    ok = ("DEDICATED_PASS" in text and "HRTIMER_PASS" in text
+    ok = (all(m in text for m in want) and "_FAIL" not in text
           and "X86_ROOT" in text and "exception" not in text)
-    print("DEDICATED_PASS HRTIMER_PASS" if ok else f"FAIL (serial log: {log})")
+    print(" ".join(want) if ok else f"FAIL (serial log: {log})")
     return 0 if ok else 1
 
 

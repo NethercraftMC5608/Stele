@@ -225,8 +225,16 @@ What Stela's runtime needs from the kernel underneath it.
         tick this replaces (`nk/tests/run-dedicated-x86.py`, 2026-11-25).
         True microsecond precision needs real hardware or a host without a
         millisecond-granular event loop; QEMU's TCG exposes no TSC-deadline.
-  - [ ] Guest interrupt injection: wire a guest timer (ARM generic timer /
-        AIC) to `hrtimer::arm_at` and mark its interrupt pending for the engine.
+  - [x] Guest timer interrupt injection: the engine's `Host` timer methods
+        on nk (`core/src/stela_nk/host.rs`) arm `hrtimer::arm_at` at the guest
+        generic timer's deadline (24 MHz guest counter on the TSC), the
+        callback marks the FIQ pending, and guest WFI sleeps in `sti; hlt`
+        until it fires. QEMU: a translated M2 guest on dedicated CPU 3 arms
+        CNTV, executes WFI, takes the FIQ once, and returns with 1 host wait,
+        1 hrtimer fire, 2.4-3.1 ms after its 2 ms deadline under TCG
+        (`NK_STELA_TIMER_TEST`, `run-dedicated-x86.py --require
+        STELA_TIMER_PASS`, 2026-11-25). Before SMP (no claimed hrtimer) the
+        host still spins on the counter. AIC device interrupts are not wired.
   - [ ] LKL's own timers (`host_timer_set_oneshot`) still run on the 10 ms
         tick on CPU 0.
 - [ ] Decide the isolation model: translated guest code at ring 0 inside nk

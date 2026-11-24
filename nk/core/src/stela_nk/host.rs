@@ -90,8 +90,29 @@ struct BootHost {
     executions: usize,
     patches: usize,
     faults: usize,
+    /// The TSC at which the guest counter reads 0.
+    tsc_base: u64,
+    /// The guest's armed timer, in counter ticks.
+    deadline: Option<u64>,
+    /// Whether that deadline is on this core's hrtimer.
+    hrtimer: bool,
+    waits: u64,
 }
 impl BootHost {
+    fn new(ram: Ram) -> Self {
+        Self {
+            ram,
+            code: Vec::new(),
+            entry: Code::new(&stela_compiler::x86_64::pinned::entry()),
+            executions: 0,
+            patches: 0,
+            faults: 0,
+            tsc_base: crate::arch::cycles(),
+            deadline: None,
+            hrtimer: false,
+            waits: 0,
+        }
+    }
     fn extent(&self, at: usize, len: usize) -> Option<&Code> {
         self.code.iter().find_map(|(code, size)| {
             let off = at.checked_sub(code.0 as usize)?;
@@ -177,15 +198,65 @@ impl Host for BootHost {
         assert!(!regime.controls.stage2, "boot host has no stage 2");
     }
     fn invalidate_translations(&mut self) {} // identity RAM; no shadow cache
+    /// The guest system counter at the M2's 24 MHz, from the TSC.
     fn counter(&mut self) -> u64 {
-        0
-    } // bounded instruction fixture, no timer
+        guest_count(self.tsc_base)
+    }
+    /// On a dedicated core the deadline arms that core's hrtimer; elsewhere
+    /// (the pre-SMP boot probe) `wait_for_interrupt` waits on the counter.
     fn arm_timer(&mut self, deadline: Option<u64>) {
-        assert!(deadline.is_none(), "boot host has no guest timer");
+        GUEST_TIMER.store(false, core::sync::atomic::Ordering::Release);
+        match deadline {
+            None => {
+                self.deadline = None;
+                crate::hrtimer::cancel();
+            }
+            Some(count) => {
+                self.deadline = Some(count);
+                let tsc = self.tsc_base + count_to_tsc(count);
+                self.hrtimer = crate::hrtimer::arm_at(tsc, guest_timer_fired);
+            }
+        }
     }
+    /// Halt until the guest's timer interrupt. Native execution runs with IF
+    /// masked (`fault::invoke`), so interrupts open only across the halt:
+    /// `sti; hlt` admits no gap between the check and the sleep.
     fn wait_for_interrupt(&mut self) {
-        panic!("boot guest must not wait");
+        use core::sync::atomic::Ordering;
+        self.waits += 1;
+        if self.hrtimer {
+            while !GUEST_TIMER.swap(false, Ordering::AcqRel) {
+                unsafe { core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack)) };
+            }
+            return;
+        }
+        let Some(deadline) = self.deadline else {
+            panic!("boot guest waits with no timer armed");
+        };
+        while guest_count(self.tsc_base) < deadline {
+            core::hint::spin_loop();
+        }
     }
+    fn poll_interrupt(&mut self) -> bool {
+        GUEST_TIMER.swap(false, core::sync::atomic::Ordering::AcqRel)
+    }
+}
+
+const GUEST_HZ: u128 = 24_000_000;
+static GUEST_TIMER: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+fn guest_timer_fired() {
+    GUEST_TIMER.store(true, core::sync::atomic::Ordering::Release);
+}
+
+fn guest_count(tsc_base: u64) -> u64 {
+    let hz = crate::timer::cycle_hz().max(1) as u128;
+    ((crate::arch::cycles().wrapping_sub(tsc_base) as u128 * GUEST_HZ) / hz) as u64
+}
+
+fn count_to_tsc(count: u64) -> u64 {
+    let hz = crate::timer::cycle_hz().max(1) as u128;
+    ((count as u128 * hz).div_ceil(GUEST_HZ)) as u64
 }
 
 pub(super) fn probe() {
@@ -214,14 +285,7 @@ extern "C" fn run_probe() {
     crate::println!("STELA_ENGINE_BEGIN");
     let ram = Ram::new();
     let base = ram.0 as u64;
-    let mut host = BootHost {
-        ram,
-        code: Vec::new(),
-        entry: Code::new(&stela_compiler::x86_64::pinned::entry()),
-        executions: 0,
-        patches: 0,
-        faults: 0,
-    };
+    let mut host = BootHost::new(ram);
     // mov x0,#3; add x2,x2,#7; subs x0,x0,#1; b.ne add;
     // mrs x3,CurrentEL; msr TPIDR_EL1,x2; mrs x4,TPIDR_EL1;
     // str x2,[x1]; b stop. The engine handles all exits and dispatch.
@@ -379,14 +443,7 @@ fn uart_probe() {
     };
     let ram = Ram::new();
     let base = ram.0 as u64;
-    let mut host = BootHost {
-        ram,
-        code: Vec::new(),
-        entry: Code::new(&stela_compiler::x86_64::pinned::entry()),
-        executions: 0,
-        patches: 0,
-        faults: 0,
-    };
+    let mut host = BootHost::new(ram);
     // ORR sets a cached vector before the fault; read UTRSTAT; write NK\n to UTXH.
     let words = [
         0x4ea2_1c20u32,
@@ -447,14 +504,7 @@ fn abort_probe() {
     use stela_engine::machine::system::Register;
     let ram = Ram::new();
     let base = ram.0 as u64;
-    let mut host = BootHost {
-        ram,
-        code: Vec::new(),
-        entry: Code::new(&stela_compiler::x86_64::pinned::entry()),
-        executions: 0,
-        patches: 0,
-        faults: 0,
-    };
+    let mut host = BootHost::new(ram);
     let bytes: Vec<u8> = [0xf940_0020u32, 0x1400_0001]
         .iter()
         .flat_map(|w| w.to_le_bytes())
@@ -495,4 +545,92 @@ fn abort_probe() {
     crate::println!(
         "STELA_GUEST_ABORT_OK: missing device, original ELR/FAR and destination retained"
     );
+}
+
+/// A guest generic timer interrupt, end to end, on a dedicated core
+/// (ROADMAP Phase 3): the guest arms CNTV 10 ms ahead and waits in WFI; the
+/// engine computes the deadline and asks the Host to sleep; nk arms the
+/// core's hrtimer, halts, and wakes on it; the engine raises the M2's timer
+/// FIQ; the guest's handler disables the timer and counts. Run on a dedicated
+/// core: `dedicate_cpu` gives the probe the LAPIC timer.
+pub(crate) fn timer_probe() -> bool {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static PASSED: AtomicBool = AtomicBool::new(false);
+    extern "C" fn on_core(_: usize) {
+        const PAGES: usize = 256;
+        let stack = crate::frames::alloc_contiguous(PAGES).expect("stela engine stack");
+        let flags = crate::sync::irq_save();
+        unsafe {
+            nk_stela_on_stack(stack.add(PAGES * 4096), run_timer_guest);
+            crate::sync::irq_restore(flags);
+            for page in 0..PAGES {
+                crate::frames::free(stack.add(page * 4096));
+            }
+        }
+    }
+    extern "C" fn run_timer_guest() {
+        PASSED.store(timer_guest(), Ordering::Release);
+    }
+    let Some(id) = crate::sched::dedicate_cpu(3, "vcpu-guest-timer", on_core, 0) else {
+        crate::println!("STELA_TIMER: dedicate_cpu(3) refused (needs NK_SMP)");
+        return false;
+    };
+    crate::sched::join(id);
+    let passed = PASSED.load(Ordering::Acquire);
+    crate::println!("{}", if passed { "STELA_TIMER_PASS" } else { "STELA_TIMER_FAIL" });
+    passed
+}
+
+fn timer_guest() -> bool {
+    let ram = Ram::new();
+    let base = ram.0 as u64;
+    let mut host = BootHost::new(ram);
+    // Assembled with clang (aarch64-none-elf); see the commit for the source.
+    //   adr x0, vectors; msr vbar_el1, x0; isb; mov x5, #0
+    //   mrs x1, cntvct_el0; x1 += 240000 (10 ms); msr cntv_cval_el0, x1
+    //   msr cntv_ctl_el0, #1; msr daifclr, #1 (FIQ)
+    // wait: wfi; cbz x5, wait; mrs x7, cntvct_el0; msr daifset, #1
+    // done: b done
+    let code: [u32; 17] = [
+        0x1000_4000, 0xd518_c000, 0xd503_3fdf, 0xd280_0005, 0xd53b_e041, 0xd295_3002,
+        0xf2a0_0062, 0x8b02_0021, 0xd51b_e341, 0xd280_0023, 0xd51b_e323, 0xd503_41ff,
+        0xd503_207f, 0xb4ff_ffe5, 0xd53b_e047, 0xd503_41df, 0x1400_0000,
+    ];
+    // vectors + 0x300 (current EL, SPx, FIQ):
+    //   mov x6, #0; msr cntv_ctl_el0, x6; mrs x8, cntvct_el0; add x5, x5, #1; eret
+    let fiq: [u32; 5] = [0xd280_0006, 0xd51b_e326, 0xd53b_e048, 0x9100_04a5, 0xd69f_03e0];
+    let bytes: Vec<u8> = code.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let handler: Vec<u8> = fiq.iter().flat_map(|w| w.to_le_bytes()).collect();
+    assert!(host.write_ram(base, &bytes));
+    assert!(host.write_ram(base + 0xb00, &handler));
+    let chip = stela_contracts::Chip::AppleM2;
+    let target = TargetCpu::Baseline;
+    let cpu = Cpu::of(chip, base, Pstate::reset(1));
+    let profile = CpuProfile {
+        name: "nk guest timer probe",
+        chip,
+        counter_frequency: 24_000_000,
+        fixed: identification::derive(chip, target, true, identification::Speculation::NONE),
+        processors: Vec::new(),
+    };
+    let fired_before = crate::hrtimer::fired();
+    let mut machine = Machine::new(cpu, host, NoDevices, profile, target);
+    let stop_pc = base + 0x40;
+    machine.set_breakpoints(&[stop_pc]);
+    let stop = machine.run(10_000);
+    let fired = crate::hrtimer::fired() - fired_before;
+    let st = &machine.cpu.state;
+    let (deadline, at_fiq, after) = (st.x[1], st.x[8], st.x[7]);
+    let late_us = at_fiq.saturating_sub(deadline) * 1_000_000 / 24_000_000;
+    crate::println!(
+        "STELA_TIMER: stop {:?}; FIQs taken {}; deadline count {}; FIQ at {} ({} us late); host waits {}, hrtimer fires {}",
+        stop, st.x[5], deadline, at_fiq, late_us, machine.host.waits, fired
+    );
+    matches!(stop, Stop::Breakpoint(pc) if pc == stop_pc)
+        && st.x[5] == 1
+        && at_fiq >= deadline
+        && after >= at_fiq
+        && machine.host.waits >= 1
+        && fired >= 1
+        && late_us < 5_000
 }

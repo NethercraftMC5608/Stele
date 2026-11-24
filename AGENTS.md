@@ -249,6 +249,10 @@ require it to pass; both the rebuilt x86 archive and cached arm64 archive pass.
   that exclude CPU 0. `sched::dedicate_cpu` gives an AP to one task (guest
   vCPUs) and masks its tick. Never give a Linux-ABI task an affinity without
   CPU 0.
+- **Guest WFI sleeps on the dedicated core's hrtimer.** `BootHost::arm_timer`
+  arms `hrtimer::arm_at`; `wait_for_interrupt` opens interrupts only across
+  `sti; hlt; cli`, because `fault::invoke` needs IF masked while guest code
+  runs. Without a claimed hrtimer (pre-SMP probes) it spins on the counter.
 - **The kernel links at 1 GiB on x86** (`linker-x86_64.ld`), because static
   binaries load at 0x400000 and every process owns the low gigabyte. Each
   address space has private copies of the top three page-table levels, exactly

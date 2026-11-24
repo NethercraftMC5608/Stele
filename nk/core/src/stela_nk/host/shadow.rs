@@ -206,14 +206,7 @@ fn machine<D: stela_engine::machine::Devices>(
     ttbr: u64,
     devices: D,
 ) -> Machine<ShadowHost, D> {
-    let inner = BootHost {
-        ram: Ram::new(),
-        code: Vec::new(),
-        entry: Code::new(&stela_compiler::x86_64::pinned::entry()),
-        executions: 0,
-        patches: 0,
-        faults: 0,
-    };
+    let inner = BootHost::new(Ram::new());
     let host = ShadowHost {
         root: Root::new(),
         ram,

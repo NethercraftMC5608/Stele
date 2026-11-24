@@ -596,3 +596,20 @@ nk-side proof that a count means the right time), and each interval's median
 lateness must stay under QEMU's own delivery step (~1.28 ms on macOS, whose
 QEMU main loop waits in whole milliseconds). `HRTIMER_PASS`. Run the scheduler torture test (`NK_SCHEDTEST=1`) after any
 scheduler change; it passed 3/3 with this one.
+
+### Guest timer interrupts on a dedicated core
+
+```sh
+NK_STELA_TIMER_TEST=1 NK_SMP=1 NK_AP_LAYER=4 NK_LKL_LIB=$PWD/ldk/build/lkl-x86_64/libnklkl.a \
+  cargo build --release --features stela --target x86_64-unknown-none --target-dir target-stela-timer
+python3 tests/run-dedicated-x86.py --kernel target-stela-timer/x86_64-unknown-none/release/nk \
+  --initrd /path/to/initrd.cpio --require STELA_TIMER_PASS --output target-stela-timer-run
+```
+
+After Linux is up, CPU 3 is dedicated to a translated M2 guest that unmasks
+FIQ, arms its virtual generic timer 2 ms ahead, and executes WFI. The engine
+host arms nk's hrtimer at that deadline and halts until it fires; the guest's
+FIQ handler disarms CNTV and counts. `STELA_TIMER_PASS` needs the guest to
+reach its breakpoint with exactly one FIQ, the FIQ no earlier than the
+deadline, at least one host wait and one hrtimer fire, and under 5 ms of
+lateness (QEMU's TCG delivery grid makes 2-3 ms typical on macOS).

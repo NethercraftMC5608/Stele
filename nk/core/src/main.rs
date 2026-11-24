@@ -476,6 +476,12 @@ pub extern "C" fn rust_main(magic: u64, info: u64) -> ! {
             if option_env!("NK_DEDICATED_TEST").is_some() {
                 dedicated_test::run();
             }
+            // A guest's generic timer interrupt through nk's hrtimer, on a
+            // dedicated core (ROADMAP Phase 3).
+            #[cfg(feature = "stela")]
+            if option_env!("NK_STELA_TIMER_TEST").is_some() {
+                stela_nk::timer_probe();
+            }
             println!();
             // LKL's numbers, not x86-64's: `ldk lkl` builds with ARCH=lkl on
             // both hosts, so the table is asm-generic wherever nk runs. 172 is
