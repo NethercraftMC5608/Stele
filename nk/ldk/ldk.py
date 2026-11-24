@@ -635,7 +635,16 @@ def cmd_lkl(args):
     # "pull access denied" for an image that is plainly built locally.
     image = IMAGE if arch == "aarch64" else f"{IMAGE}-amd64"
     # -mno-outline-atomics is an aarch64 flag and gcc refuses it elsewhere.
-    kcflags = "-mno-outline-atomics" if arch == "aarch64" else ""
+    # x86-64: -mno-red-zone, as arch/x86's own Makefile has it. arch/lkl is
+    # built like userspace and so keeps the 128-byte red zone below %rsp --
+    # but under nk, Linux runs at ring 0, where an interrupt pushes its frame
+    # onto the current stack, straight through the red zone. With real
+    # device interrupts arriving mid-driver that overwrote a leaf function's
+    # locals: host_iomem_access's `val` pointer, then the caller's frame
+    # (e1000e_update_stats with %rbp = 0). nk's own Rust target already has
+    # the red zone disabled.
+    kcflags = "-mno-outline-atomics" if arch == "aarch64" else "-mno-red-zone"
+    hostcflags = "" if arch == "aarch64" else "-mno-red-zone"
     say(f"Fetching lkl/linux for {arch} (shallow; a few minutes the first time)")
     subprocess.run(["docker", "volume", "create", volume],
                    check=True, stdout=subprocess.DEVNULL)
@@ -720,7 +729,7 @@ cp arch/lkl/include/uapi/asm/host_ops.h /out/
 cp arch/lkl/include/uapi/lkl.h /out/ 2>/dev/null || true
 # Stripped of debug info: 344MB to 20MB, and nk links the whole thing.
 strip --strip-debug lkl.o -o /out/lkl.o
-gcc -c -ffreestanding -fno-stack-protector -fno-PIE -mgeneral-regs-only \
+gcc -c -ffreestanding -fno-stack-protector -fno-PIE -mgeneral-regs-only __HOSTCFLAGS__ \
     -Wall -Wextra -Wno-unused-parameter -I/out /shim/lkl/nk-host.c -o /out/nk-host.o
 rm -f /out/libnklkl.a.tmp && ar rcs /out/libnklkl.a.tmp /out/lkl.o /out/nk-host.o
 # Verify the private syscall table before publishing the new archive.
@@ -734,6 +743,7 @@ nm --undefined-only /tmp/c.o | awk '{print "    " $2}' | sort -u
 """
     script = script.replace("__KCFLAGS__", kcflags)
     script = script.replace("__ARCH__", arch)
+    script = script.replace("__HOSTCFLAGS__", hostcflags)
     # aarch64 keeps build/lkl so every existing path and script still finds
     # it; a second architecture gets its own directory beside it.
     out = BUILD / ("lkl" if arch == "aarch64" else f"lkl-{arch}")
