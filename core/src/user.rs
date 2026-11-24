@@ -1722,9 +1722,14 @@ fn futex(_frame: &Frame) -> i64 {
 }
 
 /// clone and wait4, or -ENOSYS on a build with no Linux behind them.
+///
+/// By this architecture's own number: 220 is aarch64's clone and only
+/// aarch64's. On x86-64 clone is 56, so testing 220 sent every fork to
+/// wait4, which answered -ECHILD -- busybox's "can't fork: No child
+/// processes".
 #[cfg(nk_lkl)]
 fn process(frame: &Frame) -> i64 {
-    if frame.x[8] == 220 {
+    if frame.x[8] == crate::syscall_nr::nr::CLONE {
         fork(frame)
     } else {
         wait4(frame.x[0] as i64, frame.x[1], frame.x[2])
@@ -2125,8 +2130,13 @@ fn thread(frame: &Frame) -> i64 {
     let flags_arg = frame.x[0];
     let stack = frame.x[1];
     let parent_tid = frame.x[2];
-    let tls = frame.x[3];
-    let child_tid = frame.x[4];
+    // The two ABIs disagree on the last two: aarch64 is
+    // clone(flags, stack, parent_tid, tls, child_tid), x86-64 is
+    // clone(flags, stack, parent_tid, child_tid, tls).
+    #[cfg(target_arch = "x86_64")]
+    let (child_tid, tls) = (frame.x[3], frame.x[4]);
+    #[cfg(not(target_arch = "x86_64"))]
+    let (tls, child_tid) = (frame.x[3], frame.x[4]);
 
     if stack == 0 {
         // A thread with no stack of its own would run on its creator's, which

@@ -461,10 +461,16 @@ resume_user:
     mov     264(%rdi), %r10                 # user rsp
 
     // Restore the general registers the frame saved
+    // The same registers the sysret path restores, from the same slots:
+    // rax is the return value (x[0]), rdi the caller's own rdi (x[13]),
+    // and rsi, rdx, r10, r8, r9 the argument registers a syscall preserves.
+    // A forked child resumes at the instruction after its parent's
+    // `syscall`, and compiled code there may still hold values in any of
+    // them. This loaded rdi from x[0] -- zero -- and rotated r8/r9/r10.
     mov     0(%rdi),  %rax
     mov     8(%rdi),  %rsi
-    mov     16(%rdi), %r9                   # careful: rdx is needed below
-    mov     24(%rdi), %r8
+    mov     32(%rdi), %r8
+    mov     40(%rdi), %r9
     mov     48(%rdi), %rbx
     mov     56(%rdi), %rbp
     mov     72(%rdi), %r12
@@ -480,7 +486,9 @@ resume_user:
     pushq   %rcx                            # RIP
 
     // rdi and rdx last, since rdi held the frame pointer
+    // r10 last but two: until the pushes above it held the user rsp.
+    mov     24(%rdi), %r10
     mov     16(%rdi), %rdx
-    mov     0(%rdi),  %rdi
+    mov     104(%rdi), %rdi
 
     iretq
