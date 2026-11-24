@@ -44,20 +44,29 @@ pub fn halt() {
 /// mapped or enabled, and `cpu_id` is called from paths that run before it.
 #[inline]
 pub fn cpu_id() -> usize {
-    let ebx: u32;
+    // rbx is LLVM's, so CPUID's ebx output is swapped out through a scratch
+    // register -- and the swap has to be the full 64 bits. With 32-bit
+    // `mov`/`xchg` the restore wrote ebx, which zeroes rbx's upper half, and
+    // whatever the compiler was keeping there lost it: x86_legacy held a
+    // syscall's result in rbx across set_user_syscall (which calls this), so
+    // mkdirat's -17 reached busybox as 0xffffffef and glibc never set errno.
+    //
+    // eax is an output too: CPUID overwrites it, and declaring it input-only
+    // let the compiler assume it survived.
+    let rbx: u64;
     unsafe {
         core::arch::asm!(
-            "mov {tmp:e}, ebx",
+            "mov {tmp}, rbx",
             "cpuid",
-            "xchg {tmp:e}, ebx",
-            tmp = out(reg) ebx,
-            in("eax") 1u32,
+            "xchg {tmp}, rbx",
+            tmp = out(reg) rbx,
+            inout("eax") 1u32 => _,
             out("ecx") _,
             out("edx") _,
             options(nomem, nostack, preserves_flags),
         );
     }
-    let from_cpuid = ((ebx >> 24) & 0x7) as usize;
+    let from_cpuid = ((rbx >> 24) & 0x7) as usize;
     // CPUID is not trustworthy this early on a secondary: the bring-up loop
     // showed it reading 0 while the same CPU's LAPIC id was already 1. The
     // architectural stand-in is the local APIC id; the firmware/APIC-derived
