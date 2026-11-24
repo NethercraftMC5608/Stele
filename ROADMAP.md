@@ -128,8 +128,13 @@ LKL's drivers attach to real hardware. Pick one reference PC (from Phase 0).
         for `e1000e`: link up, DHCP lease, 3/3 pings
         (`nk/tests/run-net-x86.py`, 2026-11-25). Real hardware, and
         `igc`/`r8169`, still open.
-  - [ ] xHCI + HID (`xhci_hcd`, `usbhid`): keyboard input.
-  - [ ] HD Audio (`snd_hda_intel`): play a tone.
+  - [ ] xHCI + HID (`xhci_hcd`, `usbhid`): keyboard input. QEMU done: a
+        key typed on QEMU's USB keyboard is read as `EV_KEY` from
+        `/dev/input/event0` (`nk/tests/run-usb-hda-x86.py`, 2026-11-25).
+  - [ ] HD Audio (`snd_hda_intel`): play a tone. QEMU: the controller and
+        codec probe with MSI and card 0 registers; playback not tested yet
+        (busybox has no player). `igc` and `r8169` are built in, untested
+        until real hardware.
   - [ ] Wi-Fi (`iwlwifi` + firmware): associate. (Stela has no Wi-Fi at all.)
 - [ ] LKL's single-CPU bottleneck measured on real I/O (disk throughput,
       network). Decide whether it's acceptable for a guest. If not, plan

@@ -329,3 +329,27 @@ the clock froze inside syscalls (udelay spun for ever), LKL was built with
 the userspace red zone (interrupt frames overwrote driver locals), and a
 signal Linux raised itself (ping's SIGALRM) took Linux's default action.
 Verified 2026-11-25 with `NK_SMP=1 NK_AP_LAYER=4` and without.
+
+## USB keyboard (xHCI + HID) and HD Audio (x86-64)
+
+xHCI and HD Audio controllers are handed to Linux beside NVMe and Ethernet.
+The runner boots `qemu-xhci` + `usb-kbd` and `intel-hda` + `hda-duplex`, finds
+the keyboard's event node in `/proc/bus/input/devices`, types `a` through the
+QEMU monitor, and requires an `EV_KEY`/`KEY_A`/press record read from that
+node; it also requires `snd_hda_intel` to have registered a card (its codec
+interrupts arrive by MSI).
+
+```sh
+python3 tests/run-usb-hda-x86.py --kernel target-hx/x86_64-unknown-none/release/nk \
+  --busybox /path/to/static/x86_64/busybox
+```
+
+## Rebuilding the x86 LKL archive
+
+On an arm64 Docker host (Colima on Apple silicon), `ldk.py lkl --arch x86_64`
+cross-compiles natively with `x86_64-linux-gnu-` from the `nethos-ldk-cross-
+amd64` image instead of running gcc under amd64 emulation. A full clean build
+went from ~20 minutes plus random gcc segfaults to 86 seconds on a 12-CPU
+Colima VM (2026-11-25). The first build after switching builders runs
+`mrproper` once (`.nk-build-host`), because the tree's host tools are
+binaries for the previous builder.

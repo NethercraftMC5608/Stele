@@ -317,9 +317,10 @@ unsafe extern "C" fn msi_teardown(dev: *mut Dev, _ty: c_int) {
     d.nvec = 0;
 }
 
-/// The devices to hand Linux, chosen during discovery: the first NVMe
-/// controller and the first Ethernet controller, in that order. LKL's PCI host
-/// (patched by ldk/patch-lkl.py) scans each on its own root bus.
+/// The devices to hand Linux, chosen during discovery: the first of each
+/// class nk's LKL has a driver for -- NVMe, Ethernet, xHCI, HD Audio -- in
+/// that order. LKL's PCI host (patched by ldk/patch-lkl.py) scans each on its
+/// own root bus.
 const MAX_CHOSEN: usize = 8;
 static mut CHOSEN: [Option<Bdf>; MAX_CHOSEN] = [None; MAX_CHOSEN];
 
@@ -327,6 +328,10 @@ pub fn choose(devices: &[crate::pci::Device]) {
     let picks = [
         devices.iter().find(|d| d.class == 0x01 && d.subclass == 0x08), // NVMe
         devices.iter().find(|d| d.class == 0x02 && d.subclass == 0x00), // Ethernet
+        devices
+            .iter()
+            .find(|d| d.class == 0x0c && d.subclass == 0x03 && d.interface == 0x30), // xHCI
+        devices.iter().find(|d| d.class == 0x04 && d.subclass == 0x03), // HD Audio
     ];
     let chosen = unsafe { &mut *(&raw mut CHOSEN) };
     let mut n = 0;

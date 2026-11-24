@@ -129,6 +129,9 @@ qemu-system-x86_64 -M q35 -m 4G -smp 4 \
 
 The x86 build needs `NK_LKL_LIB` (modules are cfg'd out without it). Rebuilding
 LKL needs Docker (`colima start`), then `python3 ldk/ldk.py lkl --arch x86_64`.
+On Apple silicon that cross-compiles natively (`x86_64-linux-gnu-`); a full
+rebuild takes about 90 seconds with Colima at 12 CPUs / 16 GiB. Don't go back
+to the emulated amd64 builder: ~20 minutes and random gcc segfaults.
 `NK_SMP=1` also needs `NK_AP_LAYER=4`: layer zero does not initialize the
 AP scheduler slots and panics on an invalid current-task index.
 The old NETHOS cached x86 archive predates the retained-file ABI fix. The local
