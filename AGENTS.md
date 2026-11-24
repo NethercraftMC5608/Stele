@@ -173,6 +173,11 @@ require it to pass; both the rebuilt x86 archive and cached arm64 archive pass.
   `rt_sigtimedwait`), and caught dispositions are mirrored into LKL
   (`signal::mirror_to_lkl`) so Linux doesn't take the default action. x86
   only so far; aarch64 has the same gap.
+- **Real PCs boot nk through GRUB (Multiboot2) on UEFI.** `tests/run-uefi-x86.py`
+  builds the same disk image a USB stick needs and boots it under OVMF; use it
+  for anything touching boot info, ACPI discovery or the console. The screen
+  console (`fbcon.rs`) mirrors serial output; GRUB calls GOP's 32-bit pixels
+  24 bpp.
 - **The kernel links at 1 GiB on x86** (`linker-x86_64.ld`), because static
   binaries load at 0x400000 and every process owns the low gigabyte. Each
   address space has private copies of the top three page-table levels, exactly

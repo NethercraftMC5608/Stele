@@ -353,3 +353,29 @@ went from ~20 minutes plus random gcc segfaults to 86 seconds on a 12-CPU
 Colima VM (2026-11-25). The first build after switching builders runs
 `mrproper` once (`.nk-build-host`), because the tree's host tools are
 binaries for the previous builder.
+
+## Booting like a PC: UEFI + GRUB + Multiboot2, and the screen console
+
+Every other test starts nk with QEMU's `-kernel` (PVH). This one builds a GPT
+disk whose EFI System Partition holds GRUB (`EFI/BOOT/BOOTX64.EFI`), nk and
+an initrd, and boots it from a USB mass-storage device under OVMF, as a PC
+boots a USB stick. nk must take its memory map, ACPI RSDP and framebuffer from
+GRUB's Multiboot2 tags.
+
+```sh
+python3 tests/run-uefi-x86.py --kernel target-hx/x86_64-unknown-none/release/nk \
+  --initrd /path/to/initrd.cpio --require X86_ROOT_NOT_FOUND \
+  --require "framebuffer console" --screenshot target-uefi/screen.png
+```
+
+GRUB's EFI image is assembled in Docker (Debian's amd64 `grub-efi-amd64-bin`
+modules, native `grub-mkimage`, mtools) and cached in the output directory.
+`--disk-only` stops after writing `target-uefi/disk.img`, which is also what
+goes on a USB stick for a real PC (`dd` it to the whole device).
+
+The framebuffer console (`core/src/fbcon.rs`) draws everything printed to
+serial -- nk, Linux's printk, panics -- in Linux's 8x16 font on the GOP
+framebuffer. GRUB reports GOP's 32-bit pixels as 24 bpp, so the pixel size
+comes from the pitch. It wraps instead of scrolling (scrolling copies the
+whole uncached framebuffer per line). Verified 2026-11-25: `UEFI_PASS` with
+and without SMP, and a screenshot showing the log at 800x600 (100x37 text).

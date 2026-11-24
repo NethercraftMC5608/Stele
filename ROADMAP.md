@@ -77,8 +77,16 @@ LKL's drivers attach to real hardware. Pick one reference PC (from Phase 0).
 - [ ] Boot path: GRUB Multiboot2 on UEFI (already parsed by
       `bootinfo_x86.rs`), or nk's own EFI stub. Done when: nk's banner on serial
       or framebuffer on real hardware.
+  - [x] QEMU + OVMF: a GPT disk with GRUB on its ESP boots nk from a USB
+        mass-storage device; Multiboot2 memory map, ACPI and framebuffer tags
+        are used; SMP comes up; the init script runs
+        (`nk/tests/run-uefi-x86.py`, 2026-11-25). The same `disk.img` can be
+        written to a USB stick.
 - [ ] A console that works without serial: UEFI GOP framebuffer text, and
       later netconsole. Done when: the boot log can be read on screen.
+  - [x] GOP framebuffer text console (`core/src/fbcon.rs`), fed from the
+        serial print path; verified by screenshot under OVMF (2026-11-25).
+        Real hardware, higher resolutions and netconsole still open.
 - [ ] ACPI: RSDP → XSDT → MADT (CPUs, IOAPIC, LAPIC address), MCFG (PCIe
       ECAM), FADT (reset, power off). Replace the q35 assumptions in `smp.rs`
       and `lapic.rs`. Done when: all CPUs come up on the real machine.
