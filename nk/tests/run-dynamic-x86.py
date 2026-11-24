@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Build a glibc/Python initrd from cached NETHOS amd64 .npk packages and boot nk."""
 import argparse
+import os
 from pathlib import Path
 import runpy
 import shutil
@@ -49,6 +50,19 @@ def main():
     (root / "bin").mkdir(exist_ok=True)
     shutil.copyfile(args.busybox, root / "bin/busybox")
     (root / "bin/busybox").chmod(0o755)
+    sysroot = Path(subprocess.check_output(["rustc", "--print", "sysroot"], text=True).strip())
+    linkers = list(sysroot.glob("lib/rustlib/*/bin/rust-lld"))
+    if len(linkers) != 1:
+        parser.error("Rust's ELF linker is required for the entropy helper")
+    source = Path(__file__).resolve().parents[1] / "init/seed-entropy-x86.c"
+    subprocess.run(["clang", "--target=x86_64-unknown-linux-gnu", "-O2", "-Wall", "-Wextra", "-Werror",
+                    "-ffreestanding", "-fno-stack-protector", "-fno-pie", "-mno-red-zone",
+                    "-c", str(source), "-o", str(out / "seed-entropy.o")], check=True)
+    subprocess.run([str(linkers[0]), "-flavor", "gnu", "-static", "--build-id=none", "--image-base=0x400000",
+                    "-e", "_start", "-o", str(root / "seed-entropy"), str(out / "seed-entropy.o")], check=True)
+    (root / "seed-entropy").chmod(0o755)
+    (root / "entropy.seed").write_bytes(os.urandom(32))
+    (root / "entropy.seed").chmod(0o600)
     (root / "probe.py").write_text('''print(1)
 print("PYTHON_PRINT_OK", flush=True)
 import ctypes
@@ -103,7 +117,10 @@ print("PYTHON_THREADS_OK", flush=True)
 ''')
     (root / "nk-init").write_text('''#!/bin/busybox sh
 export PATH=/bin:/usr/bin
+/bin/busybox mknod -m 600 /dev/random c 1 8 || exit 1
 /bin/busybox mknod -m 666 /dev/urandom c 1 9 || exit 1
+/seed-entropy || { echo DYNAMIC_FAIL; exit 1; }
+/bin/busybox rm /entropy.seed
 /usr/bin/python3.13 -I -S -u /probe.py
 if [ "$?" = 0 ]; then echo DYNAMIC_PASS; else echo DYNAMIC_FAIL; fi
 exec /bin/busybox sleep 3600
@@ -131,7 +148,7 @@ exec /bin/busybox sleep 3600
                 if any(x in text for x in ("DYNAMIC_FAIL", "kernel panic", "no init to run:")):
                     break
                 if "DYNAMIC_PASS" in text:
-                    passed = all(x in text for x in ("PYTHON_PRINT_OK", "PYTHON_DLOPEN_OK"))
+                    passed = all(x in text for x in ("HOST_ENTROPY_SEEDED", "PYTHON_PRINT_OK", "PYTHON_DLOPEN_OK"))
                     if args.threads:
                         passed = passed and "PYTHON_THREADS_OK" in text
                     break
