@@ -494,6 +494,11 @@ pub extern "C" fn rust_main(magic: u64, info: u64) -> ! {
             if option_env!("NK_STELA_TIMER_TEST").is_some() {
                 stela_nk::timer_probe();
             }
+            // A host device interrupt through the AIC model into a guest.
+            #[cfg(feature = "stela")]
+            if option_env!("NK_STELA_IRQ_TEST").is_some() {
+                stela_nk::irq_probe();
+            }
             println!();
             // LKL's numbers, not x86-64's: `ldk lkl` builds with ARCH=lkl on
             // both hosts, so the table is asm-generic wherever nk runs. 172 is

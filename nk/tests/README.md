@@ -597,6 +597,22 @@ lateness must stay under QEMU's own delivery step (~1.28 ms on macOS, whose
 QEMU main loop waits in whole milliseconds). `HRTIMER_PASS`. Run the scheduler torture test (`NK_SCHEDTEST=1`) after any
 scheduler change; it passed 3/3 with this one.
 
+### Host device interrupts into a guest through the AIC
+
+```sh
+NK_STELA_IRQ_TEST=1 NK_SMP=1 NK_AP_LAYER=4 NK_LKL_LIB=$PWD/ldk/build/lkl-x86_64/libnklkl.a \
+  cargo build --release --features stela --target x86_64-unknown-none --target-dir target-stela-irq
+python3 tests/run-dedicated-x86.py --kernel target-stela-irq/x86_64-unknown-none/release/nk \
+  --initrd /path/to/initrd.cpio --require STELA_IRQ_PASS --output target-stela-irq-run
+```
+
+A translated M2 guest on dedicated CPU 3 enables the `Aic2` model, unmasks
+input 32, writes a fixture device's request register and waits in WFI. An
+nk task on CPU 2 raises the device line 5 ms later and IPIs CPU 3 (vector
+0xed). `STELA_IRQ_PASS` needs one IRQ whose AIC event is 0x10020 (IRQ type,
+input 32), the device acknowledged (line low), `run` to have returned
+`Stop::Waiting` and the core to have halted and been kicked at least once.
+
 ### Linux timers at their deadlines
 
 ```sh

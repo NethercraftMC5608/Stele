@@ -269,6 +269,7 @@ dependencies = [
  "stela-crypto",
  "stela-engine",
  "stela-soc",
+ "stela-soc-data",
 ]
 
 [[package]]

@@ -249,6 +249,11 @@ require it to pass; both the rebuilt x86 archive and cached arm64 archive pass.
   that exclude CPU 0. `sched::dedicate_cpu` gives an AP to one task (guest
   vCPUs) and masks its tick. Never give a Linux-ABI task an affinity without
   CPU 0.
+- **Host device work reaches a guest as a line plus a kick.** Set the line
+  (an atomic the board's `Devices::lines` forwards into the AIC model), then
+  IPI the dedicated core on vector 0xed. A kick that arrives while the guest
+  runs (IF masked) is delivered when it returns; a PE waiting with no
+  deadline makes `run` return `Stop::Waiting` (`Devices::waits_on_host`).
 - **CPU 0's LAPIC timer carries Linux's one-shots** (`hostops`,
   `claim_deadline_timer`); the tick is the PIT. On x86 one-shot deadlines are
   TSC nanoseconds, not ticks. Only touch `TIMERS` on CPU 0 with IF masked,

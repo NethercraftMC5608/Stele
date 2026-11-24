@@ -234,7 +234,17 @@ What Stela's runtime needs from the kernel underneath it.
         1 hrtimer fire, 2.4-3.1 ms after its 2 ms deadline under TCG
         (`NK_STELA_TIMER_TEST`, `run-dedicated-x86.py --require
         STELA_TIMER_PASS`, 2026-11-25). Before SMP (no claimed hrtimer) the
-        host still spins on the counter. AIC device interrupts are not wired.
+        host still spins on the counter.
+  - [x] Host device interrupts into a guest through the AIC model
+        (`core/src/stela_nk/host/irq.rs`): a line nk raises from another CPU
+        feeds `stela_soc::aic::Aic2` input 32, whose IRQ output is the guest
+        PE's IRQ pin (`Devices::lines`); an IPI (vector 0xed) wakes the
+        dedicated core. The guest enables and unmasks the AIC, asks for an
+        interrupt, waits in WFI, claims event 0x10020, acks the device and
+        unmasks: one IRQ, the core halted once and was kicked once, ~2.5 ms
+        raise-to-ack under TCG, 3/3 runs (`NK_STELA_IRQ_TEST`,
+        `run-dedicated-x86.py --require STELA_IRQ_PASS`, 2026-11-25). A
+        fixture device and fixed addresses, not an ADT-mounted board.
   - [x] LKL's own timers at their deadlines (x86): one-shot deadlines are
         kept in TSC nanoseconds and CPU 0's LAPIC timer (free: the boot CPU
         ticks from the PIT) is claimed as an hrtimer armed for the earliest;
@@ -308,7 +318,8 @@ What Stela's runtime needs from the kernel underneath it.
         translated ARM64 reads UTRSTAT and transmits exactly `NK\n` via three
         UTXH writes, with vector state preserved across native faults.
         Unsupported access widths refuse. Synthetic fixture address, polled
-        console only: no ADT/full-board mount or AIC connection yet
+        console only: no ADT/full-board mount yet; the AIC2 model itself now
+        delivers a host device IRQ on nk (Phase 3)
         (`nk/tests/run-stela-x86.py`, 2026-11-25; uncommitted).
         The UART also passes through a distinct virtual mapping with the ARM
         MMU enabled; the full ADT-described board remains open.

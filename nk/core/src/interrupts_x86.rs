@@ -279,6 +279,13 @@ pub unsafe extern "C" fn x86_trap(frame: *mut TrapFrame, fp: *const u8) {
                 crate::sched::schedule();
             }
         }
+        // Kick from another CPU: host device work for a dedicated core's
+        // guest (stela_nk::host::irq). Ending the halt is the whole effect.
+        #[cfg(feature = "stela")]
+        0xed => {
+            crate::lapic::eoi();
+            crate::stela_nk::kicked();
+        }
         // Reschedule IPI from another CPU (LAPIC vector 0xf0). LAPIC EOI,
         // not PIC: this interrupt never went through the 8259. The sender
         // already set this CPU's need_resched; act on it at the same safe
