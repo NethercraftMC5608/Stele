@@ -301,8 +301,8 @@ pub fn run(p: &Process) -> ! {
     // up -- the same layout `ARCH_SET_FS` would install later.
     #[cfg(target_arch = "x86_64")]
     if p.tls_memsz > 0 {
-        let tp = (p.tls_addr + p.tls_memsz as u64 + 15) & !15;
-        unsafe { crate::arch::set_tls(tp) };
+        // `load` built the block and recorded TP itself.
+        unsafe { crate::arch::set_tls(p.tls_addr) };
     }
     unsafe { enter_user(p.entry, p.stack, p.ttbr0) }
 }
@@ -3026,51 +3026,9 @@ pub fn load(
     // it before their own setup runs, and the template lives *inside* a
     // PT_LOAD of an ordinary non-PIE binary -- remapping fresh pages over it
     // would replace the image's own data with an uninitialized copy.
-    let (tls_addr, tls_filesz, tls_memsz) = if !cfg!(target_arch = "x86_64") {
-        (0, 0, 0)
-    } else {
-    match &image.tls {
-        Some(t) => {
-            let base = t.address & !(PAGE as u64 - 1);
-            let pages = (t.address + t.memsz as u64).div_ceil(PAGE as u64)
-                - base / PAGE as u64;
-            let mut backing = alloc::vec::Vec::new();
-            backing.try_reserve_exact(pages as usize).map_err(|_| "no memory for TLS")?;
-            for i in 0..pages {
-                let page = frames::alloc().ok_or("no memory for TLS")?;
-                unsafe { core::ptr::write_bytes(page, 0, PAGE) };
-                backing.push(page as u64);
-            }
-            // File bytes first: the template's initialized portion, then the
-            // rest stays zero (the .tbss tail).
-            let init_end = t.filesz.min(t.memsz);
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    bytes.as_ptr().add(t.offset),
-                    backing[0] as *mut u8,
-                    init_end,
-                );
-            }
-            for (i, &pa) in backing.iter().enumerate() {
-                unsafe {
-                    paging::map_user_permissions(
-                        ttbr0,
-                        base + (i * PAGE) as u64,
-                        pa,
-                        PAGE as u64,
-                        false,
-                        true,
-                    );
-                }
-            }
-            (t.address, t.filesz, t.memsz)
-        }
-        None => (0, 0, 0),
-    }
-    };
     // The heap starts on the first page boundary past everything the image
     // asked for, so growing it can never land on the program's own bss.
-    let brk = image
+    let mut brk = image
         .segments
         .iter()
         .map(|s| s.address + s.memsz as u64)
@@ -3078,6 +3036,66 @@ pub fn load(
         .unwrap_or(USER_BASE)
         .div_ceil(PAGE as u64)
         * PAGE as u64;
+    // x86 only. aarch64 libcs install their own thread pointer and never read
+    // it before their own setup runs.
+    //
+    // On x86-64 musl's `_start` reads `%fs:0x28` (the stack guard) before any
+    // syscall could set the base, so a thread pointer has to exist at entry.
+    // It is built in pages of its own, at the initial break, and the break
+    // moves past them. It must *not* be mapped over the template's own
+    // address: the template lives inside a PT_LOAD (busybox: .tdata is the
+    // first thing in its RW segment), so fresh pages there replaced the
+    // image's data with zeroes -- the same fault 3ab5a7c fixed on aarch64,
+    // seen here as a NULL read through a global glibc had already set.
+    //
+    // Variant 2: the block ends at TP, TP is the TCB, and the TCB's first
+    // word points at itself (`%fs:0` is how libc finds it). glibc replaces
+    // all of this with its own block through ARCH_SET_FS; musl uses it until
+    // it does the same. `tls_addr` carries TP itself.
+    let (tls_addr, tls_filesz, tls_memsz) = if !cfg!(target_arch = "x86_64") {
+        (0, 0, 0)
+    } else {
+        match &image.tls {
+            Some(t) => {
+                let align = t.align.max(64);
+                let block = (t.memsz as u64).div_ceil(align) * align;
+                // The TCB: glibc's is ~0x700 bytes; two pages of room past TP
+                // covers it and the stack guard at 0x28.
+                let total = block + 2 * PAGE as u64;
+                let pages = total.div_ceil(PAGE as u64);
+                let base = brk;
+                let tp = base + block;
+                for i in 0..pages {
+                    let page = frames::alloc().ok_or("no memory for TLS")?;
+                    unsafe { core::ptr::write_bytes(page, 0, PAGE) };
+                    // The template sits at the block's start; copy whatever
+                    // of its initialized bytes fall in this page.
+                    let page_va = base + i * PAGE as u64;
+                    let init_end = base + t.filesz.min(t.memsz) as u64;
+                    let lo = page_va.max(base);
+                    let hi = (page_va + PAGE as u64).min(init_end);
+                    if lo < hi {
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                bytes.as_ptr().add(t.offset + (lo - base) as usize),
+                                page.add((lo - page_va) as usize),
+                                (hi - lo) as usize,
+                            );
+                        }
+                    }
+                    if (page_va..page_va + PAGE as u64).contains(&tp) {
+                        unsafe { *(page.add((tp - page_va) as usize) as *mut u64) = tp };
+                    }
+                    unsafe {
+                        paging::map_user_permissions(ttbr0, page_va, page as u64, PAGE as u64, false, true);
+                    }
+                }
+                brk = base + pages * PAGE as u64;
+                (tp, t.filesz, t.memsz)
+            }
+            None => (0, 0, 0),
+        }
+    };
     Ok(Process { ttbr0, entry, stack: sp, brk, tls_addr, tls_filesz, tls_memsz, abi })
 }
 
