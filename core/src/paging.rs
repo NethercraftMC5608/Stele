@@ -458,11 +458,40 @@ fn next_asid() -> u64 {
 pub fn new_address_space() -> u64 {
     unsafe {
         let root = crate::frames::alloc().expect("no memory for an address space") as *mut u64;
-        core::ptr::copy_nonoverlapping(
-            table_of(kernel_address_space()) as *const u64,
-            root,
-            512,
-        );
+        let l1 = crate::frames::alloc().expect("no memory for an address space") as *mut u64;
+        let l2 = crate::frames::alloc().expect("no memory for an address space") as *mut u64;
+        let kroot = table_of(kernel_address_space()) as *const u64;
+        core::ptr::copy_nonoverlapping(kroot, root, 512);
+
+        // Three levels copied, not one -- the same shape as the aarch64 arm
+        // below, and for the same reason, only sharper. A shallow copy of the
+        // PML4 shares the kernel's PDPT and its first page directory, so
+        // mapping a process at 0x400000 rewrote the *kernel's* 2MB identity
+        // entry there, in every address space at once. With the kernel linked
+        // at 1MB that entry was the kernel's own text: the next kernel
+        // function in 0x400000..0x600000 executed busybox's bytes at CPL0
+        // (`mov %fs:-0x20, %eax`, cr2 0xffffffffffffffe0).
+        //
+        // The kernel now links at 1GB (linker-x86_64.ld) and the frame
+        // allocator starts above its image, so nothing of the kernel's lives
+        // in the user range and the private directory can simply leave it
+        // empty. Below USER_BASE the boot map's entries stay -- supervisor
+        // only, and the AP trampoline at 0x8000 is reached through them.
+        // PDPT slots 1.. (RAM above 1GB, the LAPIC, Linux's window) are still
+        // shared by pointer, which is what keeps later kernel mappings there
+        // visible to every process. `destroy_user_address_space` frees
+        // exactly root[0] -> l1[0] -> l2 and the page tables under it, which
+        // is this shape.
+        let kl1 = (*kroot & ADDR) as *const u64;
+        let kl2 = (*kl1 & ADDR) as *const u64;
+        core::ptr::copy_nonoverlapping(kl1, l1, 512);
+        core::ptr::copy_nonoverlapping(kl2, l2, 512);
+        let first_user = (crate::user::USER_BASE >> L2_SHIFT) as usize;
+        for i in first_user..512 {
+            *l2.add(i) = 0;
+        }
+        *root = (*kroot & !ADDR) | (l1 as u64);
+        *l1 = (*kl1 & !ADDR) | (l2 as u64);
         // No ASID: on AArch64 TTBR0[63:48] carries one, but on x86-64 CR3 has
         // no such field and any bits above the address make it non-canonical
         // -- which is a #GP with error 0 the moment the value is used, a long

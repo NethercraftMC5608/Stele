@@ -1225,7 +1225,7 @@ struct LklCpu {
 #[cfg(all(nk_lkl, target_arch = "aarch64"))]
 const LKL_CPU_SEED: usize = 0x0000000040e29eb8;
 #[cfg(all(nk_lkl, target_arch = "x86_64"))]
-const LKL_CPU_SEED: usize = 0x0000000000f51360;
+const LKL_CPU_SEED: usize = 0x0000000040e78a60;
 
 /// Where `cpu` actually is, once `check_lkl_cpu_addr` has confirmed it.
 ///
@@ -1703,7 +1703,7 @@ unsafe fn claim_memory(fdt: &dt::Fdt, ram_start: usize, ram_end: usize) {
     #[cfg(target_arch = "aarch64")]
     let image_start = 0x4008_0000usize; // where linker.ld links; see boot.s
     #[cfg(target_arch = "x86_64")]
-    let image_start = 0x0010_0000usize; // 1MB; see linker-x86_64.ld
+    let image_start = 0x4000_0000usize; // 1GB; see linker-x86_64.ld
     let image_end = &raw const __image_end as usize;
 
     // The initial ramdisk sits in RAM like everything else and nothing else

@@ -1,4 +1,4 @@
-/* x86-64: a Multiboot2 kernel, loaded at 1MB.
+/* x86-64: a Multiboot2 kernel, loaded at 1GB (see below).
  *
  * 0x100000 is the conventional load address for a PC kernel and the lowest
  * one that is safe: below it sit the real-mode IVT, the BIOS data area, the
@@ -17,7 +17,12 @@ ENTRY(_start)
 
 SECTIONS
 {
-    . = 0x100000;
+    /* 1GB, not 1MB. A process is linked for 0x400000 and owns the low
+     * gigabyte, so a kernel at 1MB sat in the middle of every user address
+     * space and the two could not both be mapped. 0x40000000 is where the
+     * aarch64 kernel already lives, for the same reason. It needs RAM at
+     * 1GB, which every machine nk targets has. */
+    . = 0x40000000;
     .text : {
         KEEP(*(.text.boot))     /* _start must be the first byte of the image */
         *(.text .text.*)
