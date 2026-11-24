@@ -156,6 +156,10 @@ _start_common:
     # SSE instruction traps. MP set is the pair it is normally used with.
     and     $~(1 << 2), %eax                # EM: clear
     or      $(1 << 1), %eax                 # MP: monitor coprocessor
+    # NE: deliver x87 errors as #MF instead of the legacy external FERR#
+    # route. PVH leaves this clear; canonical native-system RAM admission
+    # requires the architectural exception path, just as SSE uses vector 19.
+    or      $(1 << 5), %eax
     mov     %eax, %cr0
 
     # A 64-bit code segment, and a far jump to load it. Until this jump the
@@ -469,11 +473,12 @@ ap_prot:
 
     movb    $0x49, %al                // 'I': EFER.LME enabled
     outb    %al, %dx
-    // CR0: PG + WP + MP, EM clear.
+    // CR0: PG + WP + MP + NE, EM clear (same exception policy as the BSP).
     mov     %cr0, %eax
     or      $(1 << 31), %eax
     or      $(1 << 16), %eax
     or      $(1 << 1), %eax
+    or      $(1 << 5), %eax
     and     $~(1 << 2), %eax
     mov     %eax, %cr0
 

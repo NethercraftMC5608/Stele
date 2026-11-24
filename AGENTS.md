@@ -144,6 +144,72 @@ require it to pass; both the rebuilt x86 archive and cached arm64 archive pass.
 
 ## x86 pitfalls already paid for
 
+- **Ordinary translated blocks need the canonical entry thunk.**
+  `stela_compiler::x86_64::block_entry::enter` saves the host stack in
+  `GuestState::exit_rsp`; a plain function-pointer call leaves exits restoring
+  RSP from zero. `nk/core/src/stela_nk.rs` exercises trusted finite blocks
+  before SMP with owned RW/NX -> RX code pages. Its private `host.rs` now runs
+  a real system-mode `Machine`, with bounded MMU-off RAM and idle code patching.
+  System blocks need the pinned entry plus callee-saved host register
+  preservation; ordinary block entry alone is insufficient. Native fault
+  recovery and the existing S5L UART model now pass in the private fixture;
+  general guest isolation and concurrent code remain open. A separate bounded
+  MMU-on fixture now uses ARM tables and a private x86 shadow root.
+- **Native fault recovery is invocation-owned.** The pre-SMP probe runs after
+  IDT/TSS setup with IF masked. Only synchronous faults whose RIP belongs to
+  the active immutable native images are captured; other faults use nk's
+  normal path. `isr_common` passes its FXSAVE image so recovery captures XMM8-15
+  before Rust can change them. No engine/LKL work runs inside the handler.
+  Full spill/extended-register recovery, general shadow paging, guest concurrency
+  and arbitrary guest code remain unsupported. A missing device must raise an ARM
+  abort, never return a fabricated value.
+- **Shadow leaves borrow their backing.** `stela_nk/host/shadow.rs` uses a
+  private low 2 MiB aperture, separate guest physical RAM and Stela's ARM
+  walker. It eagerly rebuilds mappings outside native entry; no table walks
+  or allocations happen in the trap. Supervisor/NX x86 leaves enforce guest
+  data write permissions. CR3 is restored before fault classification; the
+  fresh ARM walk distinguishes permission/translation faults from device PAs.
+  Before destroying the root, remove borrowed leaves without freeing payload
+  frames, then let the RAM owner free them. Guest TLBI permission and unmap
+  tests pass. Nine address-space turns now verify guest MSR TTBR0 switches,
+  distinct code/data at the same VAs, and ASID reuse with explicit TLBI.
+  The host still eagerly rebuilds one root: retained per-ASID roots, scoped
+  invalidation, general demand fills and isolation remain open. MMU-on UART
+  accesses also translate VA to device PA without mapping a RAM leaf.
+- **Guest physical RAM need not be contiguous on the host.** The private
+  `stela_nk/ram.rs` owner reserves a checked guest range and commits zeroed
+  4 KiB frames as needed before native entry. Uncommitted reads return zero;
+  cross-page copies split at backing boundaries. Raw host pointers cover only
+  one resident page. The shadow fixture reserves 4 GiB, with data near its
+  6 GiB upper end backed by an nk frame below 4 GiB. Model DMA ports use the
+  same checked memory interface, including exact partial-transfer progress.
+  This remains pre-SMP: no production memory service, real-device DMA/DART,
+  retained ASID roots or general native demand filling is implied.
+- **Canonical RAM handoff consumes the sparse builder.** Its unsafe
+  `into_registered` path transfers committed frames to the engine's real
+  `RegisteredSystemRam::register` at CPL0 with IF masked. No payload is copied;
+  an immutable keep-alive reclaims frames after the last backing drops.
+  Uncommitted holes stay unregistered. Retire all shadow/direct-writer aliases
+  before handoff, and use only canonical physical/service APIs afterward.
+  The separate probe verifies publication, descriptor CAS, refusal across
+  holes, service exclusion, permanent owner failure and reclamation. Existing
+  translated fixtures still use their older private host; they do not acquire
+  canonical native-execution permission. Keep everything before SMP until the
+  frame allocator and persistent guest ownership are made safe for it.
+- **Set CR0.NE during x86 boot.** PVH left CR0 at `0x80010013`, so the engine's
+  canonical native-target admission correctly refused. BSP and AP setup now
+  enable native x87 exceptions (#MF) rather than the external FERR# route.
+  Do not weaken the engine's control checks to accommodate a missing boot bit.
+- **The engine probe needs a dedicated stack.** A measured 209,320-byte stack
+  footprint corrupted LKL statics below nk's 64 KiB boot stack, despite the
+  engine fixture itself passing. It now runs on an owned 1 MiB pre-SMP stack,
+  checks its bottom canary and reports touched bytes before freeing it.
+- **Dynamic tests must provision entropy.** Python/urandom stalled in Linux's
+  `try_to_generate_entropy` without a seeded CRNG. The dynamic runner now
+  supplies 32 fresh host-CSPRNG bytes to its test image; `seed-entropy-x86.c`
+  credits them with RNDADDENTROPY and requires nonblocking getrandom to fill
+  a buffer before Python starts. This is test provisioning, not a production
+  RNG provider; do not substitute fixed/time-derived seeds or insecure flags.
 - **Shared code assumes aarch64 numbers and layouts.** Clone was dispatched on
   `220` (aarch64) instead of `nr::CLONE` (56 on x86). Clone's last two args are
   swapped between ABIs. Asm-generic structs (`stat`, `epoll_event`) differ from

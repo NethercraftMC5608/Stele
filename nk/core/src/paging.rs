@@ -100,6 +100,50 @@ pub unsafe fn identity_mmio(start: u64, end: u64) -> bool {
     true
 }
 
+/// Change one exclusively owned boot identity RAM page between RW/NX and RX.
+/// Called only before APs and user address spaces exist: no remote TLB can
+/// retain the old rights. There is no writable alias of this identity page.
+///
+/// # Safety
+/// `page` is an allocated, exclusively owned 4 KiB RAM frame in the kernel
+/// identity arena. No references or execution may overlap a rights change.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn boot_code_rights(page: u64, executable: bool) {
+    assert!(page >= 1 << 30 && page < 1 << 32 && page & 4095 == 0);
+    let root = table_of(crate::arch::current_page_table()) as *mut u64;
+    let l1 = next_table(root.add(((page >> L0_SHIFT) & 511) as usize));
+    let l2 = next_table(l1.add(((page >> L1_SHIFT) & 511) as usize));
+    let l3 = next_table(l2.add(((page >> L2_SHIFT) & 511) as usize));
+    let entry = l3.add(((page >> L3_SHIFT) & 511) as usize);
+    assert_eq!(*entry & ADDR, page);
+    assert_ne!(*entry & pte::VALID, 0);
+    *entry = (*entry & !(pte::WRITABLE | pte::NX | pte::USER))
+        | if executable { 0 } else { pte::WRITABLE | pte::NX };
+    crate::arch::memory_barrier();
+    crate::arch::tlb_flush_all();
+}
+
+/// Install a borrowed RAM page in an inactive boot guest's private low subtree.
+/// ARM code is data to x86: these leaves are always NX and supervisor-only.
+/// # Safety
+/// `root` is a private root from new_address_space, inactive and pre-SMP;
+/// `pa` is owned live RAM. The owner must remove borrowed leaves before
+/// destroy_user_address_space, which normally frees a process's leaf frames.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn boot_shadow_page(root: u64, va: u64, pa: u64, writable: bool) {
+    assert_ne!(root, kernel_address_space());
+    assert!(va >= crate::user::USER_BASE && va < 1 << 30 && va & 4095 == 0);
+    assert_eq!(pa & 4095, 0);
+    assert_ne!(root, table_of(crate::arch::current_page_table()));
+    let l0 = root as *mut u64;
+    let l1 = next_table(l0.add(((va >> L0_SHIFT) & 511) as usize));
+    let l2 = next_table(l1.add(((va >> L1_SHIFT) & 511) as usize));
+    let l3 = next_table(l2.add(((va >> L2_SHIFT) & 511) as usize));
+    *l3.add(((va >> L3_SHIFT) & 511) as usize) = pa | pte::VALID | pte::NX
+        | if writable { pte::WRITABLE } else { 0 };
+    crate::arch::memory_barrier();
+}
+
 /// What nk maps as Device memory, rounded outwards to 2MB blocks.
 ///
 /// From the machine rather than from a guess would be better, and the device

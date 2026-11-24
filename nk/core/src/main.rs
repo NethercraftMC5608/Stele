@@ -300,9 +300,6 @@ pub extern "C" fn rust_main(magic: u64, info: u64) -> ! {
     // Reserve 192MB for the kernel heap, matching the aarch64 heap bump.
     unsafe { heap::init(192) };
 
-    #[cfg(feature = "stela")]
-    stela_smoke();
-
     platform_x86::discover(&boot);
 
     // Before any process exists, because every address space nk creates
@@ -334,6 +331,10 @@ pub extern "C" fn rust_main(magic: u64, info: u64) -> ! {
         tss_x86::init(top);
         sched::set_boot_stack_top(top);
     }
+    // Native guest faults need the IDT/TSS, but code rights are changed only
+    // before APs and user address spaces exist, with interrupts still masked.
+    #[cfg(feature = "stela")]
+    stela_nk::smoke();
     unsafe { timer::init(0) };
     // `syscall` is an invalid opcode until EFER.SCE says otherwise, and the
     // MSRs that say where it lands (LSTAR), what it runs as (STAR) and which
@@ -1777,23 +1778,5 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     halt();
 }
 
-/// Stele's translator, running inside nk: translate a known arm64 block and
-/// report what came out. The first link between the two halves of the
-/// project (ROADMAP Phase 4) -- translation only; nothing executes yet.
-#[cfg(feature = "stela")]
-fn stela_smoke() {
-    use stela_compiler::block::{BlockProfile, Features};
-    use stela_compiler::{GuestAddress, Options, TargetCpu};
-    // add x0, x0, #1 ; ret
-    let guest: [u8; 8] = [0x00, 0x04, 0x00, 0x91, 0xc0, 0x03, 0x5f, 0xd6];
-    let options = Options::new(BlockProfile::new(Features::NONE), TargetCpu::Baseline);
-    match stela_compiler::compile(&guest, GuestAddress(0x1000), &options) {
-        Ok(block) => println!(
-            "  stela:  translated {} arm64 bytes at 0x1000 into {} x86-64 bytes (compiler {})",
-            block.source_bytes,
-            block.native.x86_64_code.len(),
-            &stela_compiler::SOURCE_SHA256[..12],
-        ),
-        Err(e) => println!("  stela:  translation failed: {:?}", e),
-    }
-}
+#[cfg(all(feature = "stela", target_arch = "x86_64"))]
+mod stela_nk;

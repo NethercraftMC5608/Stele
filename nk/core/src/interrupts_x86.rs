@@ -191,8 +191,14 @@ const EXCEPTION_NAMES: [&str; 32] = [
 /// # Safety
 /// Called only from `isr_common` with a valid frame on the current stack.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn x86_trap(frame: *mut TrapFrame) {
+pub unsafe extern "C" fn x86_trap(frame: *mut TrapFrame, fp: *const u8) {
     let f = &mut *frame;
+    #[cfg(feature = "stela")]
+    if crate::stela_nk::recover_native_fault(f, fp) {
+        return;
+    }
+    #[cfg(not(feature = "stela"))]
+    let _ = fp;
     match f.vector {
         // IRQ 0: the timer.
         32 | 0x40 => {

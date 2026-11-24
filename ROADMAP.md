@@ -50,6 +50,11 @@ Branch `nk-x86-userland` in the NETHOS repo.
       passes. Added x86 file-page trampoline, full register return and syscall
       FP/SIMD preservation. `nk/tests/run-dynamic-x86.py` passes on four-CPU
       q35 QEMU (2026-11-24; uncommitted).
+      The harness now provisions fresh host entropy, credits it through
+      Linux RNDADDENTROPY, and requires nonblocking getrandom success before
+      Python. This removes an unseeded-CRNG stall measured in Linux's entropy
+      generation path; a production nk entropy provider remains open
+      (`nk/init/seed-entropy-x86.c`, 2026-11-25; uncommitted).
 - [x] Threads on x86: eight pthread-backed Python threads simultaneously
       reach a barrier, retain distinct glibc errno/TLS and Python thread-local
       values across timed waits, increment a locked counter 160 times and join.
@@ -156,19 +161,57 @@ What Stela's runtime needs from the kernel underneath it.
 - [ ] Guest memory: large physically contiguous regions (several GiB), 2 MiB
       pages, mapped where the engine expects. Done when: the engine's memory
       service allocates guest RAM on nk.
+  - [x] Small MMU-on fixture: guest VA, guest PA and native RAM backing differ.
+        Four-level ARM tables feed an eager private x86 shadow aperture; code
+        and data mappings, CR3 restoration and borrowed-frame teardown pass.
+        After guest TLBI, a read-only write takes a native protection fault
+        projected to an ARM level-3 permission abort; removing a leaf takes a
+        level-3 translation abort and preserves the load destination.
+        `nk/tests/run-stela-x86.py` (2026-11-25; uncommitted). Fixed 2 MiB EL1
+        aperture, not multi-GiB memory, general demand filling or isolation.
+  - [x] Sparse guest physical owner reserves 4 GiB without allocating the
+        whole range. Zero reads, cross-page copies, checked bounds and model
+        DMA partial-transfer progress pass; the standalone owner probe uses
+        three backing pages. Translated MMU-on data near guest PA 6 GiB maps
+        to an nk frame below 4 GiB. Shadow leaves borrow this backing
+        (`nk/tests/run-stela-x86.py`, 2026-11-25; uncommitted). The virtual
+        aperture remains 2 MiB; contiguous bulk memory, 2 MiB leaves and the
+        production engine memory service remain open.
+  - [x] One-way handoff of committed nk frames to the engine's real CPL0
+        `RegisteredSystemRam`, preserving bytes and transferring ownership
+        without copying. Canonical scatter publication, descriptor CAS,
+        hole/bounds refusal, exclusive service, permanent domain failure and
+        exact frame reclamation pass (`nk/tests/run-stela-x86.py`,
+        2026-11-25; uncommitted). Measured PVH CR0 lacked NE; BSP/AP boot now
+        enables native x87 exceptions to satisfy existing target admission.
+        Separate pre-SMP probe only: canonical native execution and full-board
+        memory-controller admission remain open; sparse holes are not registered.
 - [ ] Dedicated cores: pin guest vCPU threads, keep LKL and nk's own work on
       other CPUs. Done when: a busy loop on a vCPU core is not preempted.
 - [ ] Executable memory for translated code (W^X handling, icache is coherent
       on x86), and fault handling the engine can hook (guest page faults, MMIO
       traps). Done when: a page fault in translated code reaches an engine
       callback.
+  - [x] Trusted boot-time probe owns 4 KiB code frames, copies while RW/NX,
+        seals RX/supervisor-only, and restores RW/NX before freeing. Runs
+        before APs/processes exist; this is not a concurrent code cache
+        (`nk/core/src/stela_nk.rs`, 2026-11-25).
+  - [x] Native fault -> engine callback in QEMU: the IDT captures owned native
+        data faults, GPRs and XMM8-15, returns through the saved invocation
+        stack, and lets the engine recover/complete device accesses outside
+        the handler. UART read/three writes take four real page faults; a
+        missing device becomes an ARM data abort with original ELR/FAR and an
+        unchanged load destination. IRQ/ordinary trap handling still passes
+        (`nk/tests/run-stela-x86.py`, 2026-11-25; uncommitted).
+        This is a private IF-masked pre-SMP fixture, not isolated guest RAM,
+        full shadow paging or a general native fault/spill-recovery platform.
 - [ ] High-resolution timers and a clean way to inject guest interrupts.
 - [ ] Decide the isolation model: translated guest code at ring 0 inside nk
       (like stela.efi), at ring 3, or in VMX non-root. Record it in AGENTS.md.
 
 ## Phase 4: Stela's translator inside nk
 
-- [ ] Build `stela-compiler`, `stela-engine`, `stela-contracts`,
+- [x] Build `stela-compiler`, `stela-engine`, `stela-contracts`,
       `stela-formats` for `x86_64-unknown-none` with `default-features = false`.
       `stela-boot` already does this for UEFI, so it should mostly work. Done
       when: they link into nk.
@@ -179,18 +222,59 @@ What Stela's runtime needs from the kernel underneath it.
         (`--cfg aes_force_soft` etc. in RUSTFLAGS) (2026-11-25).
   - [x] `stela-compiler` links into nk (`--features stela`) and translates an
         arm64 block at boot: 8 bytes -> 47 bytes of x86-64 (2026-11-25).
-  - [ ] Link the engine, runtime and SoC model too (crypto cfgs into
-        `nk/.cargo/config.toml`), then execute a translated block.
+  - [x] Execute trusted compiler blocks using the canonical block-entry thunk
+        and nk-owned RX frames. Register/return state, taken/fallthrough
+        branches, RAM load/store, NZCV and a NEON vector OR are checked before
+        LKL and four-CPU userland epoll boot (`nk/tests/run-stela-x86.py`,
+        2026-11-25; uncommitted).
+  - [x] Engine, contracts and formats link with no default features and soft
+        crypto cfgs in `nk/.cargo/config.toml`. A private nk Host supplies
+        bounded MMU-off RAM, owned RX code, idle W^X patching and pinned native
+        entry. A real `Machine` runs a loop, reads CurrentEL, writes/reads
+        TPIDR_EL1, stores 21 to RAM and reaches its breakpoint: 4 native entries,
+        2 patches. LKL/epoll and dynamic Python/eight-thread regression probes
+        run afterward (`nk/tests/run-stela-x86.py`, 2026-11-25; uncommitted).
+        The probe needs its own 1 MiB stack: measured 209,320 bytes touched,
+        overflowing the ordinary 64 KiB boot stack before this fix.
+  - [x] Link `stela-soc` and its UART model; engine-driven MMIO and guest abort
+        recovery pass in the bounded pre-SMP fixture (2026-11-25; uncommitted).
+  - [x] Bounded MMU-on shadow mappings and TLBI/permission/unmap checks pass
+        (`nk/core/src/stela_nk/host/shadow.rs`, 2026-11-25; uncommitted).
+  - [x] Bounded TTBR/ASID switching: nine guest turns, eight actual ARM MSR
+        TTBR0 writes, different non-global code/data at identical VAs, and
+        ASID reuse with explicit TLBI. Results stay separate (46 and 140);
+        guest register state and kernel CR3 match after every turn. One root
+        is eagerly rebuilt; retained per-ASID roots/scoped invalidation are
+        not verified (`nk/tests/run-stela-x86.py`, 2026-11-25; uncommitted).
+  - [x] MMU-on Device-nGnRnE UART: guest VA differs from UART PA; native faults
+        are walked and completed at the device PA, with exact output, one
+        read/three writes, vector recovery, and no native RAM mapping of MMIO
+        (`nk/tests/run-stela-x86.py`, 2026-11-25; uncommitted).
+  - [ ] Link the runtime/full board, then implement general shadow paging,
+        retained ASID roots/scoped invalidation, general fault/spill recovery,
+        guest timers and a persistent engine Host.
 - [ ] A host trait between `stela-runtime` and its host (memory, timers, I/O,
       logging), with nk as one implementation and stela.efi as the other.
 - [ ] Run translated arm64 blocks inside nk (the equivalent of `stela-dev
       run-blocks`). Done when: a known block sequence gives the same final
       state as on Stela.
+  - [x] Bounded boot execution checks against architectural expected values
+        pass; no hosted Stela differential comparison yet. Only trusted,
+        fixtures at ring 0 before SMP, including recovered device faults;
+        not a macOS guest.
 - [ ] Pointer authentication, AMX, NEON/SVE paths verified on nk the same way.
 
 ## Phase 5: the M2 machine and macOS 27's early boot
 
 - [ ] `stela-soc` + `stela-soc-data` (the T8112 device models) running on nk.
+  - [x] The existing S5L UART model runs through an engine `Devices` adapter:
+        translated ARM64 reads UTRSTAT and transmits exactly `NK\n` via three
+        UTXH writes, with vector state preserved across native faults.
+        Unsupported access widths refuse. Synthetic fixture address, polled
+        console only: no ADT/full-board mount or AIC connection yet
+        (`nk/tests/run-stela-x86.py`, 2026-11-25; uncommitted).
+        The UART also passes through a distinct virtual mapping with the ARM
+        MMU enabled; the full ADT-described board remains open.
 - [ ] `stela-loader`: load the boot bundle and kernelcache that `stela-cli`
       prepares for macOS 27 from a disk LKL reads.
 - [ ] Hand off to the macOS 27 kernel. Done when: XNU's first serial output

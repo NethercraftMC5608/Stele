@@ -3,6 +3,169 @@
 Run these from `nk/`. They boot nk + LKL in QEMU q35, not the NETHOS
 Linux desktop kernel. No physical hardware result is implied.
 
+## Translated ARM64 execution on nk
+
+```sh
+NK_SMP=1 NK_AP_LAYER=4 NK_LKL_LIB="$PWD/ldk/build/lkl-x86_64/libnklkl.a" \
+  cargo build --offline --release --features stela \
+  --target x86_64-unknown-none --target-dir target-stela-exec
+python3 tests/run-stela-x86.py \
+  --kernel target-stela-exec/x86_64-unknown-none/release/nk
+```
+
+The optional boot probe runs after IDT/TSS setup, before SMP, with IF masked.
+It compiles and executes trusted finite ARM64 blocks:
+42 from an increment, return PC/kind, a three-iteration branch sequence with
+both taken and fallthrough edges, a 64-bit RAM load/increment/store, SUBS NZCV,
+and NEON OR with preserved flags. The runner requires all `STELA_EXEC_*`
+markers, the system-mode engine checks below, and successful Linux epoll
+after LKL and four-CPU scheduler startup.
+Logs and the static epoll initrd remain in `target-stela-probe/`.
+
+Each native image owns a frame, initializes it RW/NX, seals it RX and
+supervisor-only, then restores RW/NX before freeing. Rights changes happen
+only before APs and user address spaces exist, avoiding remote stale TLBs.
+Execution uses the compiler's canonical block-entry thunk, which initializes
+the exit stack pointer; a direct function-pointer call instead triple-faulted
+in the first probe, with RSP=8 after an exit restored the uninitialized field.
+
+The engine probe links `stela-engine`, contracts and formats without std.
+`stela_nk/host.rs` implements a private bounded Host: one MMU-off guest RAM
+page, at most 64 single-page native images, owned native-range readback,
+idle W^X patching, and a system-mode pinned entry wrapped with host register
+preservation. The engine itself fetches, compiles, dispatches and patches a
+fixture that loops three times, reads CurrentEL, writes/reads TPIDR_EL1 and
+stores 21 in RAM. It must reach the configured breakpoint within 64 blocks,
+with matching architectural state and a positive native entry count.
+`STELA_ENGINE_PASS` records 4 native entries, 2 patches and 4 blocks in QEMU.
+
+The next fixture links the existing `stela-soc::uart::S5lUart` behind the
+engine's Devices interface at a synthetic, unmapped 64 GiB address. Translated
+code computes a vector, reads UTRSTAT, and writes `NK\n` through three UTXH
+stores. Four actual x86 page faults reach the owned invocation's recovery
+frame, then the engine completes the accesses against the real model.
+The byte stream must match exactly (no duplicate/replayed writes); status and
+vector state must match. An unsupported byte-width write refuses without
+output. A separate missing-device load must reach the ARM data-abort vector,
+retain its original ELR/FAR and destination register, and report EC 0x25.
+The runner requires `STELA_MMIO_UART_OK`, `STELA_GUEST_ABORT_OK` and
+`STELA_MMIO_PASS`, plus nk's ordinary int3 self-test and subsequent epoll.
+
+The trap hook captures only an armed invocation's owned native RIP ranges.
+It records GPRs and XMM8-15 from the ISR's FXSAVE image without allocating,
+calling the engine or entering LKL. Returning through the saved host stack
+restores callee-saved host registers; engine fault recovery runs afterward.
+Protection/instruction-fetch/reserved-bit faults and faults within the fully resident
+RAM fixture remain host failures. No spill lease/extended GPR bank is invented;
+recovery rows needing unavailable state must refuse. APs do not exist while
+the global boot-only invocation record is armed, and it is cleared on return.
+
+The first engine run passed its own checks but corrupted LKL statics, later
+faulting in `ip6_fl_purge`. Its measured 209,320-byte stack use exceeded the
+64 KiB boot stack. The engine now runs on an owned 1 MiB stack with a bottom
+canary and a reported usage watermark, then frees it before LKL starts.
+The expanded UART/abort/shadow/sparse-RAM suite touches 463,456 bytes in the
+current build.
+`run-dynamic-x86.py --threads` also passes after the engine probe when given
+the same stela-enabled kernel, using `--output target-stela-dynamic`.
+
+The separate `stela_nk/host/shadow.rs` fixture enables the ARM MMU with four
+levels of 4 KiB tables. Guest physical RAM reserves [2 GiB, 6 GiB), guest
+virtual RAM starts at 4 MiB, and native backing is allocated elsewhere.
+The data page lies just below guest PA 6 GiB while its nk backing is below
+4 GiB. Stela's existing
+ARM walker translates descriptors through the RAM owner. The host eagerly
+builds a fixed low 2 MiB shadow aperture outside native entry, using a private
+x86 root with supervisor-only, NX leaves, and switches CR3 only during native
+execution. Reads/writes must produce 42 in the owned backing, not nk's low
+identity RAM; kernel CR3 must be restored after every native call/fault.
+
+`stela_nk/ram.rs` owns sparse backing separately from the shadow root.
+Reservation allocates no payload frames. Uncommitted reads return zero;
+writes commit zeroed 4 KiB frames and split copies at backing boundaries.
+Raw host spans cannot cross a page. The standalone probe reserves 4 GiB,
+uses only three backing pages, checks cross-page round trips and untouched
+holes, and rejects overflowing/out-of-range transfers without partial writes.
+The existing model DMA `Port` also reads/writes across backing pages; its
+progress API reports the exact four-byte prefix before an out-of-range page.
+This is model memory access, not real-device DMA or DART integration.
+Required markers: `STELA_RAM_SPARSE_OK` and `STELA_RAM_DMA_OK`.
+Shadow refresh commits valid RAM leaves outside traps; native demand filling
+and a production concurrent memory service remain open.
+
+The separate canonical-owner probe consumes a sparse builder and calls the
+engine's real CPL0 `RegisteredSystemRam::register`, with IF masked. Each
+committed page retains its guest PA and actual host PA/CPU mapping. A kept
+owner reclaims all three frames only after the canonical backings are gone;
+registration preserves historical bytes and introduces no second RAM store.
+No raw/shadow alias escapes this fixture. All later reads, publications and
+descriptor updates go through the canonical authority. Cross-page publication
+and successful/mismatched descriptor CAS pass. Transfers entering an
+unregistered hole refuse before effects; refused reads preserve the output.
+An exclusive service prevents a second service acquisition, and failing that
+service permanently refuses future acquisition and physical transfers.
+Required: `STELA_RAM_CANONICAL_OK` and `STELA_RAM_AUTHORITY_OK`.
+
+The first real registration refused native-target admission. Measurement found
+PVH CR0=`0x80010013`, missing NE (native x87 exceptions). BSP/AP boot setup now
+sets NE; the existing engine control checks remain intact. This owner probe
+does not enter translated code through canonical native loans, join the old
+shadow host's direct writers, or mount the M2 memory controller. Only committed
+pages are registered; a 4 GiB sparse reservation is not 4 GiB of admitted RAM.
+
+The same kernel passed dynamic Python/eight-thread, signal-return and all four
+platform configurations after registration/reclamation. The x87 boot change
+also passed OVMF/GRUB Multiboot2 boot with four CPUs, canonical markers and
+epoll (`target-canonical-uefi/serial.log`, 2026-11-25). Docker's socket was
+inaccessible for this run: a copy of the cached `target-uefi/disk.img` had its
+kernel and initrd FAT chains replaced with the new ELF and epoll image, with
+payload readback verified before boot. This reused GRUB; it did not rebuild
+the EFI loader or exercise a physical PC.
+
+After changing the data descriptor to read-only, the guest executes
+`TLBI VMALLE1IS; DSB ISH; ISB` and writes. It must take a real x86 protection
+fault, then an ARM same-EL data abort with the store's ELR, data VA in FAR,
+and level-3 permission FSC 15; RAM must remain 42. Removing the descriptor
+and executing TLBI before a load must remove the shadow mapping, preserve
+the destination, and report level-3 translation FSC 7. Both cases use a
+fresh walk after restoring nk's CR3, outside the trap handler. Only faults
+within the owned shadow aperture may project x86 present/protection faults;
+the identity fixture's protections remain host failures.
+
+Required markers: `STELA_SHADOW_RAM_OK`, `STELA_SHADOW_PERMISSION_OK`,
+`STELA_SHADOW_UNMAP_OK`, `STELA_SHADOW_PASS`. Root teardown clears borrowed
+leaves without freeing RAM payloads, reclaims its own table frames, then
+lets the RAM owner free the backing. Subsequent Linux userland probes check
+that these roots and borrowed frames do not corrupt nk/LKL state.
+
+The context fixture gives two roots different non-global physical code and
+data pages at identical virtual addresses. One code body adds 1, the other
+10. Nine turns use actual guest `MSR TTBR0_EL1,x10`/ISB instructions to switch
+roots and ASIDs. Every turn checks both physical data pages, the result and
+TTBR register, the host-observed regime, and restored kernel CR3. The last
+two switches reuse an ASID with explicit `TLBI VMALLE1IS; DSB ISH; ISB`.
+Final values must be 46 and 140: stale native code, stale data mappings or
+cross-space writes fail. Required: `STELA_SHADOW_CONTEXT_OK` and
+`STELA_SHADOW_ASID_REUSE_OK`. This uses eager full rebuilds of one shadow
+root, not preserved per-ASID hardware mappings or scoped invalidation.
+
+The MMU-on UART fixture maps a virtual page at 4 MiB + 8 KiB to the model's
+64 GiB physical address with MAIR Device-nGnRnE attributes. Native accesses
+fault because the device gets no RAM leaf. The host walks the fault VA and
+passes the translated PA to the same S5L model. The guest must read ready
+status, transmit exactly `NK\n` in three writes, preserve its vector result,
+and restore kernel CR3. Only the code page is mapped as RAM. Required:
+`STELA_SHADOW_MMIO_OK`.
+
+These are architectural expected-value checks, not a hosted-Stela differential
+run. All Hosts are private trusted fixtures before SMP and share kernel
+identity mappings: this is not guest isolation. The identity host refuses MMU
+enabling; the shadow host covers only a fixed EL1 aperture. Stage 2 and guest
+timer arming remain refused. General demand filling, retained ASID roots and
+scoped invalidation, a persistent
+concurrent Host, general fault/spill recovery, guest isolation, the full M2
+board/runtime and macOS boot remain open. Verified in QEMU q35 on 2026-11-25.
+
 ## epoll
 
 Requirements: stable Rust with `x86_64-unknown-none`, an x86-64 LKL archive,
@@ -166,9 +329,22 @@ with `--threads --output target-dynamic-threads` to retain both logs.
 This covers clone, futex waits/wakes, TLS and ordinary thread exit/join;
 robust-list/rseq return ENOSYS and cancellation/owner-death recovery are untested.
 
-The minimal init script creates Linux's standard `/dev/urandom` character node
-(1:9) for Python's startup fallback after nonblocking getrandom. This is not
-an entropy-source test: nk's existing unseeded random policy is unchanged.
+The minimal init script creates Linux's `/dev/random` (1:8) and `/dev/urandom`
+(1:9) nodes. Every runner invocation supplies 32 fresh bytes from the host's
+CSPRNG (`os.urandom`), with mode 0600 in the generated test rootfs.
+The libc-free `init/seed-entropy-x86.c` helper reads those bytes, credits 256
+bits with Linux RNDADDENTROPY, and requires a complete 32-byte nonblocking
+getrandom result before printing `HOST_ENTROPY_SEEDED`. The init script then
+removes the seed file from the running guest. Failure prevents Python launch
+and makes the probe fail; passing requires the entropy-ready marker too.
+
+Without this provisioning, both concurrent and standalone Python runs stalled
+before their first print. QEMU register/stack inspection located the loop in
+`try_to_generate_entropy -> random_get_entropy_fallback -> clock_read ->
+nk_time_ns`, not in the shadow translation path. After seeding, Linux reports
+`crng init done`, Python/ctypes and all eight threads pass. This provisions the
+test image only; it does not implement a production nk entropy source or
+change the kernel's existing unseeded getrandom forwarding policy.
 
 After the ABI rebuild, x86 first faulted inside the loader reading a retained
 file mapping: its trap handler only populated anonymous pages. It now redirects

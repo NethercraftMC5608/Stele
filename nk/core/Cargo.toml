@@ -13,10 +13,14 @@ name = "nk"
 path = "src/main.rs"
 
 # Stele's arm64 -> x86-64 translator, linked into nk (ROADMAP Phase 4). Off by
-# default: `--features stela` builds nk with it and runs a translation smoke
-# test at boot.
+# default: `--features stela` builds nk with it and runs trusted translated
+# ARM64 execution checks at x86 boot, before SMP and LKL startup.
 [features]
-stela = ["dep:stela-compiler"]
+stela = ["dep:stela-compiler", "dep:stela-engine", "dep:stela-contracts", "dep:stela-crypto", "dep:stela-soc"]
 
 [dependencies]
 stela-compiler = { path = "../../crates/stela-compiler", default-features = false, optional = true }
+stela-engine = { path = "../../crates/stela-engine", default-features = false, optional = true }
+stela-contracts = { path = "../../crates/stela-contracts", default-features = false, optional = true }
+stela-crypto = { path = "../../crates/stela-crypto", features = ["force-software"], optional = true }
+stela-soc = { path = "../../crates/stela-soc", default-features = false, optional = true }
