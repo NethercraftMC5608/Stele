@@ -1,0 +1,4 @@
+# Per-variant cargo target directories (see README.md) and ldk's builds.
+/target*/
+/ldk/build/
+/ldk/src/

@@ -48,3 +48,27 @@ This is a bootstrap executable, not yet support for ordinary desktop binaries.
 Each launched LKL process now owns a Linux thread-group leader with a private
 file-descriptor table and filesystem context. The boot test runs two ELF
 processes under timer preemption and checks their identities and cleanup.
+
+## In Stele
+
+nk lives in Stele as `nk/`, imported with `git subtree` (history included)
+from the NETHOS repository's `kernel/` directory. It is the planned host for
+Stele's translator: see `../AGENTS.md` and `../ROADMAP.md`.
+
+- **Licence.** `core/`, `init/`, `ldk/` and `lkl/` glue are GPL-2.0-or-later,
+  like the rest of Stele. `linux/` (the shim and generated stubs) is
+  GPL-2.0-only, as the Linux code it serves is. Linux sources are fetched at
+  build time, never vendored.
+- **Toolchain.** `nk/rust-toolchain.toml` keeps nk on stable with its two
+  bare-metal targets; Stele's root pin does not apply here.
+- **Scripts.** `run-kernel.sh` and the other run/verify scripts the text below
+  mentions are still in NETHOS (`scripts/`). Until they move, build x86-64
+  directly:
+
+```bash
+NK_LKL_LIB=/path/to/ldk/build/lkl-x86_64/libnklkl.a \
+  cargo build --release --target x86_64-unknown-none --target-dir target-hx
+qemu-system-x86_64 -M q35 -m 4G -smp 4 \
+  -kernel target-hx/x86_64-unknown-none/release/nk \
+  -initrd <initrd.cpio> -display none -serial stdio -no-reboot
+```

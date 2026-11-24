@@ -1,0 +1,7 @@
+# nk builds on stable Rust with no build-std (see README.md). Stele's root
+# rust-toolchain.toml pins a version for the UEFI build and lists only its own
+# targets; this one keeps nk on the toolchain it was developed against.
+[toolchain]
+channel = "stable"
+profile = "minimal"
+targets = ["aarch64-unknown-none-softfloat", "x86_64-unknown-none"]
