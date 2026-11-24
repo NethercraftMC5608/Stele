@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! LKL's PCI host operations, served by nk on x86-64.
 //!
-//! arch/lkl/drivers/pci.c hosts exactly one PCI device, named on the kernel
-//! command line as `lkl_pci=<segment:bus:device.function>`. Linux sees it as
-//! bus 0, devfn 0 of a private root bus, and everything it does to the device
-//! comes through `nk_pci_ops`:
+//! arch/lkl/drivers/pci.c hosts the devices named on the kernel command line
+//! as `lkl_pci=<segment:bus:device.function>[,...]` (a list since
+//! ldk/patch-lkl.py's `multi_pci_devices`). Linux sees each at devfn 0 of its
+//! own root bus, and everything it does to one comes through `nk_pci_ops`
+//! with that device's handle:
 //!
 //! - **config space**: `read`/`write`, passed to nk's ECAM (or CF8/CFC)
 //!   accessor at native width. Linux's BAR sizing writes go to the device.
@@ -316,18 +317,27 @@ unsafe extern "C" fn msi_teardown(dev: *mut Dev, _ty: c_int) {
     d.nvec = 0;
 }
 
-/// The device to hand Linux, chosen during discovery: the first NVMe
-/// controller, since that is what the roadmap attaches first.
-static mut CHOSEN: Option<Bdf> = None;
+/// The devices to hand Linux, chosen during discovery: the first NVMe
+/// controller and the first Ethernet controller, in that order. LKL's PCI host
+/// (patched by ldk/patch-lkl.py) scans each on its own root bus.
+const MAX_CHOSEN: usize = 8;
+static mut CHOSEN: [Option<Bdf>; MAX_CHOSEN] = [None; MAX_CHOSEN];
 
 pub fn choose(devices: &[crate::pci::Device]) {
-    let pick = devices.iter().find(|d| d.class == 0x01 && d.subclass == 0x08);
-    unsafe { CHOSEN = pick.map(|d| d.bdf) };
+    let picks = [
+        devices.iter().find(|d| d.class == 0x01 && d.subclass == 0x08), // NVMe
+        devices.iter().find(|d| d.class == 0x02 && d.subclass == 0x00), // Ethernet
+    ];
+    let chosen = unsafe { &mut *(&raw mut CHOSEN) };
+    let mut n = 0;
+    for d in picks.into_iter().flatten() {
+        chosen[n] = Some(d.bdf);
+        n += 1;
+    }
 }
 
-/// `lkl_pci=SSSS:BB:DD.F` for the chosen device, or nothing.
+/// ` lkl_pci=SSSS:BB:DD.F[,...]` for the chosen devices, or nothing.
 pub fn cmdline_arg(buf: &mut [u8]) -> usize {
-    let Some(b) = (unsafe { CHOSEN }) else { return 0 };
     use core::fmt::Write;
     struct W<'a>(&'a mut [u8], usize);
     impl Write for W<'_> {
@@ -341,15 +351,13 @@ pub fn cmdline_arg(buf: &mut [u8]) -> usize {
             Ok(())
         }
     }
+    let chosen = unsafe { *(&raw const CHOSEN) };
     let mut w = W(buf, 0);
-    if write!(
-        w,
-        " lkl_pci={:04x}:{:02x}:{:02x}.{}",
-        b.segment, b.bus, b.device, b.function
-    )
-    .is_err()
-    {
-        return 0;
+    for (i, b) in chosen.iter().flatten().enumerate() {
+        let sep = if i == 0 { " lkl_pci=" } else { "," };
+        if write!(w, "{}{:04x}:{:02x}:{:02x}.{}", sep, b.segment, b.bus, b.device, b.function).is_err() {
+            return 0;
+        }
     }
     w.1
 }

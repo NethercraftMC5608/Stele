@@ -1262,6 +1262,119 @@ static int pid_maps_open(struct inode *inode, struct file *file)
          'static int nk_stack_maps_show')
 
 
+def multi_pci_devices():
+    """LKL's PCI host takes a list of devices, one root bus each.
+
+    arch/lkl/drivers/pci.c hosts exactly one device, named by lkl_pci=, and
+    says so ("The PCI driver supports only one PCI device"). nk needs at
+    least a disk and a network card at once. Every per-device path already
+    goes through bus->sysdata / dev->sysdata (config space, BAR override,
+    DMA, MSI), so the only change is here: parse a comma-separated list and
+    scan each device on its own root bus number, with its own host handle.
+    """
+    path = 'arch/lkl/drivers/pci.c'
+    edit(path,
+         'static char *pcidev_name;\n'
+         '\n'
+         'static int __init setup_pci_device(char *str)\n'
+         '{\n'
+         '\tif (pcidev_name) {\n'
+         '\t\tpr_info("The PCI driver supports only one PCI device.");\n'
+         '\t\tpr_info("\'%s\' will be discarded.", str);\n'
+         '\t\treturn -1;\n'
+         '\t}\n'
+         '\tpcidev_name = str;\n'
+         '\treturn 0;\n'
+         '}',
+         '/* nk: lkl_pci=a,b,c -- one root bus per device. */\n'
+         '#define LKL_PCI_MAX_DEVICES 8\n'
+         'static char *pcidev_names[LKL_PCI_MAX_DEVICES];\n'
+         'static int pcidev_count;\n'
+         'static struct pci_bus *pcidev_buses[LKL_PCI_MAX_DEVICES];\n'
+         '\n'
+         'static int __init setup_pci_device(char *str)\n'
+         '{\n'
+         '\twhile (str && *str) {\n'
+         '\t\tchar *comma = strchr(str, \',\');\n'
+         '\n'
+         '\t\tif (comma)\n'
+         '\t\t\t*comma = \'\\0\';\n'
+         '\t\tif (pcidev_count == LKL_PCI_MAX_DEVICES) {\n'
+         '\t\t\tpr_info("lkl_pci: more than %d devices; \'%s\' discarded\\n",\n'
+         '\t\t\t\tLKL_PCI_MAX_DEVICES, str);\n'
+         '\t\t\treturn -1;\n'
+         '\t\t}\n'
+         '\t\tpcidev_names[pcidev_count++] = str;\n'
+         '\t\tstr = comma ? comma + 1 : NULL;\n'
+         '\t}\n'
+         '\treturn 0;\n'
+         '}',
+         'LKL_PCI_MAX_DEVICES')
+    edit(path,
+         '\tif (!lkl_ops->pci_ops || !pcidev_name)\n'
+         '\t\treturn -1;\n'
+         '\n'
+         '\tdev = lkl_ops->pci_ops->add(pcidev_name, (void *)memory_start,\n'
+         '\t\t\t\t    memory_end - memory_start);\n'
+         '\tif (!dev)\n'
+         '\t\treturn -1;\n'
+         '\n'
+         '\tbus = pci_scan_bus(0, &lkl_pci_root_ops, (void *)dev);\n'
+         '\tif (!bus) {\n'
+         '\t\tlkl_ops->pci_ops->remove(dev);\n'
+         '\t\treturn -1;\n'
+         '\t}\n'
+         '\tpci_walk_bus(bus, lkl_pci_override_resource, NULL);\n'
+         '\tpci_bus_add_devices(bus);\n'
+         '\tdev_set_drvdata(&pdev->dev, bus);\n'
+         '\n'
+         '\treturn 0;',
+         '\tint i, found = 0;\n'
+         '\n'
+         '\tif (!lkl_ops->pci_ops || !pcidev_count)\n'
+         '\t\treturn -1;\n'
+         '\n'
+         '\t/* nk: each device on its own root bus; one the host refuses is\n'
+         '\t * skipped rather than costing the others. */\n'
+         '\tfor (i = 0; i < pcidev_count; i++) {\n'
+         '\t\tdev = lkl_ops->pci_ops->add(pcidev_names[i],\n'
+         '\t\t\t\t\t    (void *)memory_start,\n'
+         '\t\t\t\t\t    memory_end - memory_start);\n'
+         '\t\tif (!dev)\n'
+         '\t\t\tcontinue;\n'
+         '\n'
+         '\t\tbus = pci_scan_bus(i, &lkl_pci_root_ops, (void *)dev);\n'
+         '\t\tif (!bus) {\n'
+         '\t\t\tlkl_ops->pci_ops->remove(dev);\n'
+         '\t\t\tcontinue;\n'
+         '\t\t}\n'
+         '\t\tpci_walk_bus(bus, lkl_pci_override_resource, NULL);\n'
+         '\t\tpci_bus_add_devices(bus);\n'
+         '\t\tpcidev_buses[i] = bus;\n'
+         '\t\tfound++;\n'
+         '\t}\n'
+         '\tif (!found)\n'
+         '\t\treturn -1;\n'
+         '\tdev_set_drvdata(&pdev->dev, pcidev_buses);\n'
+         '\n'
+         '\treturn 0;',
+         'each device on its own root bus')
+    edit(path,
+         '\tstruct pci_bus *bus = (struct pci_bus *)dev_get_drvdata(&pdev->dev);\n'
+         '\n'
+         '\tif (bus)\n'
+         '\t\tpci_walk_bus(bus, lkl_pci_remove_devices, NULL);',
+         '\tint i;\n'
+         '\n'
+         '\t/* nk: every root bus probe created. */\n'
+         '\tfor (i = 0; i < pcidev_count; i++)\n'
+         '\t\tif (pcidev_buses[i])\n'
+         '\t\t\tpci_walk_bus(pcidev_buses[i], lkl_pci_remove_devices,\n'
+         '\t\t\t\t     NULL);',
+         'every root bus probe created')
+    say("arch/lkl: lkl_pci= takes a list, one root bus per device")
+
+
 if __name__ == '__main__':
     shim = sys.argv[1] if len(sys.argv) > 1 else '/shim'
     arm64_open_flags()
@@ -1281,3 +1394,4 @@ if __name__ == '__main__':
     exit_jb_gate()
     quiet_exit_probe()
     input_event_probe()
+    multi_pci_devices()

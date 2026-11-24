@@ -40,9 +40,9 @@ pub fn boot() -> bool {
     } else {
         b"mem=448M loglevel=8"
     };
-    // Room for the base and `lkl_pci=SSSS:BB:DD.F`, NUL-terminated. Static
+    // Room for the base and `lkl_pci=` with up to eight devices, NUL-terminated. Static
     // because Linux keeps pointers into its command line.
-    static mut CMDLINE: [u8; 96] = [0; 96];
+    static mut CMDLINE: [u8; 160] = [0; 160];
     let cmdline = unsafe { &mut *(&raw mut CMDLINE) };
     cmdline[..base.len()].copy_from_slice(base);
     #[allow(unused_mut)]
