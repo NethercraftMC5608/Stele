@@ -335,6 +335,18 @@ What Stela's runtime needs from the kernel underneath it.
         --require STELA_BOARD_PASS`, 2026-11-25). The tree is stela-soc-data's
         fixture, not a real ADT read from disk, and only these three devices
         are placed: no PMGR, DARTs, storage or memory controllers yet.
+  - [x] A real M2 ADT from disk: `stela-dev boot prepare --ipsw
+        UniversalMac_27.2.1_26B131_Restore.ipsw --model Mac14,2` (Apple's
+        IPSW for the MacBook Air M2, from mesu.apple.com) writes the bundle's
+        `devicetree.adt`; Linux on nk reads it from its filesystem through
+        LKL (openat/read) and the same three devices are mounted from it:
+        8 processors, AIC with 1152 inputs, UART at 0x235200000 input 739.
+        The guest's UART-interrupt echo passes against it, 3/3 runs
+        (`NK_STELA_ADT_TEST`, `run-dedicated-x86.py --add
+        <bundle>/devicetree.adt:stele/devicetree.adt --require
+        STELA_ADT_PASS`, 2026-11-25). The file comes in the initrd, not yet
+        from a disk partition; `stela-dev boot check` of the same bundle on
+        the host stops at the MCC/DCS/PTD mount (needs native memory).
 - [ ] `stela-loader`: load the boot bundle and kernelcache that `stela-cli`
       prepares for macOS 27 from a disk LKL reads.
 - [ ] Hand off to the macOS 27 kernel. Done when: XNU's first serial output

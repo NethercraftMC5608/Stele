@@ -631,6 +631,25 @@ CPU 2 and kicks CPU 3. `STELA_BOARD_PASS` needs the UART to take the three
 bytes, the AIC event to be the UART's input (0x102e3), and the console to
 receive the guest's uppercase echo `NK\n`.
 
+### A real M2 ADT read from disk
+
+```sh
+stela-dev boot prepare --ipsw UniversalMac_27.2.1_26B131_Restore.ipsw \
+  --model Mac14,2 --output bundle-Mac14,2-26B131
+NK_STELA_ADT_TEST=1 NK_SMP=1 NK_AP_LAYER=4 NK_LKL_LIB=$PWD/ldk/build/lkl-x86_64/libnklkl.a \
+  cargo build --release --features stela --target x86_64-unknown-none --target-dir target-stela-adt
+python3 tests/run-dedicated-x86.py --kernel target-stela-adt/x86_64-unknown-none/release/nk \
+  --initrd /path/to/initrd.cpio --add bundle-Mac14,2-26B131/devicetree.adt:stele/devicetree.adt \
+  --require STELA_ADT_PASS --output target-stela-adt-run
+```
+
+`--add` inserts the file into the initrd before its first trailer (nk's
+unpacker stops there). After the initrd is unpacked, nk reads
+`/stele/devicetree.adt` through Linux's VFS, parses it with
+`board::board`, mounts the UART, watchdog and AIC it describes, and runs the
+same UART-interrupt echo as the board probe. With macOS 27.2.1 (26B131) for
+Mac14,2 it reports 8 processors and an AIC with 1152 inputs.
+
 ### Linux timers at their deadlines
 
 ```sh

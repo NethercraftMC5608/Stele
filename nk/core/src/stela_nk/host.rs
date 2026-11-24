@@ -12,7 +12,7 @@ use stela_engine::machine::{
 mod board;
 mod irq;
 mod shadow;
-pub(crate) use board::board_probe;
+pub(crate) use board::{adt_probe, board_probe};
 pub(crate) use irq::{irq_probe, kicked};
 
 // The pinned system-mode ABI borrows callee-saved host registers. Keep them

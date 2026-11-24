@@ -72,8 +72,68 @@ extern "C" fn typist(_: usize) {
     super::irq::kick(GUEST_CPU);
 }
 
+/// The DeviceTree the next probe mounts.
+static mut TREE: Vec<u8> = Vec::new();
+
+/// Mount `stela-soc-data`'s M2-shaped fixture tree (NK_STELA_BOARD_TEST).
 pub(crate) fn board_probe() -> bool {
+    use stela_soc_data::board::fixture_support::tree;
+    probe_tree(tree(0x8112, "Apple M2", ["uart-1,samsung", "wdt,s5l8960x", "aic,2"]), "STELA_BOARD")
+}
+
+/// Mount a real ADT read from Linux's filesystem through LKL -- the
+/// `devicetree.adt` of a `stela boot prepare` bundle (NK_STELA_ADT_TEST).
+pub(crate) fn adt_probe(path: &str) -> bool {
+    match read_linux_file(path) {
+        Ok(bytes) => {
+            crate::println!("STELA_ADT: {} bytes from {} (through LKL)", bytes.len(), path);
+            probe_tree(bytes, "STELA_ADT")
+        }
+        Err(errno) => {
+            crate::println!("STELA_ADT: cannot read {}: errno {}", path, -errno);
+            crate::println!("STELA_ADT_FAIL");
+            false
+        }
+    }
+}
+
+/// A whole file from Linux's VFS, by asm-generic syscalls (openat 56,
+/// read 63, close 57).
+fn read_linux_file(path: &str) -> Result<Vec<u8>, i64> {
+    const AT_FDCWD: i64 = -100;
+    let mut name = Vec::from(path.as_bytes());
+    name.push(0);
+    let fd = crate::lkl::syscall(56, [AT_FDCWD, name.as_ptr() as i64, 0, 0, 0, 0]);
+    if fd < 0 {
+        return Err(fd);
+    }
+    let mut bytes = Vec::new();
+    let mut chunk = vec![0u8; 64 * 1024];
+    let result = loop {
+        let n = crate::lkl::syscall(63, [fd, chunk.as_mut_ptr() as i64, chunk.len() as i64, 0, 0, 0]);
+        if n < 0 {
+            break Err(n);
+        }
+        if n == 0 {
+            break Ok(());
+        }
+        bytes.extend_from_slice(&chunk[..n as usize]);
+    };
+    crate::lkl::syscall(57, [fd, 0, 0, 0, 0, 0]);
+    result.map(|()| bytes)
+}
+
+static LABEL: AtomicUsize = AtomicUsize::new(0);
+const LABELS: [&str; 2] = ["STELA_BOARD", "STELA_ADT"];
+
+fn label() -> &'static str {
+    LABELS[LABEL.load(Ordering::Acquire)]
+}
+
+fn probe_tree(tree: Vec<u8>, name: &'static str) -> bool {
     static PASSED: AtomicBool = AtomicBool::new(false);
+    LABEL.store(LABELS.iter().position(|l| *l == name).unwrap_or(0), Ordering::Release);
+    unsafe { *(&raw mut TREE) = tree };
     extern "C" fn on_core(_: usize) {
         const PAGES: usize = 256;
         let stack = crate::frames::alloc_contiguous(PAGES).expect("stela engine stack");
@@ -92,26 +152,29 @@ pub(crate) fn board_probe() -> bool {
     let helper = crate::sched::spawn("host-console", typist, 0);
     crate::sched::set_affinity(helper, 1 << HELPER_CPU);
     let Some(id) = crate::sched::dedicate_cpu(GUEST_CPU, "vcpu-board", on_core, 0) else {
-        crate::println!("STELA_BOARD: dedicate_cpu({}) refused (needs NK_SMP)", GUEST_CPU);
+        crate::println!("{}: dedicate_cpu({}) refused (needs NK_SMP)", label(), GUEST_CPU);
         return false;
     };
     crate::sched::join(id);
     crate::sched::join(helper);
     let passed = PASSED.load(Ordering::Acquire) && HALTS.load(Ordering::Acquire) >= 1;
-    crate::println!("{}", if passed { "STELA_BOARD_PASS" } else { "STELA_BOARD_FAIL" });
+    crate::println!("{}_{}", label(), if passed { "PASS" } else { "FAIL" });
     passed
 }
 
 fn board_guest() -> bool {
-    use stela_soc_data::board::fixture_support::tree;
-    let dt = tree(0x8112, "Apple M2", ["uart-1,samsung", "wdt,s5l8960x", "aic,2"]);
+    let dt = unsafe { core::mem::take(&mut *(&raw mut TREE)) };
     let board = match stela_soc_data::board::board(&dt) {
         Ok(board) => board,
         Err(error) => {
-            crate::println!("STELA_BOARD: DeviceTree refused: {:?}", error);
+            crate::println!("{}: DeviceTree refused: {:?}", label(), error);
             return false;
         }
     };
+    crate::println!(
+        "{}: board {:?}, {} processors in the DeviceTree",
+        label(), board.cpus.chip, board.cpus.processors.len()
+    );
     let (uart, wdt, aic) = (board.uart, board.watchdog, board.aic);
     let uart_irq = AicInput::new(0, uart.irq as u16);
     let output = Rc::new(RefCell::new(Vec::new()));
@@ -128,23 +191,23 @@ fn board_guest() -> bool {
         })
         .and_then(|()| devices.add_aic_for_processors(aic.physical, aic.inputs, aic.layout, 1));
     if let Err(error) = placed {
-        crate::println!("STELA_BOARD: placement refused: {:?}", error);
+        crate::println!("{}: placement refused: {:?}", label(), error);
         return false;
     }
     let stela_soc_data::aic::AicLayout::V2 { irq_config, max_irq, event, .. } = aic.layout else {
-        crate::println!("STELA_BOARD: the M2 DeviceTree gave an AICv1");
+        crate::println!("{}: the DeviceTree gave an AICv1", label());
         return false;
     };
     let mask_clear = stela_soc_data::aic::layout::Aic2DieLayout::contiguous(irq_config, max_irq)
         .expect("AIC2 die layout")
         .mask_clear;
     crate::println!(
-        "STELA_BOARD: AIC2 MAX_IRQ {:#x}, IRQ_CFG {:#x}, MASK_CLR {:#x}, event {:#x}",
-        max_irq, irq_config, mask_clear, event
+        "{}: AIC2 MAX_IRQ {:#x}, IRQ_CFG {:#x}, MASK_CLR {:#x}, event {:#x}",
+        label(), max_irq, irq_config, mask_clear, event
     );
     crate::println!(
-        "STELA_BOARD: chip {:#x} from DeviceTree: uart {:#x}+{:#x} irq {}, wdt {:#x} irq {}, aic {:#x} ({} inputs)",
-        0x8112, uart.physical, uart.bytes, uart.irq, wdt.physical, wdt.irq, aic.physical, aic.inputs
+        "{}: from the DeviceTree: uart {:#x}+{:#x} irq {}, wdt {:#x} irq {}, aic {:#x} ({} inputs)",
+        label(), uart.physical, uart.bytes, uart.irq, wdt.physical, wdt.irq, aic.physical, aic.inputs
     );
 
     let ram = Ram::new();
@@ -221,8 +284,8 @@ fn board_guest() -> bool {
     let echoed = output.borrow().clone();
     let shown: alloc::string::String = echoed.iter().map(|&b| if b == b'\n' { '|' } else { b as char }).collect();
     crate::println!(
-        "STELA_BOARD: stop {:?}; runs {}; bytes received {}; AIC event {:#x}; console got {:?}; halts {}; typed {}, taken by the UART {}; pc {:#x}",
-        stop, runs, st.x[5], st.x[9] as u32, shown, HALTS.load(Ordering::Acquire),
+        "{}: stop {:?}; runs {}; bytes received {}; AIC event {:#x}; console got {:?}; halts {}; typed {}, taken by the UART {}; pc {:#x}",
+        label(), stop, runs, st.x[5], st.x[9] as u32, shown, HALTS.load(Ordering::Acquire),
         TYPED.load(Ordering::Acquire), TAKEN.load(Ordering::Acquire), machine.cpu.pc.wrapping_sub(base)
     );
     matches!(stop, Stop::Breakpoint(pc) if pc == stop_pc)

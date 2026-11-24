@@ -22,6 +22,41 @@ import subprocess
 import time
 
 
+def newc(name, data, mode):
+    """One cpio newc entry."""
+    name_b = name.encode() + b"\0"
+    fields = [0, mode, 0, 0, 1, 0, len(data), 0, 0, 0, 0, len(name_b), 0]
+    head = b"070701" + b"".join(b"%08X" % f for f in fields)
+    pad = lambda n: b"\0" * (-n % 4)
+    return head + name_b + pad(len(head) + len(name_b)) + data + pad(len(data))
+
+
+def with_files(archive, files):
+    """`archive` (newc) with `files` [(guest path, bytes)] and their parent
+    directories inserted before its first trailer: nk's unpacker stops
+    there, so anything after it (a second concatenated archive) is unread."""
+    end = 0
+    while True:  # walk the entries: the name may appear inside file data
+        assert archive[end:end + 6] == b"070701", "not a newc archive"
+        size = int(archive[end + 54:end + 62], 16)
+        namesize = int(archive[end + 94:end + 102], 16)
+        name = archive[end + 110:end + 110 + namesize - 1]
+        if name == b"TRAILER!!!":
+            break
+        data = (end + 110 + namesize + 3) & ~3
+        end = (data + size + 3) & ~3
+    out, dirs = archive[:end], set()
+    for path, data in files:
+        parts = path.strip("/").split("/")
+        for i in range(1, len(parts)):
+            d = "/".join(parts[:i])
+            if d not in dirs:
+                dirs.add(d)
+                out += newc(d, b"", 0o040755)
+        out += newc("/".join(parts), data, 0o100644)
+    return out + archive[end:]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--kernel", type=Path, required=True)
@@ -29,6 +64,8 @@ def main():
     parser.add_argument("--output", type=Path, default=Path("target-dedicated-run"))
     parser.add_argument("--qemu", default="qemu-system-x86_64")
     parser.add_argument("--timeout", type=float, default=150)
+    parser.add_argument("--add", action="append", default=[], metavar="HOST:GUEST",
+                        help="add a host file to the initrd at a guest path")
     parser.add_argument("--require", action="append", default=[],
                         help="markers to require (default DEDICATED_PASS and HRTIMER_PASS)")
     args = parser.parse_args()
@@ -36,9 +73,15 @@ def main():
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=True)
     log = out / "serial.log"
+    initrd = args.initrd.resolve(strict=True)
+    if args.add:
+        files = [(guest, Path(host).read_bytes())
+                 for host, guest in (spec.split(":", 1) for spec in args.add)]
+        initrd = out / "initrd.cpio"
+        initrd.write_bytes(with_files(args.initrd.read_bytes(), files))
     proc = subprocess.Popen([args.qemu, "-M", "q35", "-m", "4G", "-smp", "4",
                              "-kernel", str(args.kernel.resolve(strict=True)),
-                             "-initrd", str(args.initrd.resolve(strict=True)),
+                             "-initrd", str(initrd),
                              "-display", "none", "-serial", f"file:{log}",
                              "-monitor", "none", "-no-reboot"], stdin=subprocess.DEVNULL)
     deadline = time.monotonic() + args.timeout

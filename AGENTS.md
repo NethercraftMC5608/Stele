@@ -249,6 +249,11 @@ require it to pass; both the rebuilt x86 archive and cached arm64 archive pass.
   that exclude CPU 0. `sched::dedicate_cpu` gives an AP to one task (guest
   vCPUs) and masks its tick. Never give a Linux-ABI task an affinity without
   CPU 0.
+- **Apple's files stay out of the repo.** The M2 IPSW and the bundle
+  `stela-dev boot prepare` makes from it live in `~/Stele-assets`
+  (`bundle-Mac14,2-26B131/devicetree.adt`); tests take them by path
+  (`run-dedicated-x86.py --add HOST:GUEST`). The user-facing `stela` CLI
+  only manages USB sticks; bundle commands are `stela-dev boot ...`.
 - **Take AIC offsets from the parsed layout, never a constant.** The M2's
   AICv2 has MAX_IRQ 0x1000 (mask-clear array at 0x6600), not the 0x400 of
   unit-test fixtures; a guest probe with hard-coded offsets unmasks the wrong

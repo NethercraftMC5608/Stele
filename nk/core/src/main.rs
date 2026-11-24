@@ -526,6 +526,12 @@ pub extern "C" fn rust_main(magic: u64, info: u64) -> ! {
                     Err(e) => println!("  initrd: {} -- ignored", e),
                 }
             }
+            // A real ADT (a `stela boot prepare` bundle's devicetree.adt)
+            // read from Linux's filesystem, and the board mounted from it.
+            #[cfg(feature = "stela")]
+            if option_env!("NK_STELA_ADT_TEST").is_some() {
+                stela_nk::adt_probe("/stele/devicetree.adt");
+            }
 
             // Ring 3.
             //
