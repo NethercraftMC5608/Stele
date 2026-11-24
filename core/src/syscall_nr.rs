@@ -231,7 +231,9 @@ pub mod x86_to_lkl {
             x86::RSEQ => 293,
             x86::PIDFD_OPEN => 434,
             x86::CLONE3 => 435,
-            _ => return None,
+            // Everything else that exists under the same name in both
+            // tables, generated from Linux's own; see syscall_x86_generic.rs.
+            _ => return crate::syscall_x86_generic::lookup(nr),
         })
     }
 }

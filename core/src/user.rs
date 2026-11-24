@@ -564,6 +564,17 @@ fn handle_syscall(frame: &mut Frame) {
         futex(frame)
     } else if matches!(frame.x[8], nr::CLONE | nr::WAIT4) {
         process(frame)
+    } else if cfg!(target_arch = "x86_64") && matches!(frame.x[8], 57 | 58) {
+        // x86-64's fork (57) and vfork (58) have no asm-generic number: they
+        // are clone(SIGCHLD, 0). vfork runs as a plain fork -- a copy, and the
+        // parent not held -- which every correct vfork caller tolerates,
+        // since its child may only exec or _exit. Sharing the address space
+        // with no stack of its own is the one thing nk's clone refuses.
+        let mut f = *frame;
+        f.x[8] = nr::CLONE;
+        f.x[0] = 17; // SIGCHLD
+        f.x[1] = 0;
+        process(&f)
     } else if (frame.x[8] == 221 && cfg!(target_arch = "aarch64") || frame.x[8] == 59 && cfg!(target_arch = "x86_64")) && cfg!(nk_lkl) {
         exec(frame.x[0], frame.x[1], frame.x[2])
     } else if matches!(
@@ -981,13 +992,72 @@ fn x86_legacy(nr: u64, a: &[u64; 6]) -> Option<i64> {
         crate::sched::set_user_syscall(was);
         rc
     }
+    /// asm-generic's `struct stat` -> x86-64's, in the caller's buffer.
+    ///
+    /// LKL fills the 128-byte asm-generic layout; an x86-64 program reads a
+    /// 144-byte one with nlink widened to 64 bits and moved ahead of mode,
+    /// uid/gid/rdev shifted, and blksize widened. The x86 buffer is the
+    /// larger, so Linux writes into it safely and the fields are rearranged
+    /// in place. Renumbering fstat alone returned mode in nlink's slot.
+    fn x86_stat(rc: i64, buf: u64) -> i64 {
+        if rc < 0 {
+            return rc;
+        }
+        let mut g = [0u8; 128];
+        if crate::uaccess::copy_from_user(&mut g, buf).is_err() {
+            return crate::uaccess::EFAULT;
+        }
+        let u64_at = |o: usize| u64::from_le_bytes(g[o..o + 8].try_into().unwrap());
+        let u32_at = |o: usize| u32::from_le_bytes(g[o..o + 4].try_into().unwrap());
+        let mut x = [0u8; 144];
+        let mut put = |o: usize, b: &[u8]| x[o..o + b.len()].copy_from_slice(b);
+        put(0, &u64_at(0).to_le_bytes()); // st_dev
+        put(8, &u64_at(8).to_le_bytes()); // st_ino
+        put(16, &(u32_at(20) as u64).to_le_bytes()); // st_nlink
+        put(24, &u32_at(16).to_le_bytes()); // st_mode
+        put(28, &u32_at(24).to_le_bytes()); // st_uid
+        put(32, &u32_at(28).to_le_bytes()); // st_gid
+        put(40, &u64_at(32).to_le_bytes()); // st_rdev
+        put(48, &u64_at(48).to_le_bytes()); // st_size
+        put(56, &(u32_at(56) as i32 as i64).to_le_bytes()); // st_blksize
+        put(64, &g[64..120]); // st_blocks and the three timespecs: same offsets
+        match crate::uaccess::copy_to_user(buf, &x) {
+            Ok(()) => 0,
+            Err(e) => e,
+        }
+    }
+
         Some(match nr {
         // openat(AT_FDCWD, path, flags, mode)
         x86::OPEN => at(56, [CWD, a[0], a[1], a[2], 0, 0]),
         // newfstatat(AT_FDCWD, path, statbuf, flags)
-        x86::STAT => at(79, [CWD, a[0], a[1], 0, 0, 0]),
+        x86::STAT => x86_stat(at(79, [CWD, a[0], a[1], 0, 0, 0]), a[1]),
         // ... with AT_SYMLINK_NOFOLLOW (0x100), which is what lstat is.
-        x86::LSTAT => at(79, [CWD, a[0], a[1], 0x100, 0, 0]),
+        x86::LSTAT => x86_stat(at(79, [CWD, a[0], a[1], 0x100, 0, 0]), a[1]),
+        // fstat and newfstatat exist in both tables but not with one layout.
+        x86::FSTAT => x86_stat(at(80, [a[0], a[1], 0, 0, 0, 0]), a[1]),
+        x86::NEWFSTATAT => x86_stat(at(79, [a[0], a[1], a[2], a[3], 0, 0]), a[2]),
+        // creat(path, mode) = openat(AT_FDCWD, path, O_CREAT|O_WRONLY|O_TRUNC, mode)
+        85 => at(56, [CWD, a[0], 0o1101, a[1], 0, 0]),
+        // link -> linkat, symlink -> symlinkat
+        86 => at(37, [CWD, a[0], CWD, a[1], 0, 0]),
+        88 => at(36, [a[0], CWD, a[1], 0, 0, 0]),
+        // chmod -> fchmodat; chown/lchown -> fchownat (lchown: NOFOLLOW)
+        90 => at(53, [CWD, a[0], a[1], 0, 0, 0]),
+        92 => at(54, [CWD, a[0], a[1], a[2], 0, 0]),
+        94 => at(54, [CWD, a[0], a[1], a[2], 0x100, 0]),
+        // mknod -> mknodat
+        133 => at(33, [CWD, a[0], a[1], a[2], 0, 0]),
+        // getpgrp() = getpgid(0)
+        111 => at(155, [0, 0, 0, 0, 0, 0]),
+        // pause() = ppoll(no fds, no timeout, no mask): sleeps until a signal
+        34 => at(73, [0, 0, 0, 0, 0, 0]),
+        // The pre-flags constructors: epoll_create's size must be positive
+        // and is otherwise ignored; the rest take a zero flags word.
+        213 => if (a[0] as i64) <= 0 { -22 } else { at(20, [0, 0, 0, 0, 0, 0]) },
+        284 => at(19, [a[0], 0, 0, 0, 0, 0]), // eventfd -> eventfd2
+        253 => at(26, [0, 0, 0, 0, 0, 0]),    // inotify_init -> inotify_init1
+        282 => at(74, [a[0], a[1], a[2], 0, 0, 0]), // signalfd -> signalfd4
         // faccessat(AT_FDCWD, path, mode)
         x86::ACCESS => at(48, [CWD, a[0], a[1], 0, 0, 0]),
         // unlinkat(AT_FDCWD, path, 0)
