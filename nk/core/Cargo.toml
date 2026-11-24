@@ -1,0 +1,13 @@
+[package]
+name = "nk-core"
+version = "0.1.0"
+edition = "2021"
+# The core is GPL-2.0-or-later, as Stele is. linux/ (the shim) is GPL-2.0-only,
+# as Linux is; see nk/README.md.
+license = "GPL-2.0-or-later"
+# Edition 2021 deliberately: 2024 requires #[unsafe(no_mangle)] on every symbol
+# the assembler calls, which is noise in a file that is nothing but such symbols.
+
+[[bin]]
+name = "nk"
+path = "src/main.rs"

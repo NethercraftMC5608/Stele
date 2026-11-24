@@ -1,0 +1,160 @@
+/* x86-64: a Multiboot2 kernel, loaded at 1GB (see below).
+ *
+ * 0x100000 is the conventional load address for a PC kernel and the lowest
+ * one that is safe: below it sit the real-mode IVT, the BIOS data area, the
+ * EBDA and the VGA hole, none of which are ours to overwrite. GRUB and
+ * QEMU's -kernel both place a Multiboot2 image where its program headers
+ * ask, so this is an agreement rather than a hope -- the same arrangement
+ * as the aarch64 script's 0x40080000.
+ *
+ * The section list is otherwise identical to the aarch64 one, because what
+ * it is gathering is Linux's own sections (initcalls, per-cpu, ex_table,
+ * ksymtab) and those are the same wherever it is compiled. The differences
+ * are the load address, the absence of an ARM vector table, and the
+ * discards.
+ */
+ENTRY(_start)
+
+SECTIONS
+{
+    /* 1GB, not 1MB. A process is linked for 0x400000 and owns the low
+     * gigabyte, so a kernel at 1MB sat in the middle of every user address
+     * space and the two could not both be mapped. 0x40000000 is where the
+     * aarch64 kernel already lives, for the same reason. It needs RAM at
+     * 1GB, which every machine nk targets has. */
+    . = 0x40000000;
+    .text : {
+        KEEP(*(.text.boot))     /* _start must be the first byte of the image */
+        *(.text .text.*)
+        /* Linux puts a driver's probe-time code in .init.text and frees it
+         * afterwards. nk does not free it, so it simply joins .text -- but it
+         * has to be gathered explicitly or it is silently dropped, taking
+         * every driver's init function with it. */
+        *(.init.text .init.text.*)
+        *(.exit.text .exit.text.*)
+    }
+
+    /* Every built-in driver's module_init.
+     *
+     * `module_init` on a built-in driver is not a constructor. It is an entry
+     * in .initcallN.init, where N is a level, and the levels exist to order
+     * registration: the virtio bus registers at 4, the drivers that attach to
+     * it at 6. Gathering them out of order gives a driver looking for a bus
+     * that does not exist yet, which presents as a device nobody probes.
+     *
+     * KEEP on every one, because nothing in the program references them and
+     * --gc-sections would take the lot. */
+    .initcall ALIGN(8) : {
+        __initcall_start = .;
+        KEEP(*(.initcallearly.init))
+        KEEP(*(.initcall0.init))  KEEP(*(.initcall0s.init))
+        KEEP(*(.initcall1.init))  KEEP(*(.initcall1s.init))
+        KEEP(*(.initcall2.init))  KEEP(*(.initcall2s.init))
+        KEEP(*(.initcall3.init))  KEEP(*(.initcall3s.init))
+        KEEP(*(.initcall4.init))  KEEP(*(.initcall4s.init))
+        KEEP(*(.initcall5.init))  KEEP(*(.initcall5s.init))
+        KEEP(*(.initcallrootfs.init))
+        KEEP(*(.initcall6.init))  KEEP(*(.initcall6s.init))
+        KEEP(*(.initcall7.init))  KEEP(*(.initcall7s.init))
+        __initcall_end = .;
+    }
+
+    /* No .vectors here: x86 has no linked vector table. The IDT is built
+     * at runtime in Rust and its base is loaded with lidt, so the stubs are
+     * ordinary .text and need no placement of their own. */
+
+    /* Linux's own sections, when lkl.o is linked in.
+     *
+     * Linux does not merely put code in .text and data in .data: it builds
+     * tables by section, and refers to their bounds by symbols the linker
+     * script must define -- __start_notes, __per_cpu_start, __ex_table. A
+     * script that discards one of those sections does not produce a missing
+     * symbol; it produces "relocation refers to a symbol in a discarded
+     * section", which names the section and not the reason.
+     *
+     * So they are gathered rather than dropped, with the boundary symbols
+     * Linux's own vmlinux.lds defines around each. */
+    .rodata ALIGN(8)  : {
+        *(.rodata .rodata.*)
+        *(.data.rel.ro .data.rel.ro.*)
+        *(__param) *(__bug_table) *(__modver)
+        . = ALIGN(8);
+        __start___ex_table = .; *(__ex_table) __stop___ex_table = .;
+        . = ALIGN(8);
+        __start___ksymtab = .; *(SORT(___ksymtab+*)) *(__ksymtab) __stop___ksymtab = .;
+        __start___ksymtab_gpl = .; *(SORT(___ksymtab_gpl+*)) *(__ksymtab_gpl) __stop___ksymtab_gpl = .;
+        __start___kcrctab = .; *(SORT(___kcrctab+*)) *(__kcrctab) __stop___kcrctab = .;
+        __start___kcrctab_gpl = .; *(SORT(___kcrctab_gpl+*)) *(__kcrctab_gpl) __stop___kcrctab_gpl = .;
+        . = ALIGN(8);
+        __start_pci_fixups_early = .; *(.pci_fixup) __end_pci_fixups_early = .;
+    }
+
+    /* Named `notes`, not `.notes`: Linux refers to its bounds as
+     * __start_notes/__stop_notes and the two have to agree. */
+    notes ALIGN(8) : { __start_notes = .; KEEP(*(.note.*)) KEEP(*(.notes)) __stop_notes = .; }
+
+    /* The PVH entry note, kept deliberately and separately.
+     *
+     * QEMU's -kernel loads either a Linux bzImage or an ELF carrying this
+     * note, and refuses anything else with "Error loading uncompressed
+     * kernel without PVH ELF Note". The discard list below takes .note*,
+     * which would take this with it -- so it is gathered here first. */
+    .note.Xen : { KEEP(*(.note.Xen)) }
+
+    /* Per-CPU variables. One CPU, so the "array" is one copy and the offset
+     * every access adds is zero -- but the bounds still have to exist,
+     * because Linux walks them at boot to set that offset up. */
+    .data..percpu ALIGN(4096) : {
+        __per_cpu_load = .;
+        __per_cpu_start = .;
+        *(.data..percpu..first)
+        *(.data..percpu..page_aligned)
+        *(.data..percpu..read_mostly)
+        *(.data..percpu)
+        *(.data..percpu..shared_aligned)
+        __per_cpu_end = .;
+    }
+
+    .data ALIGN(8) : {
+        *(.data .data.*)
+        *(.data.rel .data.rel.local)
+        *(.data..ro_after_init)
+        *(.init.data .init.data.*)
+    }
+
+    /* 4096, not 16: the page tables in paging.rs are 4KB-aligned statics and
+     * cr3 and every table entry silently ignore the low bits of an address
+     * that is not, so a misaligned table is not a fault -- it is a
+     * translation regime pointing somewhere arbitrary. lld places the symbols correctly regardless by
+     * padding inside the section, but it warns that the section's own
+     * alignment contradicts its contents, and it is right to. */
+    .bss ALIGN(4096) (NOLOAD) : {
+        __bss_start = .;
+        *(.bss .bss.*)
+        *(COMMON)
+        . = ALIGN(16);
+        __bss_end = .;
+    }
+
+    /* The boot stack lives in the image rather than being placed at some
+     * assumed top-of-RAM: the Multiboot2 memory map has not been read yet at
+     * the point esp is first set, so how much RAM exists is not yet known. */
+    . = ALIGN(16);
+    . += 0x10000;
+    __stack_top = .;
+
+    __image_end = .;
+
+    /DISCARD/ : {
+        *(.comment) *(.eh_frame*)
+        /* Linux's build-time metadata, none of which nk consumes.
+         * .altinstructions is the one worth naming: it is the table of
+         * CPU-erratum and feature patches Linux applies to its own text at
+         * boot. nk does not apply them, which is correct for QEMU and is a
+         * real limitation on hardware with errata -- noted here rather than
+         * silently discarded. */
+        *(.modinfo) *(.discard) *(.discard.*)
+        *(.altinstructions) *(.altinstr_replacement)
+        *(.debug_*) *(.rela.*)
+    }
+}
