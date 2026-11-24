@@ -89,14 +89,14 @@ ring 3, static busybox, `fork`/`vfork`/`execve`, signals with handlers and
 `stat` converted between layouts. The harness `/nk-init` script runs to the
 end. Next gaps, in order:
 
-1. `ls /dev` fails with `Invalid argument`; find the call (likely another
-   asm-generic vs x86 layout or flag difference).
-2. epoll on x86: `epoll_event` is packed (12 bytes) on x86-64, 16 in
-   asm-generic. `epoll_ctl`/`epoll_wait`/`epoll_pwait` need conversion.
-3. The same syscall-return-before-signal ordering fix on aarch64 (done on x86).
-4. ACPI (MADT, MCFG), PCI enumeration, MSI-X, then LKL's PCI host ops, so
+`ls`, `find`, pipelines and file I/O work too (open flags translated); epoll
+records are repacked but no test program has exercised epoll yet.
+
+1. Test epoll and dynamically linked programs (the harness is static busybox).
+2. The same syscall-return-before-signal ordering fix on aarch64 (done on x86).
+3. ACPI (MADT, MCFG), PCI enumeration, MSI-X, then LKL's PCI host ops, so
    real drivers (NVMe, igc/e1000e, r8169, snd_hda_intel) attach.
-5. Real hardware via GRUB (Multiboot2). Then VT-x, then the Stele translator on nk.
+4. Real hardware via GRUB (Multiboot2). Then VT-x, then the Stele translator on nk.
 
 Build and boot (from `kernel/`):
 
@@ -118,6 +118,9 @@ LKL needs Docker (`colima start`), then `python3 ldk/ldk.py lkl --arch x86_64`.
   `220` (aarch64) instead of `nr::CLONE` (56 on x86). Clone's last two args are
   swapped between ABIs. Asm-generic structs (`stat`, `epoll_event`) differ from
   x86's. When something works on aarch64 and fails on x86, look here first.
+- **LKL uses arm64's open flags** (`patch-lkl.py: arm64_open_flags`), so x86
+  `O_DIRECTORY`/`O_DIRECT`/`O_LARGEFILE`/`O_NOFOLLOW` are translated in
+  `x86_legacy` (`open_flags_in`/`_out`). Any new call taking open flags needs it.
 - **The kernel links at 1 GiB on x86** (`linker-x86_64.ld`), because static
   binaries load at 0x400000 and every process owns the low gigabyte. Each
   address space has private copies of the top three page-table levels, exactly
