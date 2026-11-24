@@ -532,6 +532,11 @@ pub extern "C" fn rust_main(magic: u64, info: u64) -> ! {
             if option_env!("NK_STELA_ADT_TEST").is_some() {
                 stela_nk::adt_probe("/stele/devicetree.adt");
             }
+            // The whole M2 board, as stela.efi mounts it, from the bundle.
+            #[cfg(feature = "stela")]
+            if option_env!("NK_STELA_MOUNT_TEST").is_some() {
+                stela_nk::mount_probe("/stele");
+            }
 
             // Ring 3.
             //

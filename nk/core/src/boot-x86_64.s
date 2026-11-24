@@ -160,6 +160,9 @@ _start_common:
     # route. PVH leaves this clear; canonical native-system RAM admission
     # requires the architectural exception path, just as SSE uses vector 19.
     or      $(1 << 5), %eax
+    # CD and NW clear: firmware normally leaves the BSP's caches on, but the
+    # reset value has them off, and nothing later would correct it.
+    and     $~((1 << 29) | (1 << 30)), %eax
     mov     %eax, %cr0
 
     # A 64-bit code segment, and a far jump to load it. Until this jump the
@@ -473,13 +476,18 @@ ap_prot:
 
     movb    $0x49, %al                // 'I': EFER.LME enabled
     outb    %al, %dx
-    // CR0: PG + WP + MP + NE, EM clear (same exception policy as the BSP).
+    // CR0: PG + WP + MP + NE, EM clear (same exception policy as the BSP),
+    // and CD + NW clear. INIT leaves an AP with CR0 = 0x60000010: caches
+    // disabled. Nothing else turns them on, so without this every AP ran
+    // uncached -- slow everywhere, and refused by the engine's native RAM
+    // admission, which forbids CD and NW.
     mov     %cr0, %eax
     or      $(1 << 31), %eax
     or      $(1 << 16), %eax
     or      $(1 << 1), %eax
     or      $(1 << 5), %eax
     and     $~(1 << 2), %eax
+    and     $~((1 << 29) | (1 << 30)), %eax   // NW, CD: caches on
     mov     %eax, %cr0
 
     movb    $0x4a, %al                // 'J': CR0.PG enabled, long mode live

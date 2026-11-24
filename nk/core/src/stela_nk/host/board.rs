@@ -99,7 +99,7 @@ pub(crate) fn adt_probe(path: &str) -> bool {
 
 /// A whole file from Linux's VFS, by asm-generic syscalls (openat 56,
 /// read 63, close 57).
-fn read_linux_file(path: &str) -> Result<Vec<u8>, i64> {
+pub(super) fn read_linux_file(path: &str) -> Result<Vec<u8>, i64> {
     const AT_FDCWD: i64 = -100;
     let mut name = Vec::from(path.as_bytes());
     name.push(0);

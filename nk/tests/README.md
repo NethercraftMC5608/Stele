@@ -593,8 +593,9 @@ The same build then tests `hrtimer`, the dedicated core's one-shot timer:
 100 timers each of 50 us, 200 us, 2 ms and 5 ms must all fire, the LAPIC
 count rate measured on that core must match the boot calibration (the
 nk-side proof that a count means the right time), and each interval's median
-lateness must stay under QEMU's own delivery step (~1.28 ms on macOS, whose
-QEMU main loop waits in whole milliseconds). `HRTIMER_PASS`. Run the scheduler torture test (`NK_SCHEDTEST=1`) after any
+lateness must stay under two of QEMU's own delivery steps (~1.3-1.5 ms on
+macOS, whose QEMU main loop waits in whole milliseconds; a run sometimes lands
+a whole interval one step later, kernel changes or not). `HRTIMER_PASS`. Run the scheduler torture test (`NK_SCHEDTEST=1`) after any
 scheduler change; it passed 3/3 with this one.
 
 ### Host device interrupts into a guest through the AIC
@@ -649,6 +650,28 @@ unpacker stops there). After the initrd is unpacked, nk reads
 `board::board`, mounts the UART, watchdog and AIC it describes, and runs the
 same UART-interrupt echo as the board probe. With macOS 27.2.1 (26B131) for
 Mac14,2 it reports 8 processors and an AIC with 1152 inputs.
+
+### The whole M2 board, mounted as stela.efi mounts it
+
+```sh
+stela-dev boot prepare --ipsw UniversalMac_27.2.1_26B131_Restore.ipsw --model Mac14,2 \
+  --ecid "$(cat ~/Stele-assets/nk-machine-ecid.txt)" --output bundle-Mac14,2-26B131-nk
+NK_STELA_MOUNT_TEST=1 NK_SMP=1 NK_AP_LAYER=4 NK_LKL_LIB=$PWD/ldk/build/lkl-x86_64/libnklkl.a \
+  cargo build --release --features stela --target x86_64-unknown-none --target-dir target-stela-mount
+B=bundle-Mac14,2-26B131-nk
+python3 tests/run-dedicated-x86.py --kernel target-stela-mount/x86_64-unknown-none/release/nk \
+  --initrd /path/to/initrd.cpio --add "$B/devicetree.adt:stele/devicetree.adt" \
+  --add "$B/USB-C_HPM,46-P01-AP.bin:stele/USB-C_HPM,46-P01-AP.bin" \
+  --require STELA_MOUNT_PASS --output target-stela-mount-run --timeout 300
+```
+
+nk reads the bundle's DeviceTree and HPM firmware through LKL, registers
+2 MiB of guest RAM at the M2's DRAM base, prepares the cold T8112 memory
+plan over it, and calls `stela_runtime::machine::mount::devices_with_memory`
+on dedicated CPU 3. `STELA_MOUNT_PASS` needs the mount to place every device:
+its `DEVICES` lines report PMGR power states, the native MCC, the AIC's 1152
+inputs, 7 DARTs and AES. The SSD is an empty sparse disk and the display a
+headless scanout; the bundle needs a machine ECID for the SEP.
 
 ### Linux timers at their deadlines
 

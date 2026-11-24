@@ -347,6 +347,19 @@ What Stela's runtime needs from the kernel underneath it.
         STELA_ADT_PASS`, 2026-11-25). The file comes in the initrd, not yet
         from a disk partition; `stela-dev boot check` of the same bundle on
         the host stops at the MCC/DCS/PTD mount (needs native memory).
+  - [x] The whole board mounted on nk (`core/src/stela_nk/host/mount.rs`):
+        `stela_runtime::machine::mount::devices_with_memory`, the call
+        `stela.efi` makes, with the cold T8112 memory plan over canonical
+        guest RAM nk registers at the M2's DRAM base. Placed: PMGR (142
+        power states), MCC/DCS/PTD over that RAM, ANS2, DCP, SEP, 7 DARTs,
+        AES, the AIC (1152 inputs), UART, watchdog and the rest of the
+        DeviceTree's devices. The bundle is prepared with a generated machine
+        ECID (`--ecid`, kept in `~/Stele-assets/nk-machine-ecid.txt`), which
+        the SEP needs. Stand-ins: an empty sparse 256 GiB disk behind the
+        ANS2, a headless 1080p scanout, volatile SEP state, no CTRR regions
+        yet (`NK_STELA_MOUNT_TEST`, 3/3 runs, 2026-11-25). Found on the way:
+        nk's APs ran with caches disabled (INIT's CR0.CD/NW never cleared)
+        and nk's frame allocator had no lock after SMP; both fixed.
 - [ ] `stela-loader`: load the boot bundle and kernelcache that `stela-cli`
       prepares for macOS 27 from a disk LKL reads.
 - [ ] Hand off to the macOS 27 kernel. Done when: XNU's first serial output

@@ -249,6 +249,16 @@ require it to pass; both the rebuilt x86 archive and cached arm64 archive pass.
   that exclude CPU 0. `sched::dedicate_cpu` gives an AP to one task (guest
   vCPUs) and masks its tick. Never give a Linux-ABI task an affinity without
   CPU 0.
+- **APs must clear CR0.CD/NW, and the frame allocator is locked.** INIT
+  leaves CR0 = 0x60000010 (caches off); the AP trampoline now clears CD and
+  NW, and the engine's native RAM admission refuses a CPU that has them set
+  (`RegistrationError::NativeTarget`). `frames::alloc`/`free` take a
+  spinlock with IF masked: CPU 0 and dedicated APs allocate concurrently.
+- **LKL calls come from CPU 0.** A dedicated core cannot make Linux
+  syscalls; read what it needs (bundle files) before dedicating it.
+- **The SEP needs a machine ECID in the tree.** Prepare bundles with
+  `stela-dev boot prepare --ecid $(cat ~/Stele-assets/nk-machine-ecid.txt)`;
+  an IPSW tree alone has none.
 - **Apple's files stay out of the repo.** The M2 IPSW and the bundle
   `stela-dev boot prepare` makes from it live in `~/Stele-assets`
   (`bundle-Mac14,2-26B131/devicetree.adt`); tests take them by path
