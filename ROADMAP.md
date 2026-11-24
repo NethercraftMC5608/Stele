@@ -215,7 +215,7 @@ What Stela's runtime needs from the kernel underneath it.
         (`nk/tests/run-stela-x86.py`, 2026-11-25; uncommitted).
         This is a private IF-masked pre-SMP fixture, not isolated guest RAM,
         full shadow paging or a general native fault/spill-recovery platform.
-- [ ] High-resolution timers and a clean way to inject guest interrupts.
+- [x] High-resolution timers and a clean way to inject guest interrupts (x86).
   - [x] One-shot high-resolution timer per dedicated core (`core/src/hrtimer.rs`):
         the core's LAPIC timer becomes its task's, TSC-deadline when CPUID has
         it, count mode otherwise; callback in interrupt context (vector 0xee).
@@ -235,8 +235,14 @@ What Stela's runtime needs from the kernel underneath it.
         (`NK_STELA_TIMER_TEST`, `run-dedicated-x86.py --require
         STELA_TIMER_PASS`, 2026-11-25). Before SMP (no claimed hrtimer) the
         host still spins on the counter. AIC device interrupts are not wired.
-  - [ ] LKL's own timers (`host_timer_set_oneshot`) still run on the 10 ms
-        tick on CPU 0.
+  - [x] LKL's own timers at their deadlines (x86): one-shot deadlines are
+        kept in TSC nanoseconds and CPU 0's LAPIC timer (free: the boot CPU
+        ticks from the PIT) is claimed as an hrtimer armed for the earliest;
+        the PIT tick still checks them as a backstop. Linux nanosleep of
+        100 us-3 ms went from ~7-10 ms late to a 0.9-1.8 ms median under QEMU
+        TCG, which is QEMU's own delivery grid (`NK_LKL_TIMER_TEST`,
+        `run-dedicated-x86.py --require LKL_TIMER_PASS`, 2026-11-25). aarch64
+        still uses the tick (CNTV_CVAL deadline not done).
 - [ ] Decide the isolation model: translated guest code at ring 0 inside nk
       (like stela.efi), at ring 3, or in VMX non-root. Record it in AGENTS.md.
 

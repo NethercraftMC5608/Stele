@@ -597,6 +597,21 @@ lateness must stay under QEMU's own delivery step (~1.28 ms on macOS, whose
 QEMU main loop waits in whole milliseconds). `HRTIMER_PASS`. Run the scheduler torture test (`NK_SCHEDTEST=1`) after any
 scheduler change; it passed 3/3 with this one.
 
+### Linux timers at their deadlines
+
+```sh
+NK_LKL_TIMER_TEST=1 NK_SMP=1 NK_AP_LAYER=4 NK_LKL_LIB=$PWD/ldk/build/lkl-x86_64/libnklkl.a \
+  cargo build --release --target x86_64-unknown-none --target-dir target-lkl-timer
+python3 tests/run-dedicated-x86.py --kernel target-lkl-timer/x86_64-unknown-none/release/nk \
+  --initrd /path/to/initrd.cpio --require LKL_TIMER_PASS --output target-lkl-timer-run
+```
+
+After Linux is up, nk calls Linux's nanosleep 30 times each for 100 us,
+500 us, 1 ms and 3 ms and measures how late each returns. `LKL_TIMER_PASS`
+needs every median under 3 ms. On the 10 ms tick alone the medians were
+7-10 ms; with CPU 0's LAPIC one-shot they are 0.9-1.8 ms under TCG, which is
+QEMU's own delivery grid on macOS. Boot logs `timers: CPU 0 LAPIC one-shot`.
+
 ### Guest timer interrupts on a dedicated core
 
 ```sh

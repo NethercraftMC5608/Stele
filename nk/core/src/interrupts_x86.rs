@@ -266,9 +266,18 @@ pub unsafe extern "C" fn x86_trap(frame: *mut TrapFrame, fp: *const u8) {
         }
         // High-resolution one-shot timer on a dedicated core (hrtimer.rs).
         // EOI first; the callback is bounded and does not switch.
+        // On CPU 0 it carries Linux's one-shots (hostops): the callback may
+        // have woken the timer thread, so act on need_resched as the tick
+        // does. Never on a dedicated core, whose guest may be mid-WFI.
         0xee => {
             crate::lapic::eoi();
             crate::hrtimer::fire();
+            if crate::arch::cpu_id() == 0
+                && crate::sched::preempt_enabled()
+                && crate::sched::take_need_resched()
+            {
+                crate::sched::schedule();
+            }
         }
         // Reschedule IPI from another CPU (LAPIC vector 0xf0). LAPIC EOI,
         // not PIC: this interrupt never went through the 8259. The sender

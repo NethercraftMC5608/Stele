@@ -11,6 +11,9 @@
 //! deadline is written to IA32_TSC_DEADLINE directly, in TSC cycles); without
 //! it, one-shot count mode is programmed from the calibrated bus rate.
 //!
+//! CPU 0's LAPIC timer is claimed the same way for Linux's one-shots
+//! (`hostops`): the boot CPU ticks from the PIT, so its LAPIC timer is free.
+//!
 //! One timer per core and one callback, run in interrupt context: it must be
 //! bounded and must not block or take the console lock -- record and return,
 //! as a guest timer does by marking its interrupt pending.
@@ -54,6 +57,11 @@ pub fn claim_this_cpu() {
     CALLBACK[c].store(0, Ordering::Release);
     unsafe { crate::lapic::oneshot_mode(VECTOR, tsc_deadline_supported()) };
     OWNED[c].store(true, Ordering::Release);
+}
+
+/// Whether this CPU's LAPIC timer is claimed for one-shots.
+pub fn claimed() -> bool {
+    OWNED[cpu()].load(Ordering::Acquire)
 }
 
 /// Give the LAPIC timer back to the periodic scheduler tick.

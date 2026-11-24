@@ -162,6 +162,8 @@ mod pci_msix_test;
 #[cfg(all(nk_lkl, target_arch = "x86_64"))]
 mod dedicated_test;
 #[cfg(all(nk_lkl, target_arch = "x86_64"))]
+mod lkl_timer_test;
+#[cfg(all(nk_lkl, target_arch = "x86_64"))]
 pub mod lkl_pci_x86;
 
 /// Where boot-x86_64.s hands over.
@@ -368,6 +370,12 @@ pub extern "C" fn rust_main(magic: u64, info: u64) -> ! {
         lapic::init();
         lapic::calibrate_timer();
     }
+    // The boot CPU ticks from the PIT, so its LAPIC timer is free: Linux's
+    // one-shot timers fire on it at their deadlines (hostops).
+    if hostops::claim_deadline_timer() {
+        println!("  timers: CPU 0 LAPIC one-shot for Linux timers ({})",
+            if hrtimer::tsc_deadline_supported() { "TSC-deadline" } else { "count mode" });
+    }
 
     ioapic::route_pit();
 
@@ -475,6 +483,10 @@ pub extern "C" fn rust_main(magic: u64, info: u64) -> ! {
             // A dedicated vCPU core while Linux owns CPU 0 (ROADMAP Phase 3).
             if option_env!("NK_DEDICATED_TEST").is_some() {
                 dedicated_test::run();
+            }
+            // Linux's own timers at their deadlines, not the 10 ms tick.
+            if option_env!("NK_LKL_TIMER_TEST").is_some() {
+                lkl_timer_test::run();
             }
             // A guest's generic timer interrupt through nk's hrtimer, on a
             // dedicated core (ROADMAP Phase 3).

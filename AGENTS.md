@@ -249,6 +249,11 @@ require it to pass; both the rebuilt x86 archive and cached arm64 archive pass.
   that exclude CPU 0. `sched::dedicate_cpu` gives an AP to one task (guest
   vCPUs) and masks its tick. Never give a Linux-ABI task an affinity without
   CPU 0.
+- **CPU 0's LAPIC timer carries Linux's one-shots** (`hostops`,
+  `claim_deadline_timer`); the tick is the PIT. On x86 one-shot deadlines are
+  TSC nanoseconds, not ticks. Only touch `TIMERS` on CPU 0 with IF masked,
+  and never arm or cancel the hrtimer from another CPU: elsewhere it may
+  belong to a dedicated core's guest.
 - **Guest WFI sleeps on the dedicated core's hrtimer.** `BootHost::arm_timer`
   arms `hrtimer::arm_at`; `wait_for_interrupt` opens interrupts only across
   `sti; hlt; cli`, because `fault::invoke` needs IF masked while guest code

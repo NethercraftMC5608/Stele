@@ -375,14 +375,18 @@ pub extern "C" fn nk_time_ns() -> u64 {
     }
 }
 
-/// A one-shot timer, checked on the periodic tick.
+/// A one-shot timer.
 ///
-/// Not a real one-shot: nk's timer runs at a fixed 100Hz and these are
-/// deadlines compared against it. So the resolution is 10ms and a timer set
-/// for less than that fires at the next tick. Linux will not like that under
-/// load, and the fix is a proper deadline timer -- programming CNTV_CVAL for
-/// the nearest deadline rather than a fixed interval -- which is a change to
-/// `timer.rs` and not to this interface.
+/// On aarch64 these are deadlines in ticks, checked on nk's fixed 100 Hz
+/// tick: a timer set for less than 10 ms fires at the next tick. The fix
+/// there is programming CNTV_CVAL for the nearest deadline.
+///
+/// On x86 the deadline is in nanoseconds of `timer::time_ns`, and CPU 0's
+/// LAPIC timer -- unused by the tick, which is the PIT -- is claimed as an
+/// `hrtimer` and armed for the earliest one, so Linux's timers fire at their
+/// deadline rather than up to a tick late. The PIT tick still checks them
+/// too, as a backstop. Everything that touches the table runs on CPU 0 (LKL
+/// is pinned there, and so is the PIT), with interrupts masked.
 struct OneShot {
     deadline: u64,
     armed: bool,
@@ -419,16 +423,74 @@ pub extern "C" fn nk_timer_set_oneshot(id: usize, delta_ns: u64) -> i32 {
         // or the far future. Neither fires; the clock simply stops, and a
         // Linux whose clock has stopped does not report anything, it just
         // stops making progress.
-        let ns_per_tick = 1_000_000_000 / crate::timer::HZ;
-        let ticks = (delta_ns / ns_per_tick).max(1);
+        let flags = irq_save();
+        let deadline = if cfg!(target_arch = "x86_64") {
+            crate::timer::time_ns().saturating_add(delta_ns)
+        } else {
+            let ns_per_tick = 1_000_000_000 / crate::timer::HZ;
+            crate::timer::ticks() + (delta_ns / ns_per_tick).max(1)
+        };
         if let Some(t) = (*(&raw mut TIMERS))[id].as_mut() {
-            t.deadline = crate::timer::ticks() + ticks;
+            t.deadline = deadline;
             t.armed = true;
             N_ARMED += 1;
             LAST_DEADLINE = t.deadline;
         }
+        #[cfg(target_arch = "x86_64")]
+        rearm_deadline_timer();
+        irq_restore(flags);
     }
     0
+}
+
+/// The clock one-shot deadlines are kept in: TSC nanoseconds on x86, ticks
+/// elsewhere.
+fn timer_now() -> u64 {
+    if cfg!(target_arch = "x86_64") { crate::timer::time_ns() } else { crate::timer::ticks() }
+}
+
+/// Claim CPU 0's LAPIC timer for Linux's one-shots. On the boot CPU, before
+/// Linux starts and before any AP; a no-op without a calibrated LAPIC.
+#[cfg(target_arch = "x86_64")]
+pub fn claim_deadline_timer() -> bool {
+    if crate::arch::cpu_id() != 0 || crate::lapic::bus_hz() == 0 || crate::timer::cycle_hz() == 0 {
+        return false;
+    }
+    crate::hrtimer::claim_this_cpu();
+    true
+}
+
+/// Arm CPU 0's hrtimer for the earliest one-shot not yet due; cancel it if
+/// there is none. CPU 0 only, interrupts masked: the hrtimer is per CPU, and
+/// on any other CPU it may belong to a dedicated core's guest.
+#[cfg(target_arch = "x86_64")]
+fn rearm_deadline_timer() {
+    if crate::arch::cpu_id() != 0 {
+        return;
+    }
+    let now = crate::timer::time_ns();
+    let next = unsafe { &*(&raw const TIMERS) }
+        .iter()
+        .flatten()
+        .filter(|t| t.armed && t.deadline > now)
+        .map(|t| t.deadline)
+        .min();
+    match next {
+        Some(deadline) => {
+            let hz = crate::timer::cycle_hz() as u128;
+            let ahead = ((deadline - now) as u128 * hz).div_ceil(1_000_000_000) as u64;
+            crate::hrtimer::arm_at(crate::arch::cycles() + ahead.max(1), deadline_fired);
+        }
+        None if crate::hrtimer::claimed() => crate::hrtimer::cancel(),
+        None => {}
+    }
+}
+
+/// CPU 0's hrtimer callback, in interrupt context: the same marking as the
+/// tick, which wakes the timer thread and re-arms for the next deadline.
+#[cfg(target_arch = "x86_64")]
+fn deadline_fired() {
+    tick_timers();
 }
 
 #[no_mangle]
@@ -462,7 +524,7 @@ pub static mut LAST_DEADLINE: u64 = 0;
 /// stack that is halfway through an exception. Nothing reports it. The
 /// machine simply stops making progress, which is exactly how this presented.
 pub fn tick_timers() {
-    let now = crate::timer::ticks();
+    let now = timer_now();
     unsafe {
         let timers = &*(&raw const TIMERS);
         let mut due = 0u32;
@@ -482,6 +544,8 @@ pub fn tick_timers() {
             }
         }
     }
+    #[cfg(target_arch = "x86_64")]
+    rearm_deadline_timer();
 }
 
 /// The thread that runs timer callbacks, in thread context where they may
