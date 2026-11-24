@@ -264,6 +264,12 @@ pub unsafe extern "C" fn x86_trap(frame: *mut TrapFrame, fp: *const u8) {
                 crate::sched::schedule();
             }
         }
+        // High-resolution one-shot timer on a dedicated core (hrtimer.rs).
+        // EOI first; the callback is bounded and does not switch.
+        0xee => {
+            crate::lapic::eoi();
+            crate::hrtimer::fire();
+        }
         // Reschedule IPI from another CPU (LAPIC vector 0xf0). LAPIC EOI,
         // not PIC: this interrupt never went through the 8259. The sender
         // already set this CPU's need_resched; act on it at the same safe

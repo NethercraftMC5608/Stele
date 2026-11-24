@@ -1199,15 +1199,13 @@ extern "C" fn dedicated_trampoline(arg: usize) {
     while cpu_index(crate::arch::cpu_id()) != d.cpu {
         yield_now();
     }
+    // No periodic tick here: the LAPIC timer becomes this task's one-shot
+    // high-resolution timer (hrtimer.rs), unarmed until it asks.
     #[cfg(target_arch = "x86_64")]
-    unsafe {
-        crate::lapic::mask_timer();
-    }
+    crate::hrtimer::claim_this_cpu();
     (d.entry)(d.arg);
     #[cfg(target_arch = "x86_64")]
-    unsafe {
-        crate::lapic::unmask_timer();
-    }
+    crate::hrtimer::release_this_cpu();
     RESERVED.fetch_and(!(1u8 << d.cpu.min(7)), Ordering::AcqRel);
 }
 

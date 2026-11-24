@@ -272,6 +272,26 @@ pub unsafe fn unmask_timer() {
     write(LVT_TIMER, read(LVT_TIMER) & !(1 << 16));
 }
 
+/// One-shot timer mode at `vector`, unarmed: TSC-deadline (LVT bits 18:17 =
+/// 10b, armed through IA32_TSC_DEADLINE) or count mode (armed by writing the
+/// initial count). Stops any periodic tick. See hrtimer.rs.
+pub unsafe fn oneshot_mode(vector: u8, tsc_deadline: bool) {
+    write(TIMER_INIT, 0);
+    write(TIMER_DIV, 0x3);
+    let mode = if tsc_deadline { 0b10 << 17 } else { 0 };
+    write(LVT_TIMER, mode | vector as u32);
+}
+
+/// The count-mode timer's current count.
+pub unsafe fn current_count() -> u32 {
+    read(TIMER_COUNT)
+}
+
+/// Arm count-mode one-shot (0 disarms).
+pub unsafe fn set_initial_count(count: u32) {
+    write(TIMER_INIT, count);
+}
+
 /// Start periodic LAPIC timer ticks on this CPU at `vector`.
 pub unsafe fn start_timer(vector: u8) {
     let bus = bus_hz();

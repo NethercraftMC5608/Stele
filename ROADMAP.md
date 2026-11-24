@@ -216,6 +216,19 @@ What Stela's runtime needs from the kernel underneath it.
         This is a private IF-masked pre-SMP fixture, not isolated guest RAM,
         full shadow paging or a general native fault/spill-recovery platform.
 - [ ] High-resolution timers and a clean way to inject guest interrupts.
+  - [x] One-shot high-resolution timer per dedicated core (`core/src/hrtimer.rs`):
+        the core's LAPIC timer becomes its task's, TSC-deadline when CPUID has
+        it, count mode otherwise; callback in interrupt context (vector 0xee).
+        QEMU: 400 one-shots of 50 us-5 ms all fire; the LAPIC rate measured on
+        the core matches calibration (1.0038 vs 1.0002 GHz); lateness stays
+        under QEMU-on-macOS's own ~1.28 ms delivery step, against the 10 ms
+        tick this replaces (`nk/tests/run-dedicated-x86.py`, 2026-11-25).
+        True microsecond precision needs real hardware or a host without a
+        millisecond-granular event loop; QEMU's TCG exposes no TSC-deadline.
+  - [ ] Guest interrupt injection: wire a guest timer (ARM generic timer /
+        AIC) to `hrtimer::arm_at` and mark its interrupt pending for the engine.
+  - [ ] LKL's own timers (`host_timer_set_oneshot`) still run on the 10 ms
+        tick on CPU 0.
 - [ ] Decide the isolation model: translated guest code at ring 0 inside nk
       (like stela.efi), at ring 3, or in VMX non-root. Record it in AGENTS.md.
 

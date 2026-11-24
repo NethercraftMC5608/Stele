@@ -56,6 +56,105 @@ extern "C" fn spinner(watch_cpu3: usize) {
     }
 }
 
+// --- high-resolution timers on the dedicated core ---------------------------
+
+const PER_INTERVAL: usize = 100;
+const INTERVALS_NS: [u64; 4] = [50_000, 200_000, 2_000_000, 5_000_000];
+static FIRED_AT: AtomicU64 = AtomicU64::new(0);
+static LATE_NS: [[AtomicU64; PER_INTERVAL]; 4] =
+    [const { [const { AtomicU64::new(u64::MAX) }; PER_INTERVAL] }; 4];
+
+fn on_timer() {
+    FIRED_AT.store(crate::arch::cycles(), Ordering::Release);
+}
+
+/// On the dedicated core: for each interval, arm PER_INTERVAL one-shots that
+/// far ahead, one at a time, recording how late each fired (u64::MAX: never).
+static RATE_CHECK: AtomicU64 = AtomicU64::new(0);
+
+extern "C" fn timer_probe(_: usize) {
+    let hz = crate::timer::cycle_hz();
+    // The LAPIC count rate on this core, over 10 ms of TSC: the nk-side check
+    // that a programmed count means the time it should.
+    if !crate::hrtimer::tsc_deadline_supported() {
+        unsafe { crate::lapic::set_initial_count(u32::MAX) };
+        let t0 = crate::arch::cycles();
+        let c0 = unsafe { crate::lapic::current_count() };
+        while crate::arch::cycles() - t0 < hz / 100 {
+            core::hint::spin_loop();
+        }
+        let c1 = unsafe { crate::lapic::current_count() };
+        unsafe { crate::lapic::set_initial_count(0) };
+        RATE_CHECK.store(((c0 - c1) as u64) * 100 * 16, Ordering::Relaxed);
+    }
+    for (k, &interval) in INTERVALS_NS.iter().enumerate() {
+        let ahead = interval * hz / 1_000_000_000;
+        for i in 0..PER_INTERVAL {
+            FIRED_AT.store(0, Ordering::Release);
+            let deadline = crate::arch::cycles() + ahead;
+            if !crate::hrtimer::arm_at(deadline, on_timer) {
+                return;
+            }
+            let give_up = deadline + hz / 20; // 50 ms
+            loop {
+                let at = FIRED_AT.load(Ordering::Acquire);
+                if at != 0 {
+                    LATE_NS[k][i].store(crate::timer::cycles_to_ns(at.saturating_sub(deadline)), Ordering::Relaxed);
+                    break;
+                }
+                if crate::arch::cycles() > give_up {
+                    crate::hrtimer::cancel();
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+        }
+    }
+}
+
+/// nk's side is checked directly: the LAPIC count rate on the dedicated core
+/// must match the boot calibration, so a programmed count is the right time.
+/// Several intervals then show how the host delivers the interrupts. Under TCG on macOS, QEMU's main loop waits in whole
+/// milliseconds, so interrupts land on a grid of about a millisecond: a timer
+/// fires at the first grid point after its deadline, late by less than one
+/// grid step whatever its length. An error in nk's conversion would instead
+/// stretch the fire time in proportion to the interval (a 5 ms timer firing
+/// at 6+ ms). The grid is measured as the fire time of the shortest interval.
+/// PASS: every timer fired, the grid is far below the 10 ms tick this
+/// replaces, and every interval's median lateness is under one grid step.
+fn timer_phase() -> bool {
+    let Some(id) = crate::sched::dedicate_cpu(3, "vcpu-timer", timer_probe, 0) else {
+        crate::println!("  hrtimer: dedicate_cpu(3) refused");
+        return false;
+    };
+    crate::sched::join(id);
+    let mode = if crate::hrtimer::tsc_deadline_supported() { "TSC-deadline" } else { "LAPIC count mode" };
+    let mut ok = true;
+    let mut medians = [0u64; 4];
+    for (k, &interval) in INTERVALS_NS.iter().enumerate() {
+        let mut late: alloc::vec::Vec<u64> = LATE_NS[k].iter().map(|a| a.load(Ordering::Relaxed)).collect();
+        let fired = late.iter().filter(|&&n| n != u64::MAX).count();
+        late.retain(|&n| n != u64::MAX);
+        late.sort_unstable();
+        let pick = |q: usize| late.get((late.len() * q / 100).min(late.len().saturating_sub(1))).copied().unwrap_or(u64::MAX);
+        medians[k] = pick(50);
+        crate::println!(
+            "  hrtimer: {:>4} us x{}: {}/{} fired on cpu 3 ({}); late median {} us, p99 {} us, max {} us",
+            interval / 1000, PER_INTERVAL, fired, PER_INTERVAL, mode,
+            pick(50) / 1000, pick(99) / 1000, late.last().copied().unwrap_or(u64::MAX) / 1000
+        );
+        ok &= fired == PER_INTERVAL;
+    }
+    let rate = RATE_CHECK.load(Ordering::Relaxed);
+    let bus = crate::lapic::bus_hz();
+    let rate_ok = rate == 0 || rate.abs_diff(bus) * 50 < bus; // within 2%, or TSC-deadline
+    crate::println!("  hrtimer: LAPIC count rate on cpu 3 {} Hz vs calibrated {} Hz ({})",
+        rate, bus, if rate_ok { "matches" } else { "MISMATCH" });
+    let grid = INTERVALS_NS[0] + medians[0];
+    crate::println!("  hrtimer: host delivery grid ~{} us (fire time of the {} us timers)", grid / 1000, INTERVALS_NS[0] / 1000);
+    ok && rate_ok && grid < 2_000_000 && medians.iter().all(|&m| m < grid + 100_000)
+}
+
 pub fn run() {
     if crate::sched::cpu_count() < 4 {
         crate::println!("DEDICATED_SKIP: needs 4 CPUs (build with NK_SMP=1)");
@@ -93,6 +192,8 @@ pub fn run() {
         ded_cpu, ded, RUN_NS / 1_000_000, LOOPS[1].load(Ordering::Relaxed),
         ctl, LOOPS[0].load(Ordering::Relaxed), on3, reserved_after
     );
-    let pass = ded == 0 && ded_cpu == 3 && ctl > 2 && !on3 && reserved_after & (1 << 3) == 0;
-    crate::println!("{}", if pass { "DEDICATED_PASS" } else { "DEDICATED_FAIL" });
+    let cores = ded == 0 && ded_cpu == 3 && ctl > 2 && !on3 && reserved_after & (1 << 3) == 0;
+    let timers = timer_phase();
+    crate::println!("{}", if cores { "DEDICATED_PASS" } else { "DEDICATED_FAIL" });
+    crate::println!("{}", if timers { "HRTIMER_PASS" } else { "HRTIMER_FAIL" });
 }

@@ -140,6 +140,8 @@ pub mod acpi;
 #[cfg(target_arch = "x86_64")]
 pub mod fbcon;
 #[cfg(target_arch = "x86_64")]
+pub mod hrtimer;
+#[cfg(target_arch = "x86_64")]
 pub mod font8x16;
 #[cfg(target_arch = "x86_64")]
 pub mod pci;

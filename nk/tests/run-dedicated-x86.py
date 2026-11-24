@@ -6,7 +6,10 @@ core/src/dedicated_test.rs). The in-kernel probe runs after Linux is up and
 prints DEDICATED_PASS when the dedicated probe on CPU 3 was switched in 0
 times during its 1.5 s window, the control probe on contested CPU 2 was
 preempted, no other task ran on CPU 3, and the reservation was released.
-The boot must then still reach the init script.
+It then runs one-shot high-resolution timers on the dedicated core
+(HRTIMER_PASS: all fire, the core's LAPIC rate matches calibration, and
+lateness stays under the host's delivery step). The boot must then still
+reach the init script.
 """
 import argparse
 from pathlib import Path
@@ -36,17 +39,18 @@ def main():
         while time.monotonic() < deadline:
             time.sleep(1)
             text = log.read_text(errors="replace") if log.exists() else ""
-            if "DEDICATED_FAIL" in text or "DEDICATED_SKIP" in text or "X86_ROOT" in text \
+            if "_FAIL" in text or "DEDICATED_SKIP" in text or "X86_ROOT" in text \
                     or "exception" in text or proc.poll() is not None:
                 break
     finally:
         proc.kill()
         proc.wait()
     for line in text.splitlines():
-        if "dedicated:" in line:
+        if "dedicated:" in line or "hrtimer:" in line:
             print(line.strip())
-    ok = "DEDICATED_PASS" in text and "X86_ROOT" in text and "exception" not in text
-    print("DEDICATED_PASS" if ok else f"FAIL (serial log: {log})")
+    ok = ("DEDICATED_PASS" in text and "HRTIMER_PASS" in text
+          and "X86_ROOT" in text and "exception" not in text)
+    print("DEDICATED_PASS HRTIMER_PASS" if ok else f"FAIL (serial log: {log})")
     return 0 if ok else 1
 
 

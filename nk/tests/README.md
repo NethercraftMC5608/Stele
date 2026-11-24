@@ -587,5 +587,12 @@ is contested by pinned spinners and a control probe. PASS: the dedicated
 probe is switched in 0 times during its window, the control is preempted,
 a task allowed on {2,3} never runs on 3, and the reservation is released.
 Scheduler events, not timestamps, are the evidence: under TCG QEMU slices
-vCPUs itself. Run the scheduler torture test (`NK_SCHEDTEST=1`) after any
+vCPUs itself.
+
+The same build then tests `hrtimer`, the dedicated core's one-shot timer:
+100 timers each of 50 us, 200 us, 2 ms and 5 ms must all fire, the LAPIC
+count rate measured on that core must match the boot calibration (the
+nk-side proof that a count means the right time), and each interval's median
+lateness must stay under QEMU's own delivery step (~1.28 ms on macOS, whose
+QEMU main loop waits in whole milliseconds). `HRTIMER_PASS`. Run the scheduler torture test (`NK_SCHEDTEST=1`) after any
 scheduler change; it passed 3/3 with this one.
