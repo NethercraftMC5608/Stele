@@ -27,9 +27,19 @@ multiboot_header:
     .long   0                               # architecture: i386 (32-bit protected mode)
     .long   multiboot_header_end - multiboot_header
     .long   -(0xe85250d6 + 0 + (multiboot_header_end - multiboot_header))
-    # The end tag, and nothing else. Every optional tag is a request for the
-    # loader to do more work before handing over, and this kernel wants to
-    # be handed the machine as it is.
+    # One optional request: a framebuffer (type 5, flag 1 = optional),
+    # with no preferred size and 32 bits per pixel. Under UEFI there is no
+    # VGA text mode, so a PC with no serial port shows nk nothing without
+    # it; GRUB answers with the GOP framebuffer in info tag 8 (fbcon.rs).
+    # Optional, so a loader without graphics still boots nk.
+    .align 8
+    .short  5                               # type: framebuffer
+    .short  1                               # flags: optional
+    .long   20                              # size
+    .long   0                               # width: no preference
+    .long   0                               # height: no preference
+    .long   32                              # depth
+    .align 8
     .short  0                               # type: end
     .short  0                               # flags
     .long   8                               # size

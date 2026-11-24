@@ -34,6 +34,9 @@ pub struct BootInfo {
     /// Physical RSDP address (PVH), or the loader-owned RSDP copy (MB2).
     pub rsdp: Option<u64>,
     pub info_range: Option<(u64, u64)>,
+    /// GRUB's framebuffer (Multiboot2 tag 8): address, pitch, width, height,
+    /// bits per pixel. Direct RGB only; PVH boots have none.
+    pub framebuffer: Option<(u64, u32, u32, u32, u8)>,
 }
 
 // ------------------------------------------------------------- PVH parser --
@@ -151,6 +154,7 @@ pub unsafe fn parse_pvh(info_ptr: u64) -> Option<BootInfo> {
         cmdline: "",
         rsdp: (info.rsdp_paddr != 0).then_some(info.rsdp_paddr),
         info_range: None,
+        framebuffer: None,
     })
 }
 
@@ -171,7 +175,8 @@ pub fn parse_multiboot_bytes(bytes: &[u8], physical_base: u64) -> Option<BootInf
     if total != bytes.len() || total < 16 || total & 7 != 0 || get32(bytes, 4)? != 0 { return None; }
     let mut boot = BootInfo { ram_base: 0, ram_size: 0, ram_regions: [(0,0);MAX_RAM_REGIONS],
         ram_region_count: 0, initrd: None, cmdline: "", rsdp: None,
-        info_range: Some((physical_base,physical_base.checked_add(total as u64)?)) };
+        info_range: Some((physical_base,physical_base.checked_add(total as u64)?)),
+        framebuffer: None };
     let mut new_rsdp = false;
     let mut at = 8;
     while at < total {
@@ -212,6 +217,17 @@ pub fn parse_multiboot_bytes(bytes: &[u8], physical_base: u64) -> Option<BootInf
                     }
                     boot.ram_regions[i] = (lo,hi);
                     boot.ram_region_count+=1;
+                }
+            }
+            8 => {
+                // framebuffer_addr u64 @8, pitch @16, width @20, height @24,
+                // bpp u8 @28, type u8 @29 (1 = direct RGB).
+                if size < 31 { return None; }
+                let addr = u64::from_le_bytes(tag.get(8..16)?.try_into().ok()?);
+                let (pitch, width, height) = (get32(tag, 16)?, get32(tag, 20)?, get32(tag, 24)?);
+                let (bpp, kind) = (*tag.get(28)?, *tag.get(29)?);
+                if kind == 1 && addr != 0 {
+                    boot.framebuffer = Some((addr, pitch, width, height, bpp));
                 }
             }
             14 | 15 => {

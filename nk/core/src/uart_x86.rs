@@ -133,6 +133,8 @@ impl fmt::Write for Uart {
                 self.put(b'\r');
             }
             self.put(b);
+            // The same text on the screen, for machines with no serial port.
+            crate::fbcon::putc(b);
         }
         Ok(())
     }

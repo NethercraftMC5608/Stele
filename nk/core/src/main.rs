@@ -138,6 +138,10 @@ pub mod bootinfo_x86;
 #[cfg(target_arch = "x86_64")]
 pub mod acpi;
 #[cfg(target_arch = "x86_64")]
+pub mod fbcon;
+#[cfg(target_arch = "x86_64")]
+pub mod font8x16;
+#[cfg(target_arch = "x86_64")]
 pub mod pci;
 #[cfg(target_arch = "x86_64")]
 mod platform_x86;
@@ -186,6 +190,15 @@ pub extern "C" fn rust_main(magic: u64, info: u64) -> ! {
     let Some(boot) = boot else {
         panic!("could not parse boot information from loader");
     };
+    if let Some((address, pitch, width, height, bpp)) = boot.framebuffer {
+        let fb = fbcon::Framebuffer { address, pitch, width, height, bpp };
+        if fbcon::init(fb) {
+            let (cols, rows) = fbcon::size().unwrap_or((0, 0));
+            println!("NETHOS kernel (nk) -- framebuffer console {}x{} at {:#x}, {} x {} text", width, height, address, cols, rows);
+        } else {
+            println!("  fb:     {}x{} {}bpp at {:#x} not usable as a console", width, height, bpp, address);
+        }
+    }
 
     let mut usable = 0u64;
     for &(s, e) in &boot.ram_regions[..boot.ram_region_count] {
