@@ -1001,6 +1001,90 @@ fn x86_legacy(nr: u64, a: &[u64; 6]) -> Option<i64> {
         crate::sched::set_user_syscall(was);
         rc
     }
+    /// x86-64 open flags -> the arm64 values nk's LKL is built with.
+    ///
+    /// patch-lkl.py gives arch/lkl arm64's fcntl.h, so aarch64 programs pass
+    /// their flags straight through. x86-64 uses asm-generic's, and four bits
+    /// trade places: x86 O_DIRECTORY (0200000) is arm64 O_DIRECT, so opening a
+    /// directory asked for direct I/O and `ls /dev` got EINVAL.
+    fn open_flags_in(f: u64) -> u64 {
+        const SWAP: [(u64, u64); 4] = [
+            (0o040000, 0o200000), // O_DIRECT
+            (0o100000, 0o400000), // O_LARGEFILE
+            (0o200000, 0o040000), // O_DIRECTORY
+            (0o400000, 0o100000), // O_NOFOLLOW
+        ];
+        let mut out = f & !(0o040000 | 0o100000 | 0o200000 | 0o400000);
+        for (x86, arm) in SWAP {
+            if f & x86 != 0 {
+                out |= arm;
+            }
+        }
+        out
+    }
+    /// The reverse, for what F_GETFL reports back.
+    fn open_flags_out(f: u64) -> u64 {
+        const SWAP: [(u64, u64); 4] = [
+            (0o200000, 0o040000), // O_DIRECT
+            (0o400000, 0o100000), // O_LARGEFILE
+            (0o040000, 0o200000), // O_DIRECTORY
+            (0o100000, 0o400000), // O_NOFOLLOW
+        ];
+        let mut out = f & !(0o040000 | 0o100000 | 0o200000 | 0o400000);
+        for (arm, x86) in SWAP {
+            if f & arm != 0 {
+                out |= x86;
+            }
+        }
+        out
+    }
+
+    /// A Linux call on nk's own buffers: pointers are kernel addresses for
+    /// its duration, as in `sys_poll`.
+    fn kcall(lkl_nr: u64, args: [u64; 6]) -> i64 {
+        let was = crate::sched::set_user_syscall(false);
+        let rc = crate::lkl::syscall(lkl_nr as i64, args.map(|v| v as i64));
+        crate::sched::set_user_syscall(was);
+        rc
+    }
+
+    /// epoll_wait / epoll_pwait with x86-64's packed `epoll_event`.
+    ///
+    /// x86-64 declares `struct epoll_event` packed: `u32 events; u64 data` in
+    /// 12 bytes. asm-generic pads it to 16. Linux fills 16-byte records into
+    /// nk's buffer and they are repacked into the caller's. The signal mask,
+    /// if any, is copied in too, since the whole call runs on kernel buffers.
+    fn epoll_wait(epfd: u64, events: u64, max: u64, timeout: u64, sigmask: u64, sigsz: u64) -> i64 {
+        let Ok(n) = usize::try_from(max) else { return -22 };
+        if n == 0 || n > 4096 {
+            return -22; // -EINVAL: Linux refuses 0; 4096 bounds nk's heap
+        }
+        let mut kbuf = alloc::vec![0u8; n * 16];
+        let mut mask = [0u8; 8];
+        let mask_ptr = if sigmask != 0 {
+            if crate::uaccess::copy_from_user(&mut mask, sigmask).is_err() {
+                return crate::uaccess::EFAULT;
+            }
+            mask.as_ptr() as u64
+        } else {
+            0
+        };
+        let rc = kcall(22, [epfd, kbuf.as_mut_ptr() as u64, max, timeout, mask_ptr, if sigmask != 0 { sigsz } else { 0 }]);
+        if rc <= 0 {
+            return rc;
+        }
+        let got = rc as usize;
+        let mut out = alloc::vec![0u8; got * 12];
+        for i in 0..got {
+            out[i * 12..i * 12 + 4].copy_from_slice(&kbuf[i * 16..i * 16 + 4]);
+            out[i * 12 + 4..i * 12 + 12].copy_from_slice(&kbuf[i * 16 + 8..i * 16 + 16]);
+        }
+        match crate::uaccess::copy_to_user(events, &out) {
+            Ok(()) => rc,
+            Err(e) => e,
+        }
+    }
+
     /// asm-generic's `struct stat` -> x86-64's, in the caller's buffer.
     ///
     /// LKL fills the 128-byte asm-generic layout; an x86-64 program reads a
@@ -1038,7 +1122,33 @@ fn x86_legacy(nr: u64, a: &[u64; 6]) -> Option<i64> {
 
         Some(match nr {
         // openat(AT_FDCWD, path, flags, mode)
-        x86::OPEN => at(56, [CWD, a[0], a[1], a[2], 0, 0]),
+        x86::OPEN => at(56, [CWD, a[0], open_flags_in(a[1]), a[2], 0, 0]),
+        x86::OPENAT => at(56, [a[0], a[1], open_flags_in(a[2]), a[3], 0, 0]),
+        // epoll_ctl(epfd, op, fd, event): the 12-byte x86 record, padded.
+        233 => {
+            if a[3] == 0 {
+                at(21, [a[0], a[1], a[2], 0, 0, 0])
+            } else {
+                let mut x = [0u8; 12];
+                if crate::uaccess::copy_from_user(&mut x, a[3]).is_err() {
+                    crate::uaccess::EFAULT
+                } else {
+                    let mut g = [0u8; 16];
+                    g[0..4].copy_from_slice(&x[0..4]);
+                    g[8..16].copy_from_slice(&x[4..12]);
+                    kcall(21, [a[0], a[1], a[2], g.as_ptr() as u64, 0, 0])
+                }
+            }
+        }
+        // epoll_wait(epfd, events, max, timeout) and epoll_pwait(..., mask, size)
+        232 => epoll_wait(a[0], a[1], a[2], a[3], 0, 0),
+        281 => epoll_wait(a[0], a[1], a[2], a[3], a[4], a[5]),
+        // fcntl's flag-word commands: F_GETFL (3) and F_SETFL (4).
+        x86::FCNTL if a[1] == 4 => at(25, [a[0], 4, open_flags_in(a[2]), 0, 0, 0]),
+        x86::FCNTL if a[1] == 3 => {
+            let rc = at(25, [a[0], 3, 0, 0, 0, 0]);
+            if rc < 0 { rc } else { open_flags_out(rc as u64) as i64 }
+        }
         // newfstatat(AT_FDCWD, path, statbuf, flags)
         x86::STAT => x86_stat(at(79, [CWD, a[0], a[1], 0, 0, 0]), a[1]),
         // ... with AT_SYMLINK_NOFOLLOW (0x100), which is what lstat is.
@@ -1047,6 +1157,7 @@ fn x86_legacy(nr: u64, a: &[u64; 6]) -> Option<i64> {
         x86::FSTAT => x86_stat(at(80, [a[0], a[1], 0, 0, 0, 0]), a[1]),
         x86::NEWFSTATAT => x86_stat(at(79, [a[0], a[1], a[2], a[3], 0, 0]), a[2]),
         // creat(path, mode) = openat(AT_FDCWD, path, O_CREAT|O_WRONLY|O_TRUNC, mode)
+        // (none of the four bits that differ, so no translation needed)
         85 => at(56, [CWD, a[0], 0o1101, a[1], 0, 0]),
         // link -> linkat, symlink -> symlinkat
         86 => at(37, [CWD, a[0], CWD, a[1], 0, 0]),

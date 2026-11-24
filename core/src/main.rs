@@ -1227,7 +1227,7 @@ struct LklCpu {
 #[cfg(all(nk_lkl, target_arch = "aarch64"))]
 const LKL_CPU_SEED: usize = 0x0000000040e29eb8;
 #[cfg(all(nk_lkl, target_arch = "x86_64"))]
-const LKL_CPU_SEED: usize = 0x0000000040e7ba60;
+const LKL_CPU_SEED: usize = 0x0000000040e7ca60;
 
 /// Where `cpu` actually is, once `check_lkl_cpu_addr` has confirmed it.
 ///
