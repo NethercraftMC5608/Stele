@@ -553,7 +553,9 @@ fn pick_target_cpu(id: usize) -> usize {
     // Wakes are placement decisions too, and the same LKL line applies: a
     // task woken onto an AP while Linux is running would execute its next
     // syscall there. Everything comes back to the boot CPU. See `LKL_ACTIVE`.
-    if lkl_active() {
+    // ...unless the task cannot run there at all: nk-native work pinned
+    // away from CPU 0 (a dedicated vCPU) is placed by its own mask.
+    if lkl_active() && mask & 1 != 0 {
         return 0;
     }
     if mask & (1 << me) != 0 && cpu_online(me) {
@@ -1049,7 +1051,7 @@ pub fn spawn(name: &'static str, entry: extern "C" fn(usize), arg: usize) -> usi
             owner_cpu: core::sync::atomic::AtomicUsize::new(NO_OWNER),
             name,
             home_cpu: cpu_index(crate::arch::cpu_id()) as u8,
-            affinity: 0xff,
+            affinity: default_affinity(),
             migrations: 0,
             class: crate::schedpolicy::Class::Normal,
             // Placed against the run queue rather than at zero: a vruntime of
@@ -1165,6 +1167,90 @@ pub fn schedule() -> bool {
 /// across cpu_switch, which would serialize all CPUs behind one stack
 /// switch and deadlock the moment two schedule at once.
 static RUNQUEUE: crate::sync::Spinlock = crate::sync::Spinlock::named("RUNQUEUE");
+
+/// CPUs given to one task each (`dedicate_cpu`): bit n set means CPU n runs
+/// only the task whose affinity is exactly that bit. Other tasks have the bit
+/// stripped from their affinity when the CPU is dedicated, new tasks never
+/// get it, a dedicated CPU never steals, and its tick is masked while its
+/// task runs. For guest vCPUs: translated code that is never preempted.
+static RESERVED: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+pub fn reserved_cpus() -> u8 {
+    RESERVED.load(Ordering::Acquire)
+}
+
+/// The affinity a new task starts with: every CPU not dedicated to another.
+fn default_affinity() -> u8 {
+    let free = !RESERVED.load(Ordering::Acquire);
+    if free == 0 { 0xff } else { free }
+}
+
+struct Dedicated {
+    entry: extern "C" fn(usize),
+    arg: usize,
+    cpu: usize,
+}
+
+extern "C" fn dedicated_trampoline(arg: usize) {
+    let d = *unsafe { alloc::boxed::Box::from_raw(arg as *mut Dedicated) };
+    // `dedicate_cpu` narrows the affinity just after `spawn` publishes the
+    // task, so another CPU may have picked it up first. Yield until the
+    // scheduler has moved it; only then is this CPU's timer ours to mask.
+    while cpu_index(crate::arch::cpu_id()) != d.cpu {
+        yield_now();
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        crate::lapic::mask_timer();
+    }
+    (d.entry)(d.arg);
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        crate::lapic::unmask_timer();
+    }
+    RESERVED.fetch_and(!(1u8 << d.cpu.min(7)), Ordering::AcqRel);
+}
+
+/// Give `cpu` to a new task running `entry(arg)`, and to nothing else, until
+/// `entry` returns. Not the boot CPU (Linux and the global clock live there).
+/// Returns the task id, or None if the CPU is the BSP, offline, or already
+/// dedicated.
+pub fn dedicate_cpu(cpu: usize, name: &'static str, entry: extern "C" fn(usize), arg: usize) -> Option<usize> {
+    if cpu == 0 || cpu >= 8 || !cpu_online(cpu) {
+        return None;
+    }
+    let bit = 1u8 << cpu;
+    if RESERVED.fetch_or(bit, Ordering::AcqRel) & bit != 0 {
+        return None;
+    }
+    // Strip the CPU from every task that can run elsewhere, and move any
+    // that call it home.
+    let flags = RUNQUEUE.lock();
+    unsafe {
+        let tasks = &mut *(&raw mut TASKS);
+        for (id, t) in tasks.iter_mut().enumerate() {
+            if idle_owner_of_slot(id).is_some() || t.affinity & !bit == 0 {
+                continue;
+            }
+            t.affinity &= !bit;
+            if t.home_cpu as usize == cpu {
+                for other in 0..cpu_count() {
+                    if t.affinity & (1u8 << other.min(7)) != 0 && cpu_online(other) {
+                        t.home_cpu = other as u8;
+                        break;
+                    }
+                }
+            }
+        }
+        RUNQUEUE.unlock(flags);
+    }
+    let boxed = alloc::boxed::Box::into_raw(alloc::boxed::Box::new(Dedicated { entry, arg, cpu })) as usize;
+    let id = spawn(name, dedicated_trampoline, boxed);
+    set_affinity(id, bit);
+    set_need_resched_on(cpu);
+    crate::arch::send_ipi(cpu);
+    Some(id)
+}
 // Serializes task creation: the slot scan reads every task's state and the
 // commit writes a slot, and two concurrent spawns must not take one slot.
 // Lock order is SPAWN -> RUNQUEUE; no path takes RUNQUEUE then SPAWN.
@@ -1731,10 +1817,12 @@ unsafe fn pick_on(cur: usize, cpu: usize) -> Option<usize> {
     // Linux runs on the boot CPU only; see `LKL_ACTIVE`. An AP that picked a
     // Linux-ABI task here would run its syscalls into LKL concurrently with
     // the boot CPU's, and LKL's single-CPU state cannot survive that.
-    if cpu != 0 && lkl_active() {
-        return None;
-    }
+    // An AP may still run nk-native tasks that exclude CPU 0 -- which no
+    // Linux-ABI task does -- so a dedicated vCPU keeps its core while Linux
+    // runs. Everything that may run on CPU 0 is left to CPU 0.
+    let ap_under_linux = cpu != 0 && lkl_active();
     let cpu_bit = 1u8 << (cpu.min(7));
+    let dedicated = RESERVED.load(Ordering::Acquire) & cpu_bit != 0;
 
     let mut best: Option<usize> = None;
     let mut best_class = crate::schedpolicy::Class::Background;
@@ -1762,6 +1850,12 @@ unsafe fn pick_on(cur: usize, cpu: usize) -> Option<usize> {
             continue;
         }
         if tasks[id].affinity & cpu_bit == 0 {
+            continue;
+        }
+        if ap_under_linux && tasks[id].affinity & 1 != 0 {
+            continue;
+        }
+        if dedicated && tasks[id].affinity != cpu_bit {
             continue;
         }
 
@@ -1815,6 +1909,10 @@ pub fn balance_on_idle(cpu: usize) -> bool {
     // Same line as `pick_on`: while Linux is running, its tasks may only
     // execute on the boot CPU, so an AP must not pull one onto itself.
     if cpu != 0 && lkl_active() {
+        return false;
+    }
+    // A dedicated CPU runs its one task and never pulls work.
+    if RESERVED.load(Ordering::Acquire) & (1u8 << cpu.min(7)) != 0 {
         return false;
     }
     // Under the runqueue lock: the scan reads other tasks' state/affinity

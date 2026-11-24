@@ -572,3 +572,20 @@ for nk's target as well, with the soft crypto backends:
 `RUSTFLAGS='--cfg aes_force_soft --cfg chacha20_backend="soft" --cfg
 aes_backend="soft" --cfg polyval_backend="soft" --cfg poly1305_backend="soft"'
 cargo build -p stela-runtime --no-default-features --target x86_64-unknown-none`.
+
+## Dedicated vCPU cores
+
+```sh
+NK_DEDICATED_TEST=1 NK_SMP=1 NK_AP_LAYER=4 NK_LKL_LIB=$PWD/ldk/build/lkl-x86_64/libnklkl.a \
+  cargo build --release --target x86_64-unknown-none --target-dir target-dedicated
+python3 tests/run-dedicated-x86.py --kernel target-dedicated/x86_64-unknown-none/release/nk \
+  --initrd /path/to/initrd.cpio
+```
+
+After Linux is up, `sched::dedicate_cpu(3, ...)` runs a busy probe while CPU 2
+is contested by pinned spinners and a control probe. PASS: the dedicated
+probe is switched in 0 times during its window, the control is preempted,
+a task allowed on {2,3} never runs on 3, and the reservation is released.
+Scheduler events, not timestamps, are the evidence: under TCG QEMU slices
+vCPUs itself. Run the scheduler torture test (`NK_SCHEDTEST=1`) after any
+scheduler change; it passed 3/3 with this one.

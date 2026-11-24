@@ -186,8 +186,18 @@ What Stela's runtime needs from the kernel underneath it.
         enables native x87 exceptions to satisfy existing target admission.
         Separate pre-SMP probe only: canonical native execution and full-board
         memory-controller admission remain open; sparse holes are not registered.
-- [ ] Dedicated cores: pin guest vCPU threads, keep LKL and nk's own work on
+- [x] Dedicated cores: pin guest vCPU threads, keep LKL and nk's own work on
       other CPUs. Done when: a busy loop on a vCPU core is not preempted.
+  - `sched::dedicate_cpu(cpu, ...)` reserves an AP for one task: other tasks
+    lose it from their affinity, new tasks never get it, it never steals, and
+    its LAPIC tick is masked while the task runs; an AP may run tasks that
+    exclude CPU 0 while Linux is active. QEMU, with Linux up on CPU 0: the
+    probe on CPU 3 was switched in 0 times in 1.5 s (2.2M loops) while a
+    control on contested CPU 2 was switched in 30 times (0.5M loops), and a
+    task allowed on {2,3} never ran on 3 (`nk/tests/run-dedicated-x86.py`,
+    2026-11-25). Counted in scheduler events, since TCG's own vCPU slicing
+    makes timestamp gaps meaningless. Real hardware and interrupt routing away
+    from the core are not verified.
 - [ ] Executable memory for translated code (W^X handling, icache is coherent
       on x86), and fault handling the engine can hook (guest page faults, MMIO
       traps). Done when: a page fault in translated code reaches an engine

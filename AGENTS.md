@@ -244,6 +244,11 @@ require it to pass; both the rebuilt x86 archive and cached arm64 archive pass.
   for anything touching boot info, ACPI discovery or the console. The screen
   console (`fbcon.rs`) mirrors serial output; GRUB calls GOP's 32-bit pixels
   24 bpp.
+- **CPU 0 belongs to Linux; dedicated APs belong to one task.** While LKL is
+  active, anything that may run on CPU 0 runs only there; APs run only tasks
+  that exclude CPU 0. `sched::dedicate_cpu` gives an AP to one task (guest
+  vCPUs) and masks its tick. Never give a Linux-ABI task an affinity without
+  CPU 0.
 - **The kernel links at 1 GiB on x86** (`linker-x86_64.ld`), because static
   binaries load at 0x400000 and every process owns the low gigabyte. Each
   address space has private copies of the top three page-table levels, exactly

@@ -260,6 +260,18 @@ pub unsafe fn calibrate_timer() {
     crate::println!("  lapic:  timer bus {} MHz", bus / 1_000_000);
 }
 
+/// Stop this CPU's periodic tick (mask the LVT timer). Used on a dedicated
+/// core while its one task runs: nothing else may run there, so a tick can
+/// only interrupt it. Wakes still arrive by IPI.
+pub unsafe fn mask_timer() {
+    write(LVT_TIMER, read(LVT_TIMER) | 1 << 16);
+}
+
+/// Undo `mask_timer`.
+pub unsafe fn unmask_timer() {
+    write(LVT_TIMER, read(LVT_TIMER) & !(1 << 16));
+}
+
 /// Start periodic LAPIC timer ticks on this CPU at `vector`.
 pub unsafe fn start_timer(vector: u8) {
     let bus = bus_hz();

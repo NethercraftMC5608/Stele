@@ -158,6 +158,8 @@ mod pci_irq_test;
 #[cfg(target_arch = "x86_64")]
 mod pci_msix_test;
 #[cfg(all(nk_lkl, target_arch = "x86_64"))]
+mod dedicated_test;
+#[cfg(all(nk_lkl, target_arch = "x86_64"))]
 pub mod lkl_pci_x86;
 
 /// Where boot-x86_64.s hands over.
@@ -468,6 +470,10 @@ pub extern "C" fn rust_main(magic: u64, info: u64) -> ! {
         if lkl::boot() {
             println!();
             println!("Linux is up on nk (x86-64). Asking it something:");
+            // A dedicated vCPU core while Linux owns CPU 0 (ROADMAP Phase 3).
+            if option_env!("NK_DEDICATED_TEST").is_some() {
+                dedicated_test::run();
+            }
             println!();
             // LKL's numbers, not x86-64's: `ldk lkl` builds with ARCH=lkl on
             // both hosts, so the table is asm-generic wherever nk runs. 172 is
