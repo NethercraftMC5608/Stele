@@ -172,6 +172,15 @@ What Stela's runtime needs from the kernel underneath it.
       `stela-formats` for `x86_64-unknown-none` with `default-features = false`.
       `stela-boot` already does this for UEFI, so it should mostly work. Done
       when: they link into nk.
+  - [x] All eight build for `x86_64-unknown-none` (contracts, formats,
+        compiler, engine, soc-data, soc, loader, runtime). Needed: the engine's
+        ring-0 cfg generalised from UEFI to `stela_ring0` (UEFI or none), and
+        the soft crypto backends the UEFI build already uses
+        (`--cfg aes_force_soft` etc. in RUSTFLAGS) (2026-11-25).
+  - [x] `stela-compiler` links into nk (`--features stela`) and translates an
+        arm64 block at boot: 8 bytes -> 47 bytes of x86-64 (2026-11-25).
+  - [ ] Link the engine, runtime and SoC model too (crypto cfgs into
+        `nk/.cargo/config.toml`), then execute a translated block.
 - [ ] A host trait between `stela-runtime` and its host (memory, timers, I/O,
       logging), with nk as one implementation and stela.efi as the other.
 - [ ] Run translated arm64 blocks inside nk (the equivalent of `stela-dev

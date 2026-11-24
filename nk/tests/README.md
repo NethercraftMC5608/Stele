@@ -379,3 +379,20 @@ framebuffer. GRUB reports GOP's 32-bit pixels as 24 bpp, so the pixel size
 comes from the pitch. It wraps instead of scrolling (scrolling copies the
 whole uncached framebuffer per line). Verified 2026-11-25: `UEFI_PASS` with
 and without SMP, and a screenshot showing the log at 800x600 (100x37 text).
+
+## Stele's translator inside nk
+
+`--features stela` links `stela-compiler` into nk and, at boot, translates
+`add x0, x0, #1; ret` and prints the result. Translation only; nothing runs.
+
+```sh
+NK_LKL_LIB=$PWD/ldk/build/lkl-x86_64/libnklkl.a cargo build --release \
+  --features stela --target x86_64-unknown-none --target-dir target-stela
+# serial: "stela:  translated 8 arm64 bytes at 0x1000 into 47 x86-64 bytes"
+```
+
+The rest of the translator crates (engine, runtime, SoC model, loader) build
+for nk's target as well, with the soft crypto backends:
+`RUSTFLAGS='--cfg aes_force_soft --cfg chacha20_backend="soft" --cfg
+aes_backend="soft" --cfg polyval_backend="soft" --cfg poly1305_backend="soft"'
+cargo build -p stela-runtime --no-default-features --target x86_64-unknown-none`.

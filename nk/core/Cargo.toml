@@ -11,3 +11,12 @@ license = "GPL-2.0-or-later"
 [[bin]]
 name = "nk"
 path = "src/main.rs"
+
+# Stele's arm64 -> x86-64 translator, linked into nk (ROADMAP Phase 4). Off by
+# default: `--features stela` builds nk with it and runs a translation smoke
+# test at boot.
+[features]
+stela = ["dep:stela-compiler"]
+
+[dependencies]
+stela-compiler = { path = "../../crates/stela-compiler", default-features = false, optional = true }
