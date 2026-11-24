@@ -84,14 +84,19 @@ Keep: the translator and the Mac model. Replace: the PC drivers, with Linux's.
 
 Branch **`nk-x86-userland`** (based on `smp-sleep-halt-fix`) in the NETHOS repo.
 Working: PVH/Multiboot2 boot, 4 CPUs, LAPIC, scheduler torture, LKL boots,
-ring 3, static busybox runs, `fork` + `execve` work. Next gaps, in order:
+ring 3, static busybox, `fork`/`vfork`/`execve`, signals with handlers and
+`rt_sigreturn`, 309 syscalls translated by name (`syscall_x86_generic.rs`),
+`stat` converted between layouts. The harness `/nk-init` script runs to the
+end. Next gaps, in order:
 
-1. x86 syscalls not translated yet: `mount` (165), `vfork` (58), `pivot_root`
-   (155), and anything else printed as `ENOSYS:` on the console.
-2. The x86 signal-return path (a SIGCHLD handler returned to `0x11`).
-3. ACPI (MADT, MCFG), PCI enumeration, MSI-X, then LKL's PCI host ops, so
+1. `ls /dev` fails with `Invalid argument`; find the call (likely another
+   asm-generic vs x86 layout or flag difference).
+2. epoll on x86: `epoll_event` is packed (12 bytes) on x86-64, 16 in
+   asm-generic. `epoll_ctl`/`epoll_wait`/`epoll_pwait` need conversion.
+3. The same syscall-return-before-signal ordering fix on aarch64 (done on x86).
+4. ACPI (MADT, MCFG), PCI enumeration, MSI-X, then LKL's PCI host ops, so
    real drivers (NVMe, igc/e1000e, r8169, snd_hda_intel) attach.
-4. Real hardware via GRUB (Multiboot2). Then VT-x, then the Stele translator on nk.
+5. Real hardware via GRUB (Multiboot2). Then VT-x, then the Stele translator on nk.
 
 Build and boot (from `kernel/`):
 
@@ -125,7 +130,15 @@ LKL needs Docker (`colima start`), then `python3 ldk/ldk.py lkl --arch x86_64`.
   `resume_user`, `r10` carries the user rsp until the iret frame is pushed.
 - **TLS goes in its own pages at the program break**, never over the PT_TLS
   template, which lives inside a PT_LOAD.
-- **Debug by measurement.** QEMU's `-d int -D file` gives the real faulting
+- **Inline asm must preserve full 64-bit registers.** `cpu_id()` swapped rbx
+  through 32-bit registers around CPUID and zeroed rbx's upper half, so a
+  syscall result held in rbx came back as `0xffffffef`. A syscall that "returns
+  a positive number but should have failed" smells like this.
+- **Signals on x86:** the restorer goes on the stack at `[rsp]`, arguments in
+  rdi (`x[13]`), rsi, rdx, and the frame skips the 128-byte red zone.
+- **Debug by measurement.** lldb can attach to QEMU's gdbstub (`-s -S`,
+  `gdb-remote 1234`); write breakpoint callbacks to a file, since batch output
+  is lost when the process is killed. QEMU's `-d int -D file` gives the real faulting
   RIP and CR2. A temporary syscall trace in `rust_syscall` found the fork bug
   in one run. Remove debug code before committing.
 
