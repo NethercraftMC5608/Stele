@@ -39,7 +39,7 @@ pub enum NativeCpuError {
 use NativeCpuError as Refusal;
 
 #[cfg_attr(
-    not(all(target_arch = "x86_64", target_os = "uefi", not(feature = "std"))),
+    not(all(target_arch = "x86_64", stela_ring0)),
     allow(
         dead_code,
         reason = "identity probes are selected on freestanding hardware"
@@ -102,7 +102,7 @@ const XCR0_ZMM: u64 = 0xe0;
 const FAST_PDEP_FAMILY: u32 = 0x19;
 #[cfg(any(
     test,
-    all(target_arch = "x86_64", target_os = "uefi", not(feature = "std"))
+    all(target_arch = "x86_64", stela_ring0)
 ))]
 const CPUID1_ECX_READ: u32 = CPUID_PCLMULQDQ
     | CPUID_SSSE3
@@ -472,7 +472,7 @@ impl NativeSystemTarget {
 
 #[cfg(any(
     test,
-    all(target_arch = "x86_64", target_os = "uefi", not(feature = "std"))
+    all(target_arch = "x86_64", stela_ring0)
 ))]
 #[derive(Debug, Default, Clone, Copy)]
 struct Cpuid {
@@ -484,7 +484,7 @@ struct Cpuid {
 
 #[cfg(any(
     test,
-    all(target_arch = "x86_64", target_os = "uefi", not(feature = "std"))
+    all(target_arch = "x86_64", stela_ring0)
 ))]
 impl IdentityProbe {
     fn read(self, mut cpuid: impl FnMut(u32, u32) -> Cpuid) -> Result<u32, Refusal> {
@@ -504,7 +504,7 @@ impl IdentityProbe {
 
 #[cfg(any(
     test,
-    all(target_arch = "x86_64", target_os = "uefi", not(feature = "std"))
+    all(target_arch = "x86_64", stela_ring0)
 ))]
 fn enumerate(mut cpuid: impl FnMut(u32, u32) -> Cpuid) -> Result<(CpuDeclarations, u32), Refusal> {
     let identity = cpuid(0, 0);
@@ -569,7 +569,7 @@ fn enumerate(mut cpuid: impl FnMut(u32, u32) -> Cpuid) -> Result<(CpuDeclaration
 /// family 0FH, the extended family.
 #[cfg(any(
     test,
-    all(target_arch = "x86_64", target_os = "uefi", not(feature = "std"))
+    all(target_arch = "x86_64", stela_ring0)
 ))]
 const fn display_family(eax: u32) -> u32 {
     let base = (eax >> 8) & 0xf;
@@ -580,7 +580,7 @@ const fn display_family(eax: u32) -> u32 {
     }
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "uefi", not(feature = "std")))]
+#[cfg(all(target_arch = "x86_64", stela_ring0))]
 fn cpuid(leaf: u32, subleaf: u32) -> Cpuid {
     let r = core::arch::x86_64::__cpuid_count(leaf, subleaf);
     Cpuid {
@@ -591,7 +591,7 @@ fn cpuid(leaf: u32, subleaf: u32) -> Cpuid {
     }
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "uefi", not(feature = "std")))]
+#[cfg(all(target_arch = "x86_64", stela_ring0))]
 fn preamble() -> Result<(u16, u64), Refusal> {
     use core::arch::asm;
     let cs: u16;
@@ -605,7 +605,7 @@ fn preamble() -> Result<(u16, u64), Refusal> {
     Ok((cs, flags))
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "uefi", not(feature = "std")))]
+#[cfg(all(target_arch = "x86_64", stela_ring0))]
 fn controls(cs: u16, flags: u64, apic_id: u32) -> NativeControls {
     use core::arch::asm;
     let (cr0, cr4): (u64, u64);
@@ -634,7 +634,7 @@ fn controls(cs: u16, flags: u64, apic_id: u32) -> NativeControls {
     }
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "uefi", not(feature = "std")))]
+#[cfg(all(target_arch = "x86_64", stela_ring0))]
 fn observe() -> Result<Observation, Refusal> {
     let (cs, flags) = preamble()?;
     let (declarations, apic_id) = enumerate(cpuid)?;
@@ -644,19 +644,19 @@ fn observe() -> Result<Observation, Refusal> {
     })
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "uefi", not(feature = "std")))]
+#[cfg(all(target_arch = "x86_64", stela_ring0))]
 fn observe_controls(probe: IdentityProbe) -> Result<NativeControls, Refusal> {
     let (cs, flags) = preamble()?;
     let apic_id = probe.read(cpuid)?;
     Ok(controls(cs, flags, apic_id))
 }
 
-#[cfg(not(all(target_arch = "x86_64", target_os = "uefi", not(feature = "std"))))]
+#[cfg(not(all(target_arch = "x86_64", stela_ring0)))]
 fn observe() -> Result<Observation, Refusal> {
     Err(Refusal::UnsupportedHost)
 }
 
-#[cfg(not(all(target_arch = "x86_64", target_os = "uefi", not(feature = "std"))))]
+#[cfg(not(all(target_arch = "x86_64", stela_ring0)))]
 fn observe_controls(_: IdentityProbe) -> Result<NativeControls, Refusal> {
     Err(Refusal::UnsupportedHost)
 }

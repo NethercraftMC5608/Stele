@@ -46,7 +46,7 @@ pub mod machine;
 pub mod memory;
 pub mod pauth;
 pub mod platform;
-#[cfg(all(target_arch = "x86_64", target_os = "uefi", not(feature = "std")))]
+#[cfg(all(target_arch = "x86_64", stela_ring0))]
 pub mod freestanding {
     pub use crate::platform::boot::BootArena;
 }
