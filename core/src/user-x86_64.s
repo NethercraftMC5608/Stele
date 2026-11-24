@@ -231,7 +231,15 @@ syscall_entry:
     // live here and are preserved in the 32 bytes below RSP -- safe to use
     // because this is the kernel's own stack region, IF is masked by FMASK,
     // and nothing else runs on this stack until the switch below.
-    sub     $32, %rsp
+    //
+    // The CPU index lives in rbx only until rbx is restored, so the kernel
+    // stack pointer is read out *first* and parked in a fifth slot; the stack
+    // switch then loads it from there. Indexing kernel_sp_scratch with rbx
+    // after restoring it indexed with the *user's* rbx: harmless while every
+    // test binary entered its first syscall with rbx = 0 (CPU 0's slot by
+    // luck), and a zero stack pointer -- push to 0xff..fef0, #PF, #DF -- the
+    // first time busybox did not.
+    sub     $40, %rsp
     mov     %rax, 24(%rsp)
     mov     %rcx, 0(%rsp)
     mov     %rdx, 8(%rsp)
@@ -240,15 +248,17 @@ syscall_entry:
     cpuid
     shr     $24, %ebx
     and     $7, %ebx
-    lea     32(%rsp), %rax
+    lea     40(%rsp), %rax
     mov     %rax, user_rsp_scratch(,%rbx,8)
+    mov     kernel_sp_scratch(,%rbx,8), %rax
+    mov     %rax, 32(%rsp)
     // Restore the saved registers BEFORE switching stacks: after the mov
-    // below, RSP names the kernel stack and U-32 is unreachable.
+    // below, RSP names the kernel stack and U-40 is unreachable.
     mov     24(%rsp), %rax
     mov     16(%rsp), %rbx
     mov     8(%rsp), %rdx
     mov     0(%rsp), %rcx
-    mov     kernel_sp_scratch(,%rbx,8), %rsp
+    mov     32(%rsp), %rsp
     // RSP now names the kernel stack; rax is the syscall number again, rcx
     // the return RIP, rdx arg 2 -- exactly what entry provided.
 
