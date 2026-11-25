@@ -37,6 +37,12 @@ const RAM_BYTES: u64 = match option_env!("NK_STELA_SPTM_DRAM_MIB") {
     Some(s) => parse_seconds(s) << 20,
     None => 2 << 30,
 };
+/// Console silence that ends the run as a hang: `NK_STELA_SPTM_STALL` s at
+/// build time, 90 s by default.
+const STALL_NS: u64 = match option_env!("NK_STELA_SPTM_STALL") {
+    Some(s) => parse_seconds(s) * 1_000_000_000,
+    None => 90_000_000_000,
+};
 /// Frames below this are nk's own (identity mapped) and go back to it.
 const IDENTITY_LIMIT: u64 = 1 << 32;
 /// Native code arena: 4 MiB of frames, one recovery range.
@@ -489,10 +495,9 @@ fn number(value: &serde_json::Value, path: &[&str]) -> Option<u64> {
 /// Read `dir/bundle.json` and every region's bytes through LKL into fresh
 /// guest DRAM. CPU 0 (LKL's).
 fn prepare(dir: &str) -> Result<Prepared, String> {
-    let read = |name: &str| {
-        super::board::read_linux_file(&alloc::format!("{dir}/{name}"))
-            .map_err(|errno| alloc::format!("{dir}/{name}: errno {}", -errno))
-    };
+    let source = Source::open(dir);
+    crate::println!("STELA_SPTM: bundle from {}", source.describe());
+    let read = |name: &str| source.read(name);
     let json = read("bundle.json")?;
     let bundle: serde_json::Value =
         serde_json::from_slice(&json).map_err(|e| alloc::format!("bundle.json: {e}"))?;
@@ -553,7 +558,7 @@ fn prepare(dir: &str) -> Result<Prepared, String> {
         if pa < DRAM || pa + memory.max(bytes) > DRAM + RAM_BYTES {
             return Err(alloc::format!("region {file} at {pa:#x} is outside guest DRAM"));
         }
-        pread_into(&alloc::format!("{dir}/{file}"), offset, pa, bytes)?;
+        source.pread_into(file, offset, pa, bytes)?;
         loaded += bytes;
     }
     // The bundle's boot-time patches a bootloader fills (`stela.efi` does so
@@ -588,6 +593,39 @@ fn prepare(dir: &str) -> Result<Prepared, String> {
         crate::println!("STELA_SPTM: patched {} ({} random bytes at {:#x})", field, bytes, pa);
     }
     let _ = seeded;
+    // The kernel command line, as `stela.efi` finishes it at boot: the cold
+    // T8112 memory plan nk mounts is cacheless, so XNU must get
+    // `-disable_mcc` (stela_loader::boot_policy::mcc), or its
+    // AppleT8112MemCacheController waits for cache ways that never come on.
+    for patch in bundle.get("patches").and_then(|p| p.as_array()).into_iter().flatten() {
+        if patch.get("source").and_then(|s| s.as_str()) != Some("boot-args") {
+            continue;
+        }
+        let name = patch.get("region").and_then(|r| r.as_str()).ok_or("patch without region")?;
+        let bytes = number(patch, &["bytes"]).ok_or("patch without bytes")? as usize;
+        let at = number(patch, &["file_offset"]).ok_or("patch without file_offset")?;
+        let region = regions
+            .iter()
+            .find(|r| r.get("name").and_then(|n| n.as_str()) == Some(name))
+            .ok_or("boot-args patch: no region")?;
+        let pa = number(region, &["guest_pa"]).ok_or("region without guest_pa")?
+            + (at - number(region, &["file_offset"]).ok_or("region without file_offset")?);
+        let line = unsafe { core::slice::from_raw_parts_mut(pa as *mut u8, bytes) };
+        let len = line.iter().position(|&b| b == 0).unwrap_or(bytes);
+        let present = core::str::from_utf8(&line[..len])
+            .map(|l| l.split_ascii_whitespace().any(|w| w == "-disable_mcc"))
+            .unwrap_or(false);
+        const ARG: &[u8] = b" -disable_mcc";
+        if !present {
+            if len + ARG.len() >= bytes {
+                return Err(String::from("boot-args: no room for -disable_mcc"));
+            }
+            line[len..len + ARG.len()].copy_from_slice(ARG);
+            line[len + ARG.len()] = 0;
+        }
+        let shown = String::from_utf8_lossy(&line[..line.iter().position(|&b| b == 0).unwrap_or(bytes)]).into_owned();
+        crate::println!("STELA_SPTM: boot-args: {}", shown);
+    }
     crate::println!(
         "STELA_SPTM: {} regions, {} MiB loaded into guest DRAM at {:#x} ({} MiB backed)",
         regions.len(), loaded >> 20, DRAM, RAM_BYTES >> 20
@@ -600,6 +638,137 @@ fn prepare(dir: &str) -> Result<Prepared, String> {
         x0,
         read_only,
     })
+}
+
+/// Where the bundle comes from: files in a directory of Linux's rootfs (the
+/// initrd), or a cpio newc archive written raw to the first NVMe disk -- for
+/// a bundle the initrd cannot carry (a restore ramdisk is ~360 MiB). Files on
+/// the disk are read straight into guest DRAM with pread, never copied into
+/// Linux's memory.
+enum Source {
+    Dir(String),
+    Disk { fd: i64, files: Vec<(String, u64, u64)> },
+}
+
+impl Source {
+    fn open(dir: &str) -> Self {
+        Self::disk().unwrap_or_else(|| Self::Dir(String::from(dir)))
+    }
+    fn describe(&self) -> String {
+        match self {
+            Self::Dir(dir) => alloc::format!("{dir} (initrd)"),
+            Self::Disk { files, .. } => alloc::format!("/dev/nvme0n1 ({} files, cpio)", files.len()),
+        }
+    }
+    /// The first NVMe namespace through devtmpfs, if it holds a cpio archive.
+    fn disk() -> Option<Self> {
+        const MKDIRAT: i64 = 34;
+        const MOUNT: i64 = 40;
+        let _ = crate::lkl::syscall(MKDIRAT, [-100, c"/stele-dev".as_ptr() as i64, 0o755, 0, 0, 0]);
+        let _ = crate::lkl::syscall(MOUNT, [c"devtmpfs".as_ptr() as i64, c"/stele-dev".as_ptr() as i64,
+            c"devtmpfs".as_ptr() as i64, 0, 0, 0]);
+        let fd = crate::lkl::syscall(56, [-100, c"/stele-dev/nvme0n1".as_ptr() as i64, 0, 0, 0, 0]);
+        if fd < 0 {
+            return None;
+        }
+        let mut files = Vec::new();
+        let mut at = 0u64;
+        let mut header = [0u8; 110 + 256];
+        loop {
+            if pread(fd, &mut header, at) != header.len() as i64 || &header[..6] != b"070701" {
+                break;
+            }
+            let field = |i: usize| {
+                core::str::from_utf8(&header[6 + i * 8..14 + i * 8]).ok().and_then(|h| u64::from_str_radix(h, 16).ok())
+            };
+            let (Some(size), Some(namesize)) = (field(6), field(11)) else { break };
+            let namesize = namesize as usize;
+            if namesize == 0 || namesize > 256 {
+                break;
+            }
+            let name = String::from_utf8_lossy(&header[110..110 + namesize - 1]).into_owned();
+            if name == "TRAILER!!!" {
+                break;
+            }
+            let data = (at + 110 + namesize as u64 + 3) & !3;
+            files.push((name, data, size));
+            at = (data + size + 3) & !3;
+        }
+        if files.is_empty() {
+            crate::lkl::syscall(57, [fd, 0, 0, 0, 0, 0]);
+            return None;
+        }
+        Some(Self::Disk { fd, files })
+    }
+    fn find(&self, name: &str) -> Result<(i64, u64, u64), String> {
+        let Self::Disk { fd, files } = self else { unreachable!() };
+        files
+            .iter()
+            .find(|(n, _, _)| n == name || n.rsplit('/').next() == Some(name))
+            .map(|&(_, data, size)| (*fd, data, size))
+            .ok_or_else(|| alloc::format!("{name}: not on the bundle disk"))
+    }
+    fn read(&self, name: &str) -> Result<Vec<u8>, String> {
+        match self {
+            Self::Dir(dir) => super::board::read_linux_file(&alloc::format!("{dir}/{name}"))
+                .map_err(|errno| alloc::format!("{dir}/{name}: errno {}", -errno)),
+            Self::Disk { .. } => {
+                let (fd, data, size) = self.find(name)?;
+                let mut bytes = vec![0u8; size as usize];
+                let mut done = 0usize;
+                while done < bytes.len() {
+                    let n = pread(fd, &mut bytes[done..], data + done as u64);
+                    if n <= 0 {
+                        return Err(alloc::format!("{name}: short read on the bundle disk"));
+                    }
+                    done += n as usize;
+                }
+                Ok(bytes)
+            }
+        }
+    }
+    /// `bytes` of `file` from `offset`, into guest DRAM at `pa`.
+    fn pread_into(&self, file: &str, offset: u64, pa: u64, bytes: u64) -> Result<(), String> {
+        match self {
+            Self::Dir(dir) => pread_into(&alloc::format!("{dir}/{file}"), offset, pa, bytes),
+            Self::Disk { .. } => {
+                let (fd, data, size) = self.find(file)?;
+                if offset + bytes > size {
+                    return Err(alloc::format!("{file}: region past the file's end"));
+                }
+                copy_into(fd, data + offset, pa, bytes, file)
+            }
+        }
+    }
+}
+
+impl Drop for Source {
+    fn drop(&mut self) {
+        if let Self::Disk { fd, .. } = self {
+            crate::lkl::syscall(57, [*fd, 0, 0, 0, 0, 0]);
+        }
+    }
+}
+
+/// asm-generic pread64 (67).
+fn pread(fd: i64, out: &mut [u8], at: u64) -> i64 {
+    crate::lkl::syscall(67, [fd, out.as_mut_ptr() as i64, out.len() as i64, at as i64, 0, 0])
+}
+
+/// `bytes` from `fd` at `at` into guest DRAM at `pa`, through a bounce buffer.
+fn copy_into(fd: i64, at: u64, pa: u64, bytes: u64, what: &str) -> Result<(), String> {
+    let mut chunk = vec![0u8; 1 << 20];
+    let mut done = 0u64;
+    while done < bytes {
+        let want = (bytes - done).min(chunk.len() as u64) as usize;
+        let n = pread(fd, &mut chunk[..want], at + done);
+        if n <= 0 {
+            return Err(alloc::format!("{what}: short read at {} (errno {})", at + done, -n));
+        }
+        unsafe { core::ptr::copy_nonoverlapping(chunk.as_ptr(), (pa + done) as *mut u8, n as usize) };
+        done += n as u64;
+    }
+    Ok(())
 }
 
 /// `bytes` of `path` from `offset`, into guest DRAM at `pa` (asm-generic
@@ -780,6 +949,7 @@ fn run_board(p: Prepared) -> bool {
     let start = crate::timer::time_ns();
     let mut slices = 0u64;
     let mut reported = start;
+    let (mut last_bytes, mut last_output) = (0u64, start);
     let stop = loop {
         // The budget is a total: the engine stops once its block count
         // reaches it, so each slice asks for SLICE_BLOCKS more.
@@ -793,7 +963,18 @@ fn run_board(p: Prepared) -> bool {
                 machine.cpu.pc, console_bytes.load(Ordering::Relaxed)
             );
         }
-        let more = matches!(stop, Stop::Budget) && crate::timer::time_ns() - start < RUN_NS;
+        // A console silent this long is a hang: stop, so the state dump
+        // below shows where the guest waits.
+        let bytes = console_bytes.load(Ordering::Relaxed);
+        if bytes != last_bytes {
+            last_bytes = bytes;
+            last_output = crate::timer::time_ns();
+        }
+        let stalled = crate::timer::time_ns() - last_output > STALL_NS;
+        if stalled {
+            crate::println!("STELA_SPTM: console silent for {} s: stopping to dump state", STALL_NS / 1_000_000_000);
+        }
+        let more = matches!(stop, Stop::Budget) && crate::timer::time_ns() - start < RUN_NS && !stalled;
         if !more {
             break stop;
         }
@@ -839,7 +1020,8 @@ fn run_board(p: Prepared) -> bool {
             r.get(R::CNTP_CTL_EL0, 0), r.get(R::CNTP_CVAL_EL0, 0),
             machine.host.counter_now(), machine.cpu.pstate.daif
         );
-        let pc = machine.cpu.pc;
+        for (what, at) in [("lr", st.x[30] & 0x0000_ffff_ffff_ffff | 0xffff_0000_0000_0000), ("pc", machine.cpu.pc)] {
+        let pc = at;
         let from = (pc & !3).saturating_sub(0x60);
         if let mmu::Outcome::Mapped(t) = shadow.translate(from, false) {
             let mut words = [0u32; 48];
@@ -849,12 +1031,13 @@ fn run_board(p: Prepared) -> bool {
                     *w = unsafe { core::ptr::read_volatile(pa as *const u32) };
                 }
             }
-            crate::println!("STELA_SPTM: code from {:#x} (PA {:#x}):", from, t.physical);
+            crate::println!("STELA_SPTM: code at {} from {:#x} (PA {:#x}):", what, from, t.physical);
             for chunk in words.chunks(8) {
                 let line: alloc::vec::Vec<alloc::string::String> =
                     chunk.iter().map(|w| alloc::format!("{:08x}", w)).collect();
                 crate::println!("STELA_SPTM:   {}", line.join(" "));
             }
+        }
         }
     }
     if let Some(shadow) = machine.host.shadow.as_ref() {

@@ -274,6 +274,12 @@ require it to pass; both the rebuilt x86 archive and cached arm64 archive pass.
   comes from RAM above 4 GiB (`frames::alloc_high`, `--memory 6G`); prepare
   the bundle with `--dram-size` equal to what nk backs, or SPTM writes past
   it (external abort at the first unbacked page).
+- **Handoff for the XNU boot work: `nk/docs/HANDOFF-XNU.md`** (state, the
+  Bazzite KVM host `nether@192.168.1.9`, run commands, current panic).
+- **KASLR moves XNU every boot.** Name a dumped PC by finding its bytes in
+  the kernelcache (one page-aligned slide) and the strings it references.
+- **The cacheless M2 memory plan needs `-disable_mcc`** on XNU's command
+  line; nk appends it to the bundle's boot-args patch, as stela.efi does.
 - **Apple's files stay out of the repo.** The M2 IPSW and the bundle
   `stela-dev boot prepare` makes from it live in `~/Stele-assets`
   (`bundle-Mac14,2-26B131/devicetree.adt`); tests take them by path

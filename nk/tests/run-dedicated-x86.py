@@ -66,6 +66,9 @@ def main():
     parser.add_argument("--timeout", type=float, default=150)
     parser.add_argument("--cpu", help="QEMU -cpu model (default: QEMU's own)")
     parser.add_argument("--memory", default="4G", help="QEMU -m (default 4G)")
+    parser.add_argument("--accel", help="QEMU -accel (kvm on a Linux x86 host)")
+    parser.add_argument("--disk", type=Path,
+                        help="attach this raw image read-only as an NVMe drive (tests/bundle-disk.py)")
     parser.add_argument("--add", action="append", default=[], metavar="HOST:GUEST",
                         help="add a host file to the initrd at a guest path")
     parser.add_argument("--require", action="append", default=[],
@@ -81,7 +84,10 @@ def main():
                  for host, guest in (spec.split(":", 1) for spec in args.add)]
         initrd = out / "initrd.cpio"
         initrd.write_bytes(with_files(args.initrd.read_bytes(), files))
-    cpu = ["-cpu", args.cpu] if args.cpu else []
+    cpu = (["-cpu", args.cpu] if args.cpu else []) + (["-accel", args.accel] if args.accel else [])
+    if args.disk:
+        cpu += ["-drive", f"file={args.disk.resolve(strict=True)},if=none,id=bundle,format=raw,readonly=on",
+                "-device", "nvme,drive=bundle,serial=nkbundle"]
     proc = subprocess.Popen([args.qemu, "-M", "q35", "-m", args.memory, "-smp", "4", *cpu,
                              "-kernel", str(args.kernel.resolve(strict=True)),
                              "-initrd", str(initrd),
