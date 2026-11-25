@@ -159,9 +159,13 @@ pub(crate) unsafe fn recover_native_fault(f: &mut TrapFrame, fp: *const u8) -> b
     } else {
         0
     };
-    // A not-present data access the host's shadow can fill: map it and
-    // retry the instruction natively, as the host's own #PF gate would.
-    if f.vector == 14 && f.error & 0b1_1001 == 0 {
+    // A not-present data access the host's shadow can fill, or a write to a
+    // page it holds read-only (the guest may have made it writable without
+    // a TLBI, which ARM allows): map it and retry the instruction natively,
+    // as the host's own #PF gate would. Supervisor data accesses only.
+    let not_present = f.error & 0b1_1001 == 0;
+    let write_to_read_only = f.error & 0b1_1111 == 0b0_0011;
+    if f.vector == 14 && (not_present || write_to_read_only) {
         if let Some(filler) = &active.fill {
             if (filler.fill)(filler.context, address, f.error & 2 != 0) {
                 return true;

@@ -4,6 +4,26 @@ State of the `nk` branch (PR #2, NethercraftMC5608/Stele) and how to carry on.
 Read `AGENTS.md` and `ROADMAP.md` first. The changes described below are in
 the shared working tree, with no new commit.
 
+## Shadow page tables: kept per regime (2026-11-25)
+
+`DramHost` keeps up to 8 filled shadows keyed by the whole regime and
+implements `invalidate_reach`: the current shadow takes the TLBI's `reach`,
+kept shadows take its `everywhere` (address forms page-wise, ASID-wide or
+full forms clear). Invalidation covers whole guest pages (macOS uses 16 KiB
+pages: four x86 pages) and clears a shadow when a TLBI touches a recorded
+block mapping. A write to a present read-only shadow page upgrades it in
+the #PF fill (ARM lets a guest make a page writable without a TLBI).
+Before the 16 KiB fix, kept shadows served stale x86 pages: launchd died
+with CS_KILLED (page hash mismatch) or "Library not loaded".
+Measured on Bazzite (restore boot, 790 s): page fills 12.3 M -> 218 k,
+full clears 606 k -> 8.9 k, 659 k of 729 k regime switches reuse a kept
+shadow. Wall-clock speed improved only ~10-15% (launchd at ~70 s vs
+~80 s): the main cost is the 8 PEs time-slicing on one host core.
+Both builds go quiet at the same point after syslogd starts, with
+restored_external running and DWC3 never powered: a guest-side wait,
+not slowness. Build options: `NK_STELA_SHADOW_CACHE=0` restores the
+clear-on-every-switch behaviour.
+
 ## Resume here
 
 1. Continue the **restore USB handshake**. The nine-CPU Bazzite run reached

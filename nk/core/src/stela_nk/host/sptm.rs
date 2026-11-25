@@ -133,8 +133,18 @@ struct DramHost {
     mmu: Option<(u64, u64)>,
     /// Guest DRAM's frames, for the shadow.
     frames: Vec<u64>,
-    /// The MMU-on shadow, once the guest turned its MMU on.
+    /// The MMU-on shadow for the current regime, once the guest turned its
+    /// MMU on.
     shadow: Option<Box<Shadow>>,
+    /// Shadows of recent other regimes (kernel/user mode, other processes),
+    /// kept filled so a switch back reuses them; oldest first.
+    cached: Vec<Box<Shadow>>,
+    /// Regime switches, and those a cached shadow served.
+    switches: u64,
+    reused: u64,
+    /// TLB invalidations served page by page, and those that cleared all.
+    page_invalidations: u64,
+    full_invalidations: u64,
     /// Native accesses below `UPPER` that the shadow could not fill.
     lower_faults: u64,
     entered_el0: bool,
@@ -158,6 +168,11 @@ impl DramHost {
             mmu: None,
             frames,
             shadow: None,
+            cached: Vec::new(),
+            switches: 0,
+            reused: 0,
+            page_invalidations: 0,
+            full_invalidations: 0,
             lower_faults: 0,
             entered_el0: false,
             called_from_el0: false,
@@ -213,6 +228,20 @@ fn release_dram(frames: &[u64]) {
 }
 
 impl DramHost {
+    /// Remove what `reach` names from one shadow: page by page for a page
+    /// or small range, the whole shadow otherwise. True when it cleared all.
+    fn apply(shadow: &mut Shadow, reach: mmu::tlbi::Reach) -> bool {
+        use mmu::tlbi::Reach;
+        match reach {
+            Reach::Nothing => false,
+            Reach::All => {
+                shadow.clear();
+                true
+            }
+            Reach::Containing(va) => shadow.invalidate(va, va),
+            Reach::Overlapping { first, last } => shadow.invalidate(first, last),
+        }
+    }
     fn counter_now(&self) -> u64 {
         guest_count(self.tsc_base)
     }
@@ -380,18 +409,65 @@ impl Host for DramHost {
         if self.mmu.is_none() {
             self.mmu = Some((regime.controls.sctlr, self.executions));
         }
-        match self.shadow.as_mut() {
-            Some(shadow) if shadow.regime != *regime => {
+        if self.shadow.as_ref().is_some_and(|shadow| shadow.regime == *regime) {
+            return;
+        }
+        // Keep the outgoing shadow filled; take one of this regime if kept.
+        self.switches += 1;
+        if SHADOW_CACHE == 0 {
+            if let Some(shadow) = self.shadow.as_mut() {
                 shadow.clear();
                 shadow.regime = *regime;
+            } else {
+                self.shadow = Shadow::new(self.frames.clone(), *regime).map(Box::new);
             }
-            Some(_) => {}
-            None => self.shadow = Shadow::new(self.frames.clone(), *regime).map(Box::new),
+            return;
         }
+        if let Some(outgoing) = self.shadow.take() {
+            self.cached.push(outgoing);
+        }
+        if let Some(at) = self.cached.iter().position(|shadow| shadow.regime == *regime) {
+            self.reused += 1;
+            self.shadow = Some(self.cached.remove(at));
+            return;
+        }
+        self.shadow = if self.cached.len() >= SHADOW_CACHE {
+            // Reuse the oldest kept shadow's frames for this regime.
+            let mut shadow = self.cached.remove(0);
+            shadow.clear();
+            shadow.regime = *regime;
+            Some(shadow)
+        } else {
+            Shadow::new(self.frames.clone(), *regime).map(Box::new)
+        };
     }
     fn invalidate_translations(&mut self) {
-        if let Some(shadow) = self.shadow.as_mut() {
+        self.full_invalidations += 1;
+        for shadow in self.shadow.iter_mut().chain(self.cached.iter_mut()) {
             shadow.clear();
+        }
+    }
+    /// A TLBI of a page or a small range unmaps just those pages, from every
+    /// kept shadow (a superset of the contexts it reaches); only a full or
+    /// large invalidation clears them. New guest mappings need no TLBI
+    /// (they fault in), so kept shadows stay correct between invalidations.
+    fn invalidate_reach(&mut self, reach: mmu::tlbi::Reach, everywhere: mmu::tlbi::Everywhere) {
+        use mmu::tlbi::{Everywhere, Reach};
+        // The current shadow takes what the TLBI reaches in this context;
+        // every kept shadow takes what it removes from any context
+        // (`everywhere`), as a superset: ASIDs are not told apart.
+        self.page_invalidations += 1;
+        if let Some(shadow) = self.shadow.as_mut() {
+            if Self::apply(shadow, reach) {
+                self.full_invalidations += 1;
+            }
+        }
+        let kept = match everywhere {
+            Everywhere::Addresses(reach) | Everywhere::AsidAddresses(reach, _) => reach,
+            Everywhere::NonGlobal(_) | Everywhere::All => Reach::All,
+        };
+        for shadow in self.cached.iter_mut() {
+            Self::apply(shadow, kept);
         }
     }
     fn counter(&mut self) -> u64 {
@@ -438,6 +514,20 @@ const LOWER_END: u64 = 1 << 47;
 const UPPER_ENTRY: usize = ((UPPER >> 39) & 511) as usize;
 /// Shadow table frames between clears (each maps up to 2 MiB of leaves).
 const SHADOW_TABLES: usize = 1024;
+/// Shadows kept filled for other regimes besides the current one:
+/// `NK_STELA_SHADOW_CACHE` at build time, 8 by default; 0 clears and refills
+/// one shadow on every regime switch.
+const SHADOW_CACHE: usize = match option_env!("NK_STELA_SHADOW_CACHE") {
+    Some(s) => parse_seconds(s) as usize,
+    None => 8,
+};
+/// A range TLBI of more x86 pages than this clears the shadows instead.
+const PAGE_INVALIDATION_LIMIT: u64 = 256;
+/// The largest guest translation counted as a page (ARM's 64 KiB granule);
+/// larger ones are block mappings.
+const GUEST_PAGE_MAX: u64 = 64 << 10;
+/// Block mappings a shadow records between clears.
+const SHADOW_BLOCKS: usize = 64;
 
 /// Guest tables read straight from guest DRAM (mapped at its own address).
 struct DramTables;
@@ -464,6 +554,16 @@ struct Shadow {
     lower_fills: u64,
     refused: u64,
     clears: u64,
+    /// Clears because the table budget ran out, not the guest's doing.
+    budget_clears: u64,
+    /// The largest guest page (not block) size filled since the last clear:
+    /// macOS uses 16 KiB pages, so one guest page is four x86 pages.
+    granule: u64,
+    /// Guest block mappings (larger than a page) filled since the last
+    /// clear, as (base, bytes); fixed capacity, as fills run in the trap.
+    blocks: Vec<(u64, u64)>,
+    /// More blocks were filled than `blocks` holds.
+    blocks_overflowed: bool,
 }
 
 impl Shadow {
@@ -477,7 +577,7 @@ impl Shadow {
         unsafe { core::ptr::copy_nonoverlapping(kernel, root, UPPER_ENTRY) };
         // Capacity fixed here: fills run in the #PF trap and never allocate
         // from the heap there.
-        Some(Self { root, kernel, lower_private: false, tables: Vec::with_capacity(SHADOW_TABLES), frames, regime, fills: 0, lower_fills: 0, refused: 0, clears: 0 })
+        Some(Self { root, kernel, lower_private: false, tables: Vec::with_capacity(SHADOW_TABLES), frames, regime, fills: 0, lower_fills: 0, refused: 0, clears: 0, budget_clears: 0, granule: 4096, blocks: Vec::with_capacity(SHADOW_BLOCKS), blocks_overflowed: false })
     }
     fn cr3(&self) -> u64 {
         self.root as u64
@@ -494,6 +594,9 @@ impl Shadow {
         for table in self.tables.drain(..) {
             unsafe { crate::frames::free(table) };
         }
+        self.granule = 4096;
+        self.blocks.clear();
+        self.blocks_overflowed = false;
         self.clears += 1;
     }
     /// Follow the next table or take a private copy of the corresponding
@@ -545,6 +648,43 @@ impl Shadow {
             | if writable { crate::pte::WRITABLE } else { 0 };
         true
     }
+    /// What a TLBI of guest VAs `first..=last` removes: every x86 page of
+    /// the guest pages it touches, or the whole shadow when it touches a
+    /// filled block mapping (or more blocks were filled than recorded).
+    /// True when it cleared everything.
+    fn invalidate(&mut self, first: u64, last: u64) -> bool {
+        let touches_block = self.blocks_overflowed
+            || self.blocks.iter().any(|&(base, bytes)| first < base + bytes && base <= last);
+        let granule = self.granule.max(4096);
+        let start = first & !(granule - 1);
+        let end = (last | (granule - 1)).wrapping_add(1);
+        let pages = end.wrapping_sub(start) >> 12;
+        if touches_block || end <= start || pages > PAGE_INVALIDATION_LIMIT {
+            self.clear();
+            return true;
+        }
+        for page in 0..pages {
+            self.unmap(start + page * 4096);
+        }
+        false
+    }
+    /// Remove this shadow's own mapping of the page at `va`, if it has one;
+    /// nk's own mappings (shared or copied from the kernel) stay.
+    fn unmap(&mut self, va: u64) {
+        use crate::pte::{ADDR, HUGE, VALID};
+        if (LOWER_END..UPPER).contains(&va) || Self::mapped(self.kernel, va) {
+            return;
+        }
+        let mut table = self.root;
+        for shift in [39, 30, 21] {
+            let entry = unsafe { *table.add(((va >> shift) & 511) as usize) };
+            if entry & VALID == 0 || entry & HUGE != 0 {
+                return;
+            }
+            table = (entry & ADDR) as *mut u64;
+        }
+        unsafe { *table.add(((va >> 12) & 511) as usize) = 0 };
+    }
     fn mapped(mut root: *const u64, address: u64) -> bool {
         use crate::pte::{ADDR, HUGE, VALID};
         for shift in [39, 30, 21, 12] {
@@ -589,7 +729,32 @@ impl Shadow {
         }
         let frame = self.frames[((physical - DRAM) / 4096) as usize];
         if unsafe { !self.map(page, frame, t.writable) } {
-            return false;
+            // A kept shadow can use up its table budget: start it afresh
+            // (this frees frames and allocates nothing from the heap, so it
+            // is safe in the trap) and map again.
+            if self.tables.len() < self.tables.capacity() {
+                return false;
+            }
+            self.clear();
+            self.budget_clears += 1;
+            if unsafe { !self.map(page, frame, t.writable) } {
+                return false;
+            }
+        }
+        // The page may have been present (read-only, now upgraded): its
+        // old entry can be in this CPU's TLB, with the shadow root live.
+        unsafe { core::arch::asm!("invlpg [{}]", in(reg) page, options(nostack)) };
+        if t.size > GUEST_PAGE_MAX {
+            let base = address & !(t.size - 1);
+            if !self.blocks.iter().any(|&(b, n)| b == base && n == t.size) {
+                if self.blocks.len() < self.blocks.capacity() {
+                    self.blocks.push((base, t.size));
+                } else {
+                    self.blocks_overflowed = true;
+                }
+            }
+        } else if t.size > self.granule {
+            self.granule = t.size;
         }
         self.fills += 1;
         self.lower_fills += u64::from(address < LOWER_END);
@@ -824,8 +989,19 @@ impl Source {
         let _ = crate::lkl::syscall(MKDIRAT, [-100, c"/stele-dev".as_ptr() as i64, 0o755, 0, 0, 0]);
         let _ = crate::lkl::syscall(MOUNT, [c"devtmpfs".as_ptr() as i64, c"/stele-dev".as_ptr() as i64,
             c"devtmpfs".as_ptr() as i64, 0, 0, 0]);
-        let fd = crate::lkl::syscall(56, [-100, c"/stele-dev/nvme0n1".as_ptr() as i64, 0, 0, 0, 0]);
+        // Linux probes NVMe asynchronously: the namespace can appear a few
+        // seconds after boot. Wait up to 10 s (asm-generic nanosleep 101).
+        let mut fd = -2;
+        for _ in 0..40 {
+            fd = crate::lkl::syscall(56, [-100, c"/stele-dev/nvme0n1".as_ptr() as i64, 0, 0, 0, 0]);
+            if fd >= 0 {
+                break;
+            }
+            let quarter: [i64; 2] = [0, 250_000_000];
+            crate::lkl::syscall(101, [quarter.as_ptr() as i64, 0, 0, 0, 0, 0]);
+        }
         if fd < 0 {
+            crate::println!("STELA_SPTM: no bundle disk: /dev/nvme0n1 errno {}", -fd);
             return None;
         }
         let mut files = Vec::new();
@@ -1301,8 +1477,11 @@ fn run_board(p: Prepared) -> bool {
     }
     if let Some(shadow) = machine.host.shadow.as_ref() {
         crate::println!(
-            "STELA_SPTM: shadow: {} pages filled ({} lower), {} refused, {} clears; {} native faults below the upper range",
-            shadow.fills, shadow.lower_fills, shadow.refused, shadow.clears, machine.host.lower_faults
+            "STELA_SPTM: shadow: {} pages filled ({} lower), {} refused, {} clears ({} for the table budget); {} native faults below the upper range",
+            shadow.fills, shadow.lower_fills, shadow.refused, shadow.clears, shadow.budget_clears, machine.host.lower_faults);
+        crate::println!(
+            "STELA_SPTM: shadow cache: {} regime switches, {} served by a kept shadow; TLBIs: {} page-wise, {} full",
+            machine.host.switches, machine.host.reused, machine.host.page_invalidations, machine.host.full_invalidations
         );
     }
     // Slice 1 passes once SPTM's own code ran natively on the board and the
