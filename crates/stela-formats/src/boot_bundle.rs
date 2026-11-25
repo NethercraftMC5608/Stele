@@ -82,6 +82,24 @@ pub struct Framebuffer {
 }
 
 impl Framebuffer {
+    /// A 32-bit boot framebuffer ending at `dram_end`, in whole guest pages.
+    pub fn at_dram_end(width: u64, height: u64, dram_end: u64) -> Option<Self> {
+        const PAGE: u64 = 0x4000;
+        let row_bytes = width.checked_mul(4)?;
+        let bytes = row_bytes.checked_mul(height)?.checked_next_multiple_of(PAGE)?;
+        if bytes == 0 {
+            return None;
+        }
+        Some(Self {
+            guest_pa: dram_end.checked_sub(bytes)?,
+            bytes,
+            row_bytes,
+            width,
+            height,
+            bits_per_pixel: 32,
+        })
+    }
+
     /// The UI scale macOS is given for this screen in `/chosen
     /// display-scale`: iBoot's rule, `boot_args.Video.v_depth` bits 16..23
     /// plus one. Stela's depth carries no scale bits, so it is 1, the scale
@@ -321,36 +339,32 @@ fn u32_value(value: u64) -> Vec<u8> {
     (value as u32).to_le_bytes().to_vec()
 }
 
-impl<'a> Verified<'a> {
-    fn file_bytes(&self, name: &str) -> Result<&'a [u8], BundleError> {
-        self.manifest.file(name)?;
-        self.files
+impl Manifest {
+    /// Where a patch can write within its declared loaded file region.
+    pub fn patch_address(&self, patch: &Patch) -> Result<u64, BundleError> {
+        let error = |reason| BundleError::Patch {
+            field: patch.field.clone(),
+            reason,
+        };
+        let region = self
+            .regions
             .iter()
-            .find(|(n, _)| *n == name)
-            .map(|(_, bytes)| *bytes)
-            .ok_or_else(|| manifest_error(format!("no file {name}")))
-    }
-
-    fn region_bytes(&self, region: &Region) -> Result<&'a [u8], BundleError> {
-        let file = self.file_bytes(&region.file)?;
-        let start = usize::try_from(region.file_offset).ok();
-        let end = start.and_then(|s| s.checked_add(usize::try_from(region.bytes).ok()?));
-        match (start, end) {
-            (Some(start), Some(end))
-                if end <= file.len() && region.bytes <= region.memory_bytes =>
-            {
-                Ok(&file[start..end])
-            }
-            _ => Err(BundleError::Region {
-                name: region.name.clone(),
-                reason: format!("lies outside {}", region.file),
-            }),
+            .find(|region| region.name == patch.region)
+            .ok_or_else(|| error(format!("names missing region {}", patch.region)))?;
+        let offset = patch.file_offset.checked_sub(region.file_offset);
+        if region.file == patch.file
+            && let Some(offset) = offset
+            && offset.checked_add(patch.bytes).is_some_and(|end| end <= region.bytes)
+            && let Some(pa) = region.guest_pa.checked_add(offset)
+        {
+            return Ok(pa);
         }
+        Err(error(format!("lies outside region {}", region.name)))
     }
 
     /// The bytes a patch slot takes on `machine`; `None` keeps the prepared
     /// bytes.
-    fn patch_value(
+    pub fn patch_value(
         &self,
         patch: &Patch,
         machine: &Machine,
@@ -361,13 +375,14 @@ impl<'a> Verified<'a> {
             reason: reason.into(),
         };
         let bytes = usize::try_from(patch.bytes).map_err(|_| error("size overflows"))?;
-        let options = &self.manifest.options;
+        let options = &self.options;
         let value = match (patch.source, patch.field.as_str()) {
             (PatchSource::DramSize, "/chosen dram-size" | "boot_args.memSizeActual") => {
                 Some(u64_value(machine.dram_bytes))
             }
             (PatchSource::DramSize, "boot_args.memSize") => Some(u64_value(
-                machine.managed_end().map_err(error)? - options.phys_base,
+                machine.managed_end().map_err(error)?.checked_sub(options.phys_base)
+                    .ok_or_else(|| error("managed RAM ends before physBase"))?,
             )),
             (PatchSource::Entropy, _) => {
                 let mut random = vec![0; bytes];
@@ -381,7 +396,7 @@ impl<'a> Verified<'a> {
                     let command_line = machine
                         .boot_args
                         .as_deref()
-                        .unwrap_or(&self.manifest.boot_args.command_line);
+                        .unwrap_or(&self.boot_args.command_line);
                     let verbose = command_line
                         .split_ascii_whitespace()
                         .any(|w| w == VERBOSE_FLAG);
@@ -449,6 +464,34 @@ impl<'a> Verified<'a> {
             }
         }
         Ok(value)
+    }
+}
+
+impl<'a> Verified<'a> {
+    fn file_bytes(&self, name: &str) -> Result<&'a [u8], BundleError> {
+        self.manifest.file(name)?;
+        self.files
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, bytes)| *bytes)
+            .ok_or_else(|| manifest_error(format!("no file {name}")))
+    }
+
+    fn region_bytes(&self, region: &Region) -> Result<&'a [u8], BundleError> {
+        let file = self.file_bytes(&region.file)?;
+        let start = usize::try_from(region.file_offset).ok();
+        let end = start.and_then(|s| s.checked_add(usize::try_from(region.bytes).ok()?));
+        match (start, end) {
+            (Some(start), Some(end))
+                if end <= file.len() && region.bytes <= region.memory_bytes =>
+            {
+                Ok(&file[start..end])
+            }
+            _ => Err(BundleError::Region {
+                name: region.name.clone(),
+                reason: format!("lies outside {}", region.file),
+            }),
+        }
     }
 
     /// Write every region into guest DRAM and fill the patch slots.
@@ -555,7 +598,7 @@ impl<'a> Verified<'a> {
         let mut patches = Vec::new();
         let mut kept = Vec::new();
         for patch in &self.manifest.patches {
-            let Some(value) = self.patch_value(patch, machine, entropy)? else {
+            let Some(value) = self.manifest.patch_value(patch, machine, entropy)? else {
                 if patch.required {
                     return Err(BundleError::Patch {
                         field: patch.field.clone(),
@@ -565,25 +608,7 @@ impl<'a> Verified<'a> {
                 kept.push(patch.field.clone());
                 continue;
             };
-            let region = self
-                .manifest
-                .regions
-                .iter()
-                .find(|r| r.name == patch.region)
-                .ok_or_else(|| BundleError::Patch {
-                    field: patch.field.clone(),
-                    reason: format!("names missing region {}", patch.region),
-                })?;
-            let inside = region.file == patch.file
-                && patch.file_offset >= region.file_offset
-                && patch.file_offset + patch.bytes <= region.file_offset + region.bytes;
-            if !inside {
-                return Err(BundleError::Patch {
-                    field: patch.field.clone(),
-                    reason: format!("lies outside region {}", region.name),
-                });
-            }
-            let guest_pa = region.guest_pa + (patch.file_offset - region.file_offset);
+            let guest_pa = self.manifest.patch_address(patch)?;
             if !write(guest_pa, &value) {
                 return Err(BundleError::Patch {
                     field: patch.field.clone(),

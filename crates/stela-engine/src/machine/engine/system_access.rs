@@ -174,6 +174,12 @@ impl<H: Host, D: Devices> Machine<H, D> {
 
     pub(super) fn exception_instruction(&mut self, operation: ExceptionOperation) -> Step {
         let pc = self.cpu.pc;
+        if let ExceptionOperation::SupervisorCall { immediate } = operation
+            && self.cpu.pstate.el == 0
+            && self.host.observes_user_svc()
+        {
+            self.host.report_user_svc(pc, immediate, &self.cpu.state);
+        }
         match operation {
             // HFGITR_EL2.SVC_EL1 and SVC_EL0 trap SVC from EL1, and from EL0
             // outside the host, to EL2 at the SVC itself (Arm

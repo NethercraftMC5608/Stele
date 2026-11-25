@@ -56,12 +56,13 @@ fn timed_out() {
 }
 
 /// A kick not yet taken by the core it woke.
-static KICK: AtomicBool = AtomicBool::new(false);
+static KICK: [AtomicBool; crate::sched::MAX_CPUS] =
+    [const { AtomicBool::new(false) }; crate::sched::MAX_CPUS];
 
 /// From the IDT, after EOI: the halt it ended is all a kick is for.
 pub(crate) fn kicked() {
     KICKS.fetch_add(1, Ordering::AcqRel);
-    KICK.store(true, Ordering::Release);
+    KICK[crate::arch::cpu_id()].store(true, Ordering::Release);
 }
 
 /// Wake dedicated core `cpu` for host device work.
@@ -73,7 +74,7 @@ pub(super) fn kick(cpu: usize) {
 
 /// Whether a kick arrived since the last look, consuming it.
 pub(super) fn take_kick() -> bool {
-    KICK.swap(false, Ordering::AcqRel)
+    KICK[crate::arch::cpu_id()].swap(false, Ordering::AcqRel)
 }
 
 /// Whether host device work woke this core (for `BootHost::wait_for_interrupt`).

@@ -220,8 +220,8 @@ syscall_entry:
     // Stash user RSP in this CPU's scratch slot, load this CPU's kernel stack.
     //
     // Per-CPU because two CPUs in `syscall` at once share nothing else here:
-    // each names its slot by APIC ID (EBX bits 24..31 from CPUID.1, masked
-    // to 8 slots), so CPU 1's entry cannot clobber CPU 0's saved RSP. IF is
+    // each resolves its APIC ID (EBX bits 24..31 from CPUID.1) to a
+    // dense slot, so CPU 1 cannot clobber CPU 0's saved RSP. IF is
     // still masked by FMASK across the sequence, so no interrupt can land
     // between the stash and the reload on the same CPU either.
     // Stash first, index second. The pushes below move RSP, so the value
@@ -247,7 +247,11 @@ syscall_entry:
     mov     $1, %eax
     cpuid
     shr     $24, %ebx
-    and     $7, %ebx
+    movzbl  nk_apic_slots(,%rbx), %ebx
+    cmp     ${cpu_slots}, %ebx
+    jb      1f
+    ud2
+1:
     lea     40(%rsp), %rax
     mov     %rax, user_rsp_scratch(,%rbx,8)
     mov     kernel_sp_scratch(,%rbx,8), %rax
@@ -316,7 +320,11 @@ syscall_entry:
     mov     $1, %eax
     cpuid
     shr     $24, %ebx
-    and     $7, %ebx
+    movzbl  nk_apic_slots(,%rbx), %ebx
+    cmp     ${cpu_slots}, %ebx
+    jb      1f
+    ud2
+1:
     mov     user_rsp_scratch(,%rbx,8), %rax
     pop     %rbx
     mov     %rax, 264(%rsp)                 # sp = user rsp
@@ -438,13 +446,13 @@ x86_syscall_init:
 .section ".data"
 .align 8
 // Per-CPU syscall scratch: word 0 of each 8-byte slot is the saved user RSP.
-// Indexed by (APIC ID & 7), matching arch::cpu_id. One global word was safe
+// Indexed by the LAPIC topology slot, matching arch::cpu_id. One global word was safe
 // with one CPU; two CPUs in `syscall` at once would store to the same word
 // and return to each other's stacks.
 .global user_rsp_scratch
-user_rsp_scratch:  .quad 0, 0, 0, 0, 0, 0, 0, 0
+user_rsp_scratch:  .zero 8 * {cpu_slots}
 .global kernel_sp_scratch
-kernel_sp_scratch: .quad 0, 0, 0, 0, 0, 0, 0, 0
+kernel_sp_scratch: .zero 8 * {cpu_slots}
 
 // ------------------------------------------------------------ resume_user --
 //

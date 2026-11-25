@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! macOS 27's first instructions on nk: the bundle loaded into guest DRAM
 //! and SPTM entered on the mounted M2 board (ROADMAP Phase 5,
-//! NK_STELA_SPTM_TEST). Slice 1 of the host port: MMU off only.
+//! NK_STELA_SPTM_TEST).
 //!
 //! CPU 0 reads the bundle through LKL: `bundle.json` gives each region's
 //! file, offset, length and guest physical address, the SPTM entry, its x0
@@ -14,9 +14,8 @@
 //!
 //! On dedicated CPU 3 the whole board is mounted (`mount.rs`'s inputs) and
 //! PE 0 starts at EL2, MMU off, at SPTM's entry -- as `stela.efi` starts it.
-//! `DramHost` has no shadow page tables yet, so the run ends where SPTM
-//! turns its MMU on (`set_regime` records the regime that asks), or at the
-//! first stop before that.
+//! Once the guest enables its MMU, `DramHost` fills x86 shadow translations
+//! for guest RAM. The current probe time-slices all guest PEs on this AP.
 
 use super::*;
 use alloc::{boxed::Box, string::String, sync::Arc, vec};
@@ -26,6 +25,7 @@ use stela_runtime::machine::mount;
 use stela_soc::machine::memory_resources::{t8112::cache::ZeroWayConfiguration, MemoryResources};
 use stela_soc::machine::{t8112_cold, ConsoleSink, UsbCables};
 use stela_engine::machine::FaultCause;
+use stela_formats::boot_bundle::{Framebuffer, Machine as BootMachine, Manifest, PatchSource, schema::Region};
 
 const DRAM: u64 = crate::paging::GUEST_DRAM_VA;
 /// Guest DRAM backed and registered: `NK_STELA_SPTM_DRAM_MIB` at build
@@ -38,10 +38,11 @@ const RAM_BYTES: u64 = match option_env!("NK_STELA_SPTM_DRAM_MIB") {
     None => 2 << 30,
 };
 /// Console silence that ends the run as a hang: `NK_STELA_SPTM_STALL` s at
-/// build time, 90 s by default.
+/// build time. Restore userspace can go quiet for more than 90 seconds
+/// while launchd boots its jobs under translation.
 const STALL_NS: u64 = match option_env!("NK_STELA_SPTM_STALL") {
     Some(s) => parse_seconds(s) * 1_000_000_000,
-    None => 90_000_000_000,
+    None => 240_000_000_000,
 };
 /// Frames below this are nk's own (identity mapped) and go back to it.
 const IDENTITY_LIMIT: u64 = 1 << 32;
@@ -49,6 +50,7 @@ const IDENTITY_LIMIT: u64 = 1 << 32;
 const CODE_PAGES: usize = 1024;
 /// Blocks per `run` call, between checks of the regime.
 const SLICE_BLOCKS: u64 = 2_000;
+const GUEST_CPU: usize = 3;
 /// Wall-clock bound on the whole run: `NK_STELA_SPTM_SECONDS` at build
 /// time, 60 s by default. Under QEMU TCG on an ARM Mac the guest runs two
 /// translations deep, so SPTM moves slowly.
@@ -70,6 +72,9 @@ const fn parse_seconds(s: &str) -> u64 {
 /// What CPU 0 prepared for the core.
 struct Prepared {
     tree: Vec<u8>,
+    framebuffer: Framebuffer,
+    disk: Option<super::disk::LinuxDisk>,
+    restore: bool,
     hpm: Vec<u8>,
     /// Each guest DRAM page's backing frame, in guest order.
     frames: Vec<u64>,
@@ -97,14 +102,16 @@ impl ConsoleSink for Console {
     }
 }
 
+const SCANOUT_MODE: stela_soc::scanout::Mode = stela_soc::scanout::Mode {
+    width: 1920,
+    height: 1080,
+    format: stela_soc::scanout::PixelFormat::Bgra8888,
+};
+
 struct Headless;
 impl stela_soc::scanout::Scanout for Headless {
     fn mode(&self) -> stela_soc::scanout::Mode {
-        stela_soc::scanout::Mode {
-            width: 1920,
-            height: 1080,
-            format: stela_soc::scanout::PixelFormat::Bgra8888,
-        }
+        SCANOUT_MODE
     }
     fn present(&mut self, _rows: &[u8]) -> stela_soc::Result<()> {
         Ok(())
@@ -128,13 +135,16 @@ struct DramHost {
     frames: Vec<u64>,
     /// The MMU-on shadow, once the guest turned its MMU on.
     shadow: Option<Box<Shadow>>,
-    /// Native accesses below `UPPER` with the MMU on that faulted: the
-    /// guest's lower range is not shadowed yet.
+    /// Native accesses below `UPPER` that the shadow could not fill.
     lower_faults: u64,
+    entered_el0: bool,
+    called_from_el0: bool,
+    trace_exec: bool,
+    exec_reports: u8,
 }
 
 impl DramHost {
-    fn new(frames: Vec<u64>) -> Option<Self> {
+    fn new(frames: Vec<u64>, trace_exec: bool) -> Option<Self> {
         let arena = crate::frames::alloc_contiguous(CODE_PAGES)?;
         Some(Self {
             arena,
@@ -149,6 +159,10 @@ impl DramHost {
             frames,
             shadow: None,
             lower_faults: 0,
+            entered_el0: false,
+            called_from_el0: false,
+            trace_exec,
+            exec_reports: 0,
         })
     }
     fn in_ram(at: u64, len: usize) -> bool {
@@ -258,14 +272,14 @@ impl Host for DramHost {
                 Ok(raw) => NativeExit::Exit { next_pc: raw as u64, kind: (raw >> 64) as u64 },
             };
         };
-        // MMU on: run on the shadow root; not-present upper accesses fill
+        // MMU on: run on the shadow root; not-present RAM accesses fill
         // in the trap and retry.
         let original = crate::arch::current_page_table();
         crate::arch::set_page_table(shadow.cr3());
         let context = &mut **shadow as *mut Shadow as *mut ();
         let raw = super::super::fault::invoke_filling(
             self.entry.0, at.0, state, core::iter::once(range), DRAM, None,
-            Some((shadow_fill, context)),
+            Some(super::super::fault::Filler { context, fill: shadow_fill, owns: shadow_owns }),
         );
         crate::arch::set_page_table(original);
         match raw {
@@ -283,16 +297,77 @@ impl Host for DramHost {
                 let cause = match shadow.translate(capture.address, capture.write) {
                     mmu::Outcome::Fault(fault) => FaultCause::Guest(fault),
                     mmu::Outcome::Unsupported(reason) => FaultCause::Translation(reason),
-                    mmu::Outcome::Mapped(t) if !DramHost::in_ram(t.physical, 1) => {
-                        FaultCause::Device { physical: t.physical }
+                    mmu::Outcome::Mapped(t) => {
+                        let page = capture.address & !4095;
+                        if shadow.regime.watch.blocks(page) {
+                            FaultCause::Watched
+                        } else if shadow.regime.tag_blocks(page, t.attributes) {
+                            FaultCause::TagChecked
+                        } else if DramHost::in_ram(t.physical, 1) {
+                            FaultCause::UnmappedRam
+                        } else {
+                            FaultCause::Device { physical: t.physical }
+                        }
                     }
-                    // RAM the shadow does not map: the lower range, or a
-                    // watched or tag-checked page.
-                    mmu::Outcome::Mapped(t) => FaultCause::Device { physical: t.physical },
                 };
                 NativeExit::Fault(capture.native(cause))
             }
         }
+    }
+    fn report(&mut self, event: &stela_engine::machine::Event) {
+        use stela_engine::machine::{Event, exception::Vector};
+        // TXM runs at EL0 in the upper half before XNU enters user space.
+        if let Event::Return { to_el: 0, pc, .. } = event {
+            if *pc < LOWER_END && !self.entered_el0 {
+                self.entered_el0 = true;
+                crate::println!("STELA_SPTM: entered lower guest EL0 at {pc:#x}");
+            }
+        }
+        if let Event::Exception { vector, from_el, syndrome, return_address, .. } = event {
+            let ec = (syndrome >> 26) & 0x3f;
+            let fsc = syndrome & 0x3f;
+            if *from_el == 0 && ec == 0x15 && *return_address <= LOWER_END && !self.called_from_el0 {
+                self.called_from_el0 = true;
+                crate::println!("STELA_SPTM: guest EL0 made an SVC at {:#x}", return_address - 4);
+            }
+            if *vector == Vector::SError
+                || (matches!(ec, 0x20 | 0x21 | 0x24 | 0x25)
+                    && matches!(fsc, 0x10 | 0x14..=0x17))
+            {
+                crate::println!("STELA_SPTM: ARM trap {event:x?}");
+            }
+        }
+    }
+    fn report_user_svc(&mut self, pc: u64, immediate: u16, state: &GuestState) {
+        if pc >= LOWER_END || immediate != 0x80 || self.exec_reports == 32 {
+            return;
+        }
+        // XNU bsd/kern/syscalls.master: execve(path, ...) and posix_spawn(pid, path, ...).
+        let (operation, address) = match state.x[16] {
+            59 => ("execve", state.x[0]),
+            244 => ("posix_spawn", state.x[1]),
+            _ => return,
+        };
+        let Some(shadow) = &self.shadow else { return };
+        let mut path = [0u8; 128];
+        for (offset, byte) in path.iter_mut().enumerate() {
+            let Some(va) = address.checked_add(offset as u64) else { return };
+            let mmu::Outcome::Mapped(t) = shadow.translate(va, false) else { return };
+            if !DramHost::in_ram(t.physical, 1) {
+                return;
+            }
+            *byte = unsafe { (t.physical as *const u8).read_volatile() };
+            if *byte == 0 {
+                if let Ok(path) = core::str::from_utf8(&path[..offset]) {
+                    self.exec_reports += 1;
+                    crate::println!("STELA_SPTM: guest {operation} {path:?}");
+                }
+                return;
+            }
+        }
+    }
+    fn observes_user_svc(&self) -> bool {
+        self.trace_exec
     }
     fn placement(&self) -> mmu::placement::Placement {
         mmu::placement::Placement::FourLevel { slices: 2 }
@@ -306,10 +381,11 @@ impl Host for DramHost {
             self.mmu = Some((regime.controls.sctlr, self.executions));
         }
         match self.shadow.as_mut() {
-            Some(shadow) => {
+            Some(shadow) if shadow.regime != *regime => {
                 shadow.clear();
                 shadow.regime = *regime;
             }
+            Some(_) => {}
             None => self.shadow = Shadow::new(self.frames.clone(), *regime).map(Box::new),
         }
     }
@@ -322,7 +398,7 @@ impl Host for DramHost {
         guest_count(self.tsc_base)
     }
     fn arm_timer(&mut self, deadline: Option<u64>) {
-        GUEST_TIMER.store(false, Ordering::Release);
+        guest_timer().store(false, Ordering::Release);
         match deadline {
             None => {
                 self.deadline = None;
@@ -336,7 +412,7 @@ impl Host for DramHost {
     }
     fn wait_for_interrupt(&mut self) {
         if self.hrtimer {
-            while !GUEST_TIMER.swap(false, Ordering::AcqRel) && !super::irq::take_kick() {
+            while !guest_timer().swap(false, Ordering::AcqRel) && !super::irq::take_kick() {
                 unsafe { core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack)) };
             }
             return;
@@ -348,16 +424,17 @@ impl Host for DramHost {
         }
     }
     fn poll_interrupt(&mut self) -> bool {
-        GUEST_TIMER.swap(false, Ordering::AcqRel)
+        guest_timer().swap(false, Ordering::AcqRel)
     }
 }
 
-// --- slice 2: shadow page tables for the guest's upper range ---------------
+// --- Demand-filled shadow page tables -------------------------------------
 
 /// The engine's four-level placement with two slices: guest addresses at or
 /// above this run natively at the same host address. Below it is nk's own
 /// half (PML4 entries 0..264), shared from the kernel's root.
 const UPPER: u64 = 0xffff_8000_0000_0000 + 2 * (1 << 41);
+const LOWER_END: u64 = 1 << 47;
 const UPPER_ENTRY: usize = ((UPPER >> 39) & 511) as usize;
 /// Shadow table frames between clears (each maps up to 2 MiB of leaves).
 const SHADOW_TABLES: usize = 1024;
@@ -373,15 +450,18 @@ impl mmu::TableMemory for DramTables {
     }
 }
 
-/// A private PML4 for the guest's core: nk's entries below `UPPER_ENTRY`
-/// copied from the kernel root, and the guest's upper range in tables this
-/// owns, filled on demand from the guest's own translation.
+/// A private PML4 for the guest's core. Upper guest mappings use private
+/// tables. Lower guest mappings can fill holes in nk's address space, after
+/// copying each shared table along their path.
 struct Shadow {
     root: *mut u64,
+    kernel: *const u64,
+    lower_private: bool,
     tables: Vec<*mut u8>,
     frames: Vec<u64>,
     regime: Regime,
     fills: u64,
+    lower_fills: u64,
     refused: u64,
     clears: u64,
 }
@@ -397,13 +477,17 @@ impl Shadow {
         unsafe { core::ptr::copy_nonoverlapping(kernel, root, UPPER_ENTRY) };
         // Capacity fixed here: fills run in the #PF trap and never allocate
         // from the heap there.
-        Some(Self { root, tables: Vec::with_capacity(SHADOW_TABLES), frames, regime, fills: 0, refused: 0, clears: 0 })
+        Some(Self { root, kernel, lower_private: false, tables: Vec::with_capacity(SHADOW_TABLES), frames, regime, fills: 0, lower_fills: 0, refused: 0, clears: 0 })
     }
     fn cr3(&self) -> u64 {
         self.root as u64
     }
     /// Drop every guest mapping: the guest changed its translation.
     fn clear(&mut self) {
+        if self.lower_private {
+            unsafe { core::ptr::copy_nonoverlapping(self.kernel, self.root, UPPER_ENTRY) };
+            self.lower_private = false;
+        }
         for i in UPPER_ENTRY..512 {
             unsafe { *self.root.add(i) = 0 };
         }
@@ -412,36 +496,72 @@ impl Shadow {
         }
         self.clears += 1;
     }
-    /// The next-level table under `entry`, made when absent. Private: only
-    /// entries at or above `UPPER_ENTRY` reach here.
-    unsafe fn next(&mut self, entry: *mut u64) -> Option<*mut u64> {
-        if *entry & crate::pte::VALID == 0 {
+    /// Follow the next table or take a private copy of the corresponding
+    /// kernel table. A host block mapping owns its entire span.
+    unsafe fn next(&mut self, entry: *mut u64, host: u64) -> Option<*mut u64> {
+        use crate::pte::{ADDR, HUGE, VALID, WRITABLE};
+        if host & (VALID | HUGE) == VALID | HUGE {
+            return None;
+        }
+        if *entry & VALID == 0 || *entry & ADDR == host & ADDR {
             if self.tables.len() == self.tables.capacity() {
                 return None;
             }
             let table = crate::frames::alloc()?;
             self.tables.push(table);
-            *entry = table as u64 | crate::pte::VALID | crate::pte::WRITABLE;
+            if host & VALID != 0 {
+                core::ptr::copy_nonoverlapping((host & ADDR) as *const u64, table.cast(), 512);
+            }
+            *entry = table as u64 | (host & !ADDR) | VALID | WRITABLE;
         }
-        Some((*entry & crate::pte::ADDR) as *mut u64)
+        Some((*entry & ADDR) as *mut u64)
     }
     unsafe fn map(&mut self, va: u64, frame: u64, writable: bool) -> bool {
-        let index = |shift: u32| ((va >> shift) & 511) as usize;
-        let Some(l3) = self.next(self.root.add(index(39))) else { return false };
-        let Some(l2) = self.next(l3.add(index(30))) else { return false };
-        let Some(l1) = self.next(l2.add(index(21))) else { return false };
-        *l1.add(index(12)) = frame
+        use crate::pte::{ADDR, VALID};
+        let mut shadow = self.root;
+        let mut host = self.kernel;
+        if va < UPPER {
+            // A partial fill can already have copied a table.
+            self.lower_private = true;
+        }
+        for shift in [39, 30, 21] {
+            let index = ((va >> shift) & 511) as usize;
+            let host_entry = if host.is_null() { 0 } else { *host.add(index) };
+            let Some(next) = self.next(shadow.add(index), host_entry) else { return false };
+            shadow = next;
+            host = if host_entry & VALID == 0 {
+                core::ptr::null()
+            } else {
+                (host_entry & ADDR) as *const u64
+            };
+        }
+        let index = ((va >> 12) & 511) as usize;
+        if !host.is_null() && *host.add(index) & VALID != 0 {
+            return false;
+        }
+        *shadow.add(index) = frame
             | crate::pte::VALID
             | crate::pte::NX
             | if writable { crate::pte::WRITABLE } else { 0 };
         true
     }
-    fn watched(&self, page: u64) -> bool {
-        self.regime
-            .watch
-            .ranges
-            .iter()
-            .any(|&(first, last)| first <= last && first <= page + 4095 && page <= last)
+    fn mapped(mut root: *const u64, address: u64) -> bool {
+        use crate::pte::{ADDR, HUGE, VALID};
+        for shift in [39, 30, 21, 12] {
+            let index = ((address >> shift) & 511) as usize;
+            let entry = unsafe { *root.add(index) };
+            if entry & VALID == 0 {
+                return false;
+            }
+            if shift == 12 || entry & HUGE != 0 {
+                return true;
+            }
+            root = (entry & ADDR) as *const u64;
+        }
+        unreachable!()
+    }
+    fn owns(&self, address: u64) -> bool {
+        !Self::mapped(self.kernel, address) && Self::mapped(self.root, address)
     }
     fn translate(&self, address: u64, write: bool) -> mmu::Outcome {
         let access = if write { mmu::Access::Write } else { mmu::Access::Read };
@@ -450,7 +570,7 @@ impl Shadow {
     /// Map the page at `address` if the guest maps it to DRAM with the
     /// access allowed; false leaves the fault to the engine.
     fn fill(&mut self, address: u64, write: bool) -> bool {
-        if address < UPPER {
+        if (LOWER_END..UPPER).contains(&address) {
             return false;
         }
         let page = address & !4095;
@@ -460,8 +580,9 @@ impl Shadow {
         };
         let physical = t.physical & !4095;
         let allowed = if write { t.writable } else { t.readable };
-        if !allowed || !DramHost::in_ram(physical, 4096) || self.watched(page)
+        if !allowed || !DramHost::in_ram(physical, 4096) || self.regime.watch.blocks(page)
             || self.regime.tag_blocks(page, t.attributes)
+            || Self::mapped(self.kernel, page)
         {
             self.refused += 1;
             return false;
@@ -471,6 +592,7 @@ impl Shadow {
             return false;
         }
         self.fills += 1;
+        self.lower_fills += u64::from(address < LOWER_END);
         true
     }
 }
@@ -487,27 +609,47 @@ unsafe fn shadow_fill(context: *mut (), address: u64, write: bool) -> bool {
     (*(context as *mut Shadow)).fill(address, write)
 }
 
-/// A JSON number at `path` in `bundle.json`.
-fn number(value: &serde_json::Value, path: &[&str]) -> Option<u64> {
-    path.iter().try_fold(value, |v, key| v.get(*key))?.as_u64()
+unsafe fn shadow_owns(context: *mut (), address: u64) -> bool {
+    (*(context as *const Shadow)).owns(address)
 }
 
-/// Read `dir/bundle.json` and every region's bytes through LKL into fresh
-/// guest DRAM. CPU 0 (LKL's).
+/// Read the bundle manifest and stream its regions into guest DRAM on CPU 0.
 fn prepare(dir: &str) -> Result<Prepared, String> {
     let source = Source::open(dir);
     crate::println!("STELA_SPTM: bundle from {}", source.describe());
-    let read = |name: &str| source.read(name);
-    let json = read("bundle.json")?;
-    let bundle: serde_json::Value =
-        serde_json::from_slice(&json).map_err(|e| alloc::format!("bundle.json: {e}"))?;
-    let entry = number(&bundle, &["entry", "physical_address"]).ok_or("bundle has no entry")?;
-    let x0 = number(&bundle, &["entry_x0"]).ok_or("bundle has no entry x0")?;
-    let read_only = (
-        number(&bundle, &["read_only_region", "base"]).ok_or("no read-only region")?,
-        number(&bundle, &["read_only_region", "bytes"]).ok_or("no read-only region")?,
-    );
-    let regions = bundle.get("regions").and_then(|r| r.as_array()).ok_or("bundle has no regions")?;
+    let bundle = Manifest::parse(&source.read("bundle.json")?)
+        .map_err(|error| alloc::format!("{error}"))?;
+    let hpm = source.read("USB-C_HPM,46-P01-AP.bin")?;
+    let entry = bundle.entry.physical_address;
+    let x0 = bundle.entry_x0;
+    let read_only = bundle.read_only_region.as_ref().ok_or("no read-only region")?;
+    let read_only = (read_only.base, read_only.bytes);
+    let regions = &bundle.regions;
+    let framebuffer = Framebuffer::at_dram_end(
+        u64::from(SCANOUT_MODE.width),
+        u64::from(SCANOUT_MODE.height),
+        DRAM + RAM_BYTES,
+    )
+    .ok_or("guest framebuffer dimensions exceed DRAM")?;
+    if bundle.options.dram_base != DRAM
+        || bundle.options.phys_base < DRAM
+        || bundle.top_of_kernel_data > framebuffer.guest_pa
+        || bundle.carveouts.iter().any(|range| {
+            range.base < DRAM
+                || range.base.checked_add(range.bytes).is_none_or(|end| end > framebuffer.guest_pa)
+        })
+    {
+        return Err("bundle layout does not leave room for the guest framebuffer".into());
+    }
+    for region in regions {
+        if region.guest_pa < DRAM
+            || region.bytes > region.memory_bytes
+            || region.guest_pa.checked_add(region.memory_bytes)
+                .is_none_or(|end| end > framebuffer.guest_pa)
+        {
+            return Err(alloc::format!("region {} is outside managed guest DRAM", region.name));
+        }
+    }
 
     // Frame by frame: guest DRAM is mapped page by page, so it need not be
     // physically contiguous, and contiguous runs are scarce.
@@ -545,99 +687,114 @@ fn prepare(dir: &str) -> Result<Prepared, String> {
         (RAM_BYTES - (high_before - crate::frames::high_free())) >> 20
     );
 
-    let mut loaded = 0u64;
-    for region in regions {
-        let file = region.get("file").and_then(|f| f.as_str()).ok_or("region without file")?;
-        let pa = number(region, &["guest_pa"]).ok_or("region without guest_pa")?;
-        let bytes = number(region, &["bytes"]).ok_or("region without bytes")?;
-        let offset = number(region, &["file_offset"]).ok_or("region without file_offset")?;
-        let memory = number(region, &["memory_bytes"]).unwrap_or(bytes);
-        if bytes == 0 {
-            continue;
+    let load = || -> Result<(Vec<u8>, u64), String> {
+        let mut loaded = 0;
+        for region in regions.iter().filter(|region| region.bytes != 0) {
+            source.pread_into(&region.file, region.file_offset, region.guest_pa, region.bytes)?;
+            loaded += region.bytes;
         }
-        if pa < DRAM || pa + memory.max(bytes) > DRAM + RAM_BYTES {
-            return Err(alloc::format!("region {file} at {pa:#x} is outside guest DRAM"));
+
+        // The cacheless T8112 memory plan needs the same flag as stela.efi.
+        let mut command_line = bundle.boot_args.command_line.clone();
+        if !command_line.split_ascii_whitespace().any(|word| word == "-disable_mcc") {
+            command_line.push_str(" -disable_mcc");
         }
-        source.pread_into(file, offset, pa, bytes)?;
-        loaded += bytes;
-    }
-    // The bundle's boot-time patches a bootloader fills (`stela.efi` does so
-    // at boot): here the required entropy fields -- /chosen random-seed and
-    // cl4-entropy, the hibernation CTRR keys -- from RDRAND, at each patch's
-    // place inside its loaded region. The timebase and DRAM size already
-    // hold this machine's values; framebuffer and NVRAM fields stay unset.
-    let mut seeded = 0usize;
-    for patch in bundle.get("patches").and_then(|p| p.as_array()).into_iter().flatten() {
-        if patch.get("source").and_then(|s| s.as_str()) != Some("entropy") {
-            continue;
-        }
-        let field = patch.get("field").and_then(|f| f.as_str()).unwrap_or("?");
-        let name = patch.get("region").and_then(|r| r.as_str()).ok_or("patch without region")?;
-        let bytes = number(patch, &["bytes"]).ok_or("patch without bytes")? as usize;
-        let at = patch
-            .get("file_offset")
-            .and_then(|o| o.as_u64())
-            .ok_or("patch without file_offset")?;
-        let region = regions
-            .iter()
-            .find(|r| r.get("name").and_then(|n| n.as_str()) == Some(name))
-            .ok_or_else(|| alloc::format!("patch {field}: no region {name}"))?;
-        let base = number(region, &["guest_pa"]).ok_or("region without guest_pa")?;
-        let start = number(region, &["file_offset"]).ok_or("region without file_offset")?;
-        let pa = base + (at - start);
-        let mut random = vec![0u8; bytes];
-        super::mount::rdrand_fill(&mut random)
-            .map_err(|e| alloc::format!("patch {field}: {e:?}"))?;
-        unsafe { core::ptr::copy_nonoverlapping(random.as_ptr(), pa as *mut u8, bytes) };
-        seeded += bytes;
-        crate::println!("STELA_SPTM: patched {} ({} random bytes at {:#x})", field, bytes, pa);
-    }
-    let _ = seeded;
-    // The kernel command line, as `stela.efi` finishes it at boot: the cold
-    // T8112 memory plan nk mounts is cacheless, so XNU must get
-    // `-disable_mcc` (stela_loader::boot_policy::mcc), or its
-    // AppleT8112MemCacheController waits for cache ways that never come on.
-    for patch in bundle.get("patches").and_then(|p| p.as_array()).into_iter().flatten() {
-        if patch.get("source").and_then(|s| s.as_str()) != Some("boot-args") {
-            continue;
-        }
-        let name = patch.get("region").and_then(|r| r.as_str()).ok_or("patch without region")?;
-        let bytes = number(patch, &["bytes"]).ok_or("patch without bytes")? as usize;
-        let at = number(patch, &["file_offset"]).ok_or("patch without file_offset")?;
-        let region = regions
-            .iter()
-            .find(|r| r.get("name").and_then(|n| n.as_str()) == Some(name))
-            .ok_or("boot-args patch: no region")?;
-        let pa = number(region, &["guest_pa"]).ok_or("region without guest_pa")?
-            + (at - number(region, &["file_offset"]).ok_or("region without file_offset")?);
-        let line = unsafe { core::slice::from_raw_parts_mut(pa as *mut u8, bytes) };
-        let len = line.iter().position(|&b| b == 0).unwrap_or(bytes);
-        let present = core::str::from_utf8(&line[..len])
-            .map(|l| l.split_ascii_whitespace().any(|w| w == "-disable_mcc"))
-            .unwrap_or(false);
-        const ARG: &[u8] = b" -disable_mcc";
-        if !present {
-            if len + ARG.len() >= bytes {
-                return Err(String::from("boot-args: no room for -disable_mcc"));
+        crate::println!("STELA_SPTM: boot-args: {}", command_line);
+        let machine = BootMachine {
+            dram_base: DRAM,
+            ram_bytes: RAM_BYTES,
+            dram_bytes: RAM_BYTES,
+            timebase_hz: 24_000_000,
+            framebuffer: Some(framebuffer),
+            boot_args: Some(command_line),
+            nvram: None,
+        };
+        for patch in &bundle.patches {
+            let value = bundle
+                .patch_value(patch, &machine, &mut super::mount::rdrand_fill)
+                .map_err(|error| alloc::format!("{error}"))?;
+            let Some(value) = value else {
+                if patch.required {
+                    return Err(alloc::format!("patch {} has no value", patch.field));
+                }
+                continue;
+            };
+            let pa = bundle.patch_address(patch).map_err(|error| alloc::format!("{error}"))?;
+            // The region and patch extent have been checked before writing.
+            unsafe { core::ptr::copy_nonoverlapping(value.as_ptr(), pa as *mut u8, value.len()) };
+            if patch.source == PatchSource::Entropy {
+                crate::println!("STELA_SPTM: patched {} ({} random bytes at {:#x})", patch.field, value.len(), pa);
             }
-            line[len..len + ARG.len()].copy_from_slice(ARG);
-            line[len + ARG.len()] = 0;
         }
-        let shown = String::from_utf8_lossy(&line[..line.iter().position(|&b| b == 0).unwrap_or(bytes)]).into_owned();
-        crate::println!("STELA_SPTM: boot-args: {}", shown);
-    }
+        Ok((prepared_tree(regions, x0)?, loaded))
+    };
+    let (tree, loaded) = match load() {
+        Ok(result) => result,
+        Err(error) => {
+            release_dram(&frames);
+            return Err(error);
+        }
+    };
+    crate::println!(
+        "STELA_SPTM: boot framebuffer {}x{} at {:#x}, stride {}, {:#x} bytes",
+        framebuffer.width, framebuffer.height, framebuffer.guest_pa, framebuffer.row_bytes, framebuffer.bytes
+    );
     crate::println!(
         "STELA_SPTM: {} regions, {} MiB loaded into guest DRAM at {:#x} ({} MiB backed)",
         regions.len(), loaded >> 20, DRAM, RAM_BYTES >> 20
     );
     Ok(Prepared {
-        tree: read("devicetree.adt")?,
-        hpm: read("USB-C_HPM,46-P01-AP.bin")?,
+        tree,
+        framebuffer,
+        disk: None,
+        restore: bundle.boot_args.command_line.split_ascii_whitespace().any(|word| word == "-restore"),
+        hpm,
         frames,
         entry,
         x0,
         read_only,
     })
+}
+
+/// Keep older bundles' PMGR metadata consistent with their hidden ANE.
+/// Apply this after all file-offset patches, which refer to the original ADT.
+fn prepared_tree(regions: &[Region], x0: u64) -> Result<Vec<u8>, String> {
+    use stela_loader::{apple_device_tree::DeviceTree, boot_args::offset::DEVICE_TREE_LENGTH};
+
+    let region = |name| {
+        regions
+            .iter()
+            .find(|region| region.name == name)
+            .map(|region| (region.guest_pa, region.bytes))
+    };
+    let (pa, bytes) = region("DeviceTree").ok_or("missing DeviceTree region")?;
+    if bytes == 0 || !DramHost::in_ram(pa, bytes as usize) {
+        return Err("DeviceTree region outside guest DRAM".into());
+    }
+    // The region has been loaded and patched on CPU 0, before the guest starts.
+    let loaded = unsafe { core::slice::from_raw_parts_mut(pa as *mut u8, bytes as usize) };
+    let mut tree = DeviceTree::parse(loaded).map_err(|error| alloc::format!("DeviceTree: {error}"))?;
+    if !stela_loader::devices::withdraw_hidden_ane_energy(&mut tree) {
+        return Ok(loaded.to_vec());
+    }
+    let (args_pa, args_bytes) = region("BootArgs").ok_or("missing BootArgs region")?;
+    if args_pa != x0
+        || args_bytes < (DEVICE_TREE_LENGTH + 4) as u64
+        || !DramHost::in_ram(args_pa, args_bytes as usize)
+        || (args_pa < pa + bytes && pa < args_pa + args_bytes)
+    {
+        return Err("BootArgs region cannot supply the DeviceTree length".into());
+    }
+    let length = unsafe { (args_pa as *mut u8).add(DEVICE_TREE_LENGTH).cast::<u32>() };
+    if u64::from(u32::from_le(unsafe { length.read_unaligned() })) != bytes {
+        return Err("BootArgs DeviceTree length differs from the loaded region".into());
+    }
+    let tree = tree.serialize();
+    loaded[..tree.len()].copy_from_slice(&tree);
+    loaded[tree.len()..].fill(0);
+    unsafe { length.write_unaligned((tree.len() as u32).to_le()) };
+    crate::println!("STELA_SPTM: withdrawn PMGR energy counter for hidden ANE");
+    Ok(tree)
 }
 
 /// Where the bundle comes from: files in a directory of Linux's rootfs (the
@@ -800,14 +957,30 @@ fn pread_into(path: &str, offset: u64, pa: u64, bytes: u64) -> Result<(), String
 
 pub(crate) fn sptm_probe(dir: &str) -> bool {
     static PASSED: AtomicBool = AtomicBool::new(false);
-    match prepare(dir) {
-        Ok(prepared) => unsafe { *(&raw mut PREPARED) = Some(prepared) },
+    let mut prepared = match prepare(dir) {
+        Ok(prepared) => prepared,
         Err(error) => {
             crate::println!("STELA_SPTM: cannot prepare the bundle: {}", error);
             crate::println!("STELA_SPTM_FAIL");
             return false;
         }
+    };
+    let mut disk_worker = None;
+    if option_env!("NK_STELA_SPTM_NVME_SSD") == Some("1") {
+        match super::disk::Worker::open() {
+            Ok((worker, disk)) => {
+                disk_worker = Some(worker);
+                prepared.disk = Some(disk);
+            }
+            Err(error) => {
+                release_dram(&prepared.frames);
+                crate::println!("STELA_SPTM: {error}");
+                crate::println!("STELA_SPTM_FAIL");
+                return false;
+            }
+        }
     }
+    unsafe { *(&raw mut PREPARED) = Some(prepared) };
     extern "C" fn on_core(_: usize) {
         const PAGES: usize = 512;
         let stack = crate::frames::alloc_contiguous(PAGES).expect("SPTM stack");
@@ -823,10 +996,20 @@ pub(crate) fn sptm_probe(dir: &str) -> bool {
     extern "C" fn run_sptm() {
         PASSED.store(enter_sptm(), Ordering::Release);
     }
-    let Some(id) = crate::sched::dedicate_cpu(3, "vcpu-sptm", on_core, 0) else {
+    let Some(id) = crate::sched::dedicate_cpu(GUEST_CPU, "vcpu-sptm", on_core, 0) else {
+        if let Some(prepared) = unsafe { (*(&raw mut PREPARED)).take() } {
+            release_dram(&prepared.frames);
+        }
         crate::println!("STELA_SPTM: dedicate_cpu(3) refused (needs NK_SMP)");
         return false;
     };
+    if let Some(worker) = &mut disk_worker {
+        while !crate::sched::finished(id) {
+            if !worker.service(GUEST_CPU) {
+                crate::sched::sleep_ticks(1);
+            }
+        }
+    }
     crate::sched::join(id);
     let passed = PASSED.load(Ordering::Acquire);
     crate::println!("{}", if passed { "STELA_SPTM_PASS" } else { "STELA_SPTM_FAIL" });
@@ -841,6 +1024,33 @@ fn enter_sptm() -> bool {
     let passed = run_board(p);
     release_dram(&frames);
     passed
+}
+
+fn report_restore_usb(log: stela_soc::machine::UsbLog) {
+    use stela_runtime::restore::{plist, session::PROTOCOL};
+    use stela_soc::machine::UsbLog;
+
+    match log {
+        UsbLog::Descriptor(descriptor) if descriptor.kind == 2 => {
+            crate::println!("STELA_SPTM: USB host read a guest configuration descriptor");
+        }
+        UsbLog::QueryTypeReply(bytes) => {
+            let supported = plist::decode(&bytes, plist::Limits::default()).is_ok_and(|reply| {
+                reply.required("Type").and_then(plist::Value::string) == Ok("com.apple.mobile.restored")
+                    && reply.required("Result").and_then(plist::Value::string) == Ok("Success")
+                    && reply.required("RestoreProtocolVersion").and_then(plist::Value::uint) == Ok(PROTOCOL)
+            });
+            if supported {
+                crate::println!("STELA_SPTM: restored answered QueryType over USB (protocol {PROTOCOL})");
+            } else {
+                crate::println!("STELA_SPTM: unsupported restored QueryType reply ({} bytes)", bytes.len());
+            }
+        }
+        UsbLog::MuxRejected(bytes) => {
+            crate::println!("STELA_SPTM: USB mux rejected guest data ({} logged bytes)", bytes.len());
+        }
+        _ => {}
+    }
 }
 
 fn run_board(p: Prepared) -> bool {
@@ -893,18 +1103,30 @@ fn run_board(p: Prepared) -> bool {
     let hpm: &'static [u8] = Box::leak(p.hpm.into_boxed_slice());
     let firmware = move |name: &str| (name == "USB-C_HPM,46-P01-AP.bin").then_some(hpm);
     let console_bytes = Arc::new(core::sync::atomic::AtomicU64::new(0));
+    let backing: Box<dyn stela_driver_base::block::BlockDevice> = match p.disk {
+        Some(mut disk) => {
+            use stela_driver_base::block::BlockDevice;
+            if let Err(error) = disk.read(0, &mut [0; 4096]).and_then(|()| disk.flush()) {
+                crate::println!("STELA_SPTM: cannot check the LKL SSD: {error}");
+                return false;
+            }
+            Box::new(disk)
+        }
+        None => Box::new(super::mount::SparseDisk::new(super::mount::SSD_BLOCKS)),
+    };
+    let restore_usb = p.restore && option_env!("NK_STELA_SPTM_RESTORE_USB") == Some("1");
     let inputs = mount::Inputs {
         programmed,
         reset: Some(p.entry),
         now: 0,
         wall: None,
         rtc_anchor: None,
-        backing: Some(Box::new(super::mount::SparseDisk::new(super::mount::SSD_BLOCKS))),
+        backing: Some(backing),
         sep_state: None,
         sep_observe: false,
         sep_recovery_policy_nonce: None,
         entropy: Box::new(super::mount::rdrand_fill),
-        restore: false,
+        restore: restore_usb,
         input: false,
         usb: UsbCables::default(),
         scanout: Some(Box::new(Headless)),
@@ -918,16 +1140,26 @@ fn run_board(p: Prepared) -> bool {
             crate::println!("  mount: {}", line);
         }
     };
-    let devices = match mount::devices_with_memory(&board, console, inputs, Some(MemoryResources::T8112Cold(plan)), &mut log) {
-        Ok((devices, _)) => devices,
+    let (mut devices, usb) = match mount::devices_with_memory(&board, console, inputs, Some(MemoryResources::T8112Cold(plan)), &mut log) {
+        Ok(mounted) => mounted,
         Err(error) => {
             crate::println!("STELA_SPTM: mount refused: {:?}", error);
             return false;
         }
     };
+    if restore_usb {
+        let result = usb
+            .ok_or(stela_contracts::refuse!("the board has no restore USB port"))
+            .and_then(|usb| devices.usb_client(usb)?.query_type());
+        if let Err(error) = result {
+            crate::println!("STELA_SPTM: restore USB probe refused: {error}");
+            return false;
+        }
+        crate::println!("STELA_SPTM: restore USB host cabled, QueryType queued");
+    }
 
     let chip = board.cpus.chip;
-    let Some(host) = DramHost::new(p.frames.clone()) else {
+    let Some(host) = DramHost::new(p.frames.clone(), restore_usb) else {
         crate::println!("STELA_SPTM: no frames for the code arena");
         return false;
     };
@@ -949,14 +1181,41 @@ fn run_board(p: Prepared) -> bool {
     let start = crate::timer::time_ns();
     let mut slices = 0u64;
     let mut reported = start;
+    let mut framebuffer_drawn = false;
+    let mut usb_status = Vec::new();
     let (mut last_bytes, mut last_output) = (0u64, start);
     let stop = loop {
         // The budget is a total: the engine stops once its block count
         // reaches it, so each slice asks for SLICE_BLOCKS more.
         let stop = machine.run(machine.statistics.blocks + SLICE_BLOCKS);
+        for requirement in machine.take_unmodeled() {
+            crate::println!("STELA_SPTM: degraded {requirement}");
+        }
+        while let Some(log) = machine.devices.take_usb_log() {
+            report_restore_usb(log);
+        }
         slices += 1;
         if crate::timer::time_ns() - reported > 10_000_000_000 {
             reported = crate::timer::time_ns();
+            if restore_usb {
+                let status = machine.devices.usb_diagnostics();
+                if status != usb_status {
+                    for port in &status {
+                        crate::println!("STELA_SPTM: restore USB {port}");
+                    }
+                    usb_status = status;
+                }
+            }
+            if !framebuffer_drawn {
+                let framebuffer = p.framebuffer;
+                let pixels = framebuffer.row_bytes * framebuffer.height / 4;
+                let base = framebuffer.guest_pa as *const u32;
+                framebuffer_drawn = (0..pixels as usize)
+                    .any(|pixel| unsafe { base.add(pixel).read_volatile() } & 0x00ff_ffff != 0);
+                if framebuffer_drawn {
+                    crate::println!("STELA_SPTM: guest drew into the boot framebuffer");
+                }
+            }
             crate::println!(
                 "STELA_SPTM: ... {} s: {} blocks, {} native runs, pc {:#x}, console bytes {}",
                 (reported - start) / 1_000_000_000, machine.statistics.blocks, machine.host.executions,
@@ -974,7 +1233,7 @@ fn run_board(p: Prepared) -> bool {
         if stalled {
             crate::println!("STELA_SPTM: console silent for {} s: stopping to dump state", STALL_NS / 1_000_000_000);
         }
-        let more = matches!(stop, Stop::Budget) && crate::timer::time_ns() - start < RUN_NS && !stalled;
+        let more = matches!(stop, Stop::Budget | Stop::Waiting) && crate::timer::time_ns() - start < RUN_NS && !stalled;
         if !more {
             break stop;
         }
@@ -1042,8 +1301,8 @@ fn run_board(p: Prepared) -> bool {
     }
     if let Some(shadow) = machine.host.shadow.as_ref() {
         crate::println!(
-            "STELA_SPTM: shadow: {} pages filled in the #PF path, {} refused, {} clears; {} native faults below the upper range",
-            shadow.fills, shadow.refused, shadow.clears, machine.host.lower_faults
+            "STELA_SPTM: shadow: {} pages filled ({} lower), {} refused, {} clears; {} native faults below the upper range",
+            shadow.fills, shadow.lower_fills, shadow.refused, shadow.clears, machine.host.lower_faults
         );
     }
     // Slice 1 passes once SPTM's own code ran natively on the board and the

@@ -66,14 +66,24 @@ def main():
     parser.add_argument("--timeout", type=float, default=150)
     parser.add_argument("--cpu", help="QEMU -cpu model (default: QEMU's own)")
     parser.add_argument("--memory", default="4G", help="QEMU -m (default 4G)")
+    parser.add_argument("--smp", default="4", help="QEMU CPU count or topology (default 4)")
     parser.add_argument("--accel", help="QEMU -accel (kvm on a Linux x86 host)")
     parser.add_argument("--disk", type=Path,
                         help="attach this raw image read-only as an NVMe drive (tests/bundle-disk.py)")
+    parser.add_argument("--ssd", type=Path,
+                        help="attach a separate writable raw image as NVMe namespace 2")
     parser.add_argument("--add", action="append", default=[], metavar="HOST:GUEST",
                         help="add a host file to the initrd at a guest path")
     parser.add_argument("--require", action="append", default=[],
                         help="markers to require (default DEDICATED_PASS and HRTIMER_PASS)")
     args = parser.parse_args()
+    if args.ssd and not args.disk:
+        parser.error("--ssd requires --disk for the read-only bundle namespace")
+    if args.ssd:
+        if not args.ssd.is_file() or not args.disk.is_file():
+            parser.error("--disk and --ssd must be existing image files")
+        if args.ssd.samefile(args.disk):
+            parser.error("--disk and --ssd must name different files")
     want = args.require or ["DEDICATED_PASS", "HRTIMER_PASS"]
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -86,9 +96,17 @@ def main():
         initrd.write_bytes(with_files(args.initrd.read_bytes(), files))
     cpu = (["-cpu", args.cpu] if args.cpu else []) + (["-accel", args.accel] if args.accel else [])
     if args.disk:
-        cpu += ["-drive", f"file={args.disk.resolve(strict=True)},if=none,id=bundle,format=raw,readonly=on",
-                "-device", "nvme,drive=bundle,serial=nkbundle"]
-    proc = subprocess.Popen([args.qemu, "-M", "q35", "-m", args.memory, "-smp", "4", *cpu,
+        cpu += ["-drive", f"file={args.disk.resolve(strict=True)},if=none,id=bundle,format=raw,readonly=on"]
+        if args.ssd:
+            cpu += [
+                "-drive", f"file={args.ssd.resolve(strict=True)},if=none,id=install,format=raw",
+                "-device", "nvme,id=stele-nvme,serial=nkbundle",
+                "-device", "nvme-ns,drive=bundle,bus=stele-nvme,nsid=1",
+                "-device", "nvme-ns,drive=install,bus=stele-nvme,nsid=2",
+            ]
+        else:
+            cpu += ["-device", "nvme,drive=bundle,serial=nkbundle"]
+    proc = subprocess.Popen([args.qemu, "-M", "q35", "-m", args.memory, "-smp", args.smp, *cpu,
                              "-kernel", str(args.kernel.resolve(strict=True)),
                              "-initrd", str(initrd),
                              "-display", "none", "-serial", f"file:{log}",

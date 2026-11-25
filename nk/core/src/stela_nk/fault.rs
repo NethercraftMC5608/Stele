@@ -1,5 +1,5 @@
-//! BSP-only, interrupt-masked recovery from an owned native invocation.
-//! The trap hook allocates nothing and never calls the engine or Linux.
+//! Per-CPU, interrupt-masked recovery from an owned native invocation.
+//! The trap hook never allocates from the heap or calls the engine or Linux.
 use crate::interrupts_x86::TrapFrame;
 use core::sync::atomic::{AtomicPtr, Ordering};
 use stela_compiler::{
@@ -54,17 +54,20 @@ struct Recovery {
     fill: Option<Filler>,
 }
 
-/// A shadow fill a host offers the #PF path: `(fill, context)`. `fill` runs
-/// in the trap, IF masked, on the faulting core, with the not-present
-/// address and whether it was a write; true means the shadow now maps the
-/// page and the faulting instruction is retried natively. It must not block
-/// or call the engine.
-pub(super) type Filler = (unsafe fn(*mut (), u64, bool) -> bool, *mut ());
-static ACTIVE: AtomicPtr<Recovery> = AtomicPtr::new(core::ptr::null_mut());
+/// Shadow operations invoked in the #PF path with interrupts masked.
+pub(super) struct Filler {
+    pub context: *mut (),
+    /// A not-present access can retry once its page is mapped.
+    pub fill: unsafe fn(*mut (), u64, bool) -> bool,
+    /// A protection fault can reach the ARM walker only on a guest leaf.
+    pub owns: unsafe fn(*mut (), u64) -> bool,
+}
+static ACTIVE: [AtomicPtr<Recovery>; crate::sched::MAX_CPUS] =
+    [const { AtomicPtr::new(core::ptr::null_mut()) }; crate::sched::MAX_CPUS];
 
 /// # Safety
-/// Called only by the pre-SMP host for finite trusted code. All extents are
-/// immutable RX storage kept alive through the invocation and trap return.
+/// The caller stays on the same CPU with interrupts masked. All extents
+/// are immutable RX storage kept alive through the invocation and trap return.
 pub(super) unsafe fn invoke(
     thunk: *const u8,
     entry: usize,
@@ -108,8 +111,9 @@ pub(super) unsafe fn invoke_filling(
         recovery.ranges[recovery.count] = range;
         recovery.count += 1;
     }
+    let active = &ACTIVE[crate::arch::cpu_id()];
     assert!(
-        ACTIVE
+        active
             .compare_exchange(
                 core::ptr::null_mut(),
                 &raw mut recovery,
@@ -120,7 +124,7 @@ pub(super) unsafe fn invoke_filling(
         "nested native boot entry"
     );
     let raw = super::host::nk_stela_system_enter(thunk, entry, state, &raw mut recovery.stack);
-    ACTIVE.store(core::ptr::null_mut(), Ordering::Release);
+    active.store(core::ptr::null_mut(), Ordering::Release);
     match recovery.fault {
         Some(fault) => Err(fault),
         None => Ok(raw),
@@ -134,7 +138,7 @@ pub(crate) unsafe fn recover_native_fault(f: &mut TrapFrame, fp: *const u8) -> b
     if f.cs & 3 != 0 || !matches!(f.vector, 6 | 13 | 14) {
         return false;
     }
-    let Some(active) = ACTIVE.load(Ordering::Acquire).as_mut() else {
+    let Some(active) = ACTIVE[crate::arch::cpu_id()].load(Ordering::Acquire).as_mut() else {
         return false;
     };
     if active.stack == 0
@@ -158,21 +162,24 @@ pub(crate) unsafe fn recover_native_fault(f: &mut TrapFrame, fp: *const u8) -> b
     // A not-present data access the host's shadow can fill: map it and
     // retry the instruction natively, as the host's own #PF gate would.
     if f.vector == 14 && f.error & 0b1_1001 == 0 {
-        if let Some((fill, context)) = active.fill {
-            if fill(context, address, f.error & 2 != 0) {
+        if let Some(filler) = &active.fill {
+            if (filler.fill)(filler.context, address, f.error & 2 != 0) {
                 return true;
             }
         }
     }
-    let shadow = active
+    let aperture = active
         .shadow_window
         .is_some_and(|(s, e)| s <= address && address < e);
     if f.vector == 14 {
         // Only the separately owned shadow aperture can project a present
         // protection fault into an ARM permission fault, after a fresh walk.
-        if active.shadow_window.is_some() && !shadow {
+        if active.shadow_window.is_some() && !aperture {
             return false;
         }
+        let shadow = aperture
+            || (f.error == 3
+                && active.fill.as_ref().is_some_and(|filler| (filler.owns)(filler.context, address)));
         if f.error & !(if shadow { 3 } else { 2 }) != 0 {
             return false;
         }

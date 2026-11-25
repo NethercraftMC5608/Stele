@@ -24,6 +24,8 @@ def main():
         ("sparse", ["--smp", "6,sockets=2,cores=3,threads=1"],
          ["cpu3 online (apic 4)", "cpu4 online (apic 5)", "cpu5 online (apic 6)", "6 CPUs total"]),
         ("eight", ["--smp", "8"], ["cpu7 online (apic 7)", "8 CPUs total"]),
+        ("nine", ["--smp", "9,sockets=3,cores=3,threads=1"],
+         ["cpu8 online (apic 10)", "9 CPUs total"]),
         ("legacy", ["--machine", "q35,acpi=off"], ["BSP only, legacy PCI config", "functions via CF8/CFC", "1 CPUs total"]),
     ]
     for name, options, expected in cases:

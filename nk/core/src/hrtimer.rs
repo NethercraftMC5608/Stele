@@ -21,7 +21,7 @@
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 pub const VECTOR: u8 = 0xee;
-const MAX_CPUS: usize = 8;
+const MAX_CPUS: usize = crate::sched::MAX_CPUS;
 const IA32_TSC_DEADLINE: u32 = 0x6e0;
 
 static CALLBACK: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];

@@ -14,7 +14,7 @@
 use crate::println;
 
 /// Maximum APs to start. Matches MAX_CPUS in sched and the GDT/TSS tables.
-pub const MAX_APS: usize = 7;
+pub const MAX_APS: usize = crate::sched::MAX_CPUS - 1;
 
 /// How many CPUs bring-up actually found online, recorded at the end of
 /// `bring_up`. The torture compares the scheduler's count against this: an
@@ -48,9 +48,9 @@ unsafe extern "C" {
     static ap_trampoline_src: u64;
     static ap_trampoline_len: u64;
     static ap_prot: u8;
-    static mut ap_stack: [u64; 8];
-    static mut ap_ready: [u64; 8];
-    static mut ap_go: [u64; 8];
+    static mut ap_stack: [u64; crate::sched::MAX_CPUS];
+    static mut ap_ready: [u64; crate::sched::MAX_CPUS];
+    static mut ap_go: [u64; crate::sched::MAX_CPUS];
     static mut ap_slot: u64;
     static ap_gdt_ptr: u8;
     static mut ap_gdt_base: u32;
@@ -170,7 +170,7 @@ pub unsafe extern "C" fn rust_ap_main(cpu: u64) -> ! {
         // state an AP is in from birth.
         let idle = crate::sched::spawn("idle", ap_idle, cpu);
         crate::sched::set_class(idle, crate::schedpolicy::Class::Background);
-        crate::sched::set_affinity(idle, 1u8 << cpu.min(7));
+        crate::sched::set_affinity(idle, 1u16 << cpu);
         // The AP's idle loop runs on the stack the trampoline set up, not on
         // the pool allocation `spawn` gave the placeholder task, so record
         // the stack that is really in use. See `sched::set_task_stack`.
@@ -643,7 +643,7 @@ pub unsafe extern "C" fn rust_ap_main_arm(cpu: u64) -> ! {
     crate::sched::init_secondary(cpu);
     let idle = crate::sched::spawn("idle", idle_entry, cpu);
     crate::sched::set_class(idle, crate::schedpolicy::Class::Background);
-    crate::sched::set_affinity(idle, 1u8 << cpu.min(7));
+    crate::sched::set_affinity(idle, 1u16 << cpu);
     // The AP's idle loop runs on the stack `secondary_entry` set up, not on
     // the pool allocation `spawn` gave the placeholder task, so record the
     // stack that is really in use. See `sched::set_task_stack`.

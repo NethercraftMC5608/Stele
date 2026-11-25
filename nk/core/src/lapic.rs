@@ -11,10 +11,15 @@
 //! timer for per-CPU ticks, and INIT/STARTUP sequencing. The I/O APIC (device
 //! routing) is not here -- devices stay on the PIC until a later stage.
 
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU8, AtomicUsize, Ordering};
 
 static BASE: AtomicUsize = AtomicUsize::new(0xfee0_0000);
-static APIC_IDS: [AtomicU32; 8] = [const { AtomicU32::new(u32::MAX) }; 8];
+static APIC_IDS: [AtomicU32; crate::sched::MAX_CPUS] =
+    [const { AtomicU32::new(u32::MAX) }; crate::sched::MAX_CPUS];
+
+/// Hardware-to-logical slots for the syscall entry's stack lookup.
+#[no_mangle]
+static nk_apic_slots: [AtomicU8; 256] = [const { AtomicU8::new(u8::MAX) }; 256];
 static CPU_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 pub fn base() -> usize { BASE.load(Ordering::Relaxed) }
@@ -24,11 +29,13 @@ pub fn base() -> usize { BASE.load(Ordering::Relaxed) }
 pub fn configure_topology(ids: &[u32]) {
     let bsp = id();
     APIC_IDS[0].store(bsp, Ordering::Relaxed);
+    nk_apic_slots[bsp as usize].store(0, Ordering::Relaxed);
     let mut count = 1;
     for &apic in ids {
         if apic == bsp || apic > 255 || count == APIC_IDS.len() { continue; }
         if APIC_IDS[..count].iter().any(|v| v.load(Ordering::Relaxed) == apic) { continue; }
         APIC_IDS[count].store(apic, Ordering::Relaxed);
+        nk_apic_slots[apic as usize].store(count as u8, Ordering::Relaxed);
         count += 1;
     }
     CPU_COUNT.store(count, Ordering::Release);
@@ -41,9 +48,9 @@ pub fn logical_id() -> usize {
     let count = CPU_COUNT.load(Ordering::Acquire);
     // Before discovery only the BSP executes; no physical ID is a task index.
     if count == 0 { return 0; }
-    let hardware = id();
-    APIC_IDS[..count].iter().position(|v| v.load(Ordering::Relaxed) == hardware)
-        .expect("CPU absent from the firmware topology")
+    let slot = usize::from(nk_apic_slots[id() as usize].load(Ordering::Relaxed));
+    assert!(slot < count, "CPU absent from the firmware topology");
+    slot
 }
 
 unsafe fn apic_msr() -> u64 {

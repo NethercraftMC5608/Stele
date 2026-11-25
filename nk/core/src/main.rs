@@ -101,9 +101,9 @@ global_asm!(include_str!("user.s"));
 // defaults to Intel on x86. Without it the first `mov $x, %reg` is a parse
 // error about an unknown token, which names the column and not the cause.
 #[cfg(target_arch = "x86_64")]
-global_asm!(include_str!("boot-x86_64.s"), options(att_syntax));
+global_asm!(include_str!("boot-x86_64.s"), cpu_slots = const sched::MAX_CPUS, options(att_syntax));
 #[cfg(target_arch = "x86_64")]
-global_asm!(include_str!("user-x86_64.s"), options(att_syntax));
+global_asm!(include_str!("user-x86_64.s"), cpu_slots = const sched::MAX_CPUS, options(att_syntax));
 // The ring-3 smoke test, copied verbatim to USER_BASE by `user::spawn`.
 //
 // Not an ELF: spawn copies one page and jumps to its first byte, so the

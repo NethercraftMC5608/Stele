@@ -2,15 +2,15 @@
 //! NK_DEDICATED_TEST: a dedicated core is not preempted (ROADMAP Phase 3).
 //!
 //! Run after Linux is up, so it also shows the core works while LKL owns CPU 0.
-//! CPU 2 is contested: three spinners pinned to it, a fourth allowed on 2 and 3,
+//! CPU 2 is contested: three spinners pinned to it, a fourth allowed on both target slots,
 //! and a control probe pinned to 2. CPU 3 is dedicated to a probe.
 //!
 //! Timestamp gaps are no evidence under TCG -- QEMU itself time-slices vCPUs
 //! -- so the test counts what nk's scheduler does: how often each probe was
-//! switched in during its run window (`slices_of`), and whether the {2,3}
-//! spinner ever ran on CPU 3. PASS needs the dedicated probe switched in
+//! switched in during its run window (`slices_of`), and whether the
+//! wide-affinity spinner ever ran on the dedicated CPU. PASS needs the dedicated probe switched in
 //! exactly once, the control probe preempted (so the counter is shown to
-//! detect it), and CPU 3 untouched by anything else.
+//! detect it), and the dedicated CPU untouched by anything else.
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -18,7 +18,7 @@ const RUN_NS: u64 = 1_500_000_000;
 
 static SLICES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 static LOOPS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
-static SPINNER_ON_3: AtomicBool = AtomicBool::new(false);
+static SPINNER_ON_DEDICATED: AtomicBool = AtomicBool::new(false);
 static CPU_SEEN: [AtomicU64; 2] = [AtomicU64::new(u64::MAX), AtomicU64::new(u64::MAX)];
 
 fn now_ns() -> u64 {
@@ -45,12 +45,12 @@ extern "C" fn probe(which: usize) {
     LOOPS[which].store(loops, Ordering::Relaxed);
 }
 
-/// Contend for CPU 2 (and, if allowed, 3) for a little longer than the probes.
-extern "C" fn spinner(watch_cpu3: usize) {
+/// Contend for CPU 2, and optionally watch the dedicated CPU.
+extern "C" fn spinner(watch_cpu: usize) {
     let start = now_ns();
     while now_ns().wrapping_sub(start) < RUN_NS + 300_000_000 {
-        if watch_cpu3 != 0 && crate::arch::cpu_id() == 3 {
-            SPINNER_ON_3.store(true, Ordering::Relaxed);
+        if watch_cpu != 0 && crate::arch::cpu_id() == watch_cpu {
+            SPINNER_ON_DEDICATED.store(true, Ordering::Relaxed);
         }
         core::hint::spin_loop();
     }
@@ -126,9 +126,9 @@ extern "C" fn timer_probe(_: usize) {
 /// run of an interval one step later (the 5 ms timers at ~2.5 ms in about a
 /// third of runs, with or without nk changes): that is the host, which the
 /// LAPIC rate check already separates from nk.
-fn timer_phase() -> bool {
-    let Some(id) = crate::sched::dedicate_cpu(3, "vcpu-timer", timer_probe, 0) else {
-        crate::println!("  hrtimer: dedicate_cpu(3) refused");
+fn timer_phase(cpu: usize) -> bool {
+    let Some(id) = crate::sched::dedicate_cpu(cpu, "vcpu-timer", timer_probe, 0) else {
+        crate::println!("  hrtimer: dedicate_cpu({cpu}) refused");
         return false;
     };
     crate::sched::join(id);
@@ -143,7 +143,7 @@ fn timer_phase() -> bool {
         let pick = |q: usize| late.get((late.len() * q / 100).min(late.len().saturating_sub(1))).copied().unwrap_or(u64::MAX);
         medians[k] = pick(50);
         crate::println!(
-            "  hrtimer: {:>4} us x{}: {}/{} fired on cpu 3 ({}); late median {} us, p99 {} us, max {} us",
+            "  hrtimer: {:>4} us x{}: {}/{} fired on cpu {cpu} ({}); late median {} us, p99 {} us, max {} us",
             interval / 1000, PER_INTERVAL, fired, PER_INTERVAL, mode,
             pick(50) / 1000, pick(99) / 1000, late.last().copied().unwrap_or(u64::MAX) / 1000
         );
@@ -152,7 +152,7 @@ fn timer_phase() -> bool {
     let rate = RATE_CHECK.load(Ordering::Relaxed);
     let bus = crate::lapic::bus_hz();
     let rate_ok = rate == 0 || rate.abs_diff(bus) * 50 < bus; // within 2%, or TSC-deadline
-    crate::println!("  hrtimer: LAPIC count rate on cpu 3 {} Hz vs calibrated {} Hz ({})",
+    crate::println!("  hrtimer: LAPIC count rate on cpu {cpu} {} Hz vs calibrated {} Hz ({})",
         rate, bus, if rate_ok { "matches" } else { "MISMATCH" });
     let grid = INTERVALS_NS[0] + medians[0];
     crate::println!("  hrtimer: host delivery grid ~{} us (fire time of the {} us timers)", grid / 1000, INTERVALS_NS[0] / 1000);
@@ -164,22 +164,22 @@ pub fn run() {
         crate::println!("DEDICATED_SKIP: needs 4 CPUs (build with NK_SMP=1)");
         return;
     }
+    let cpu = crate::sched::cpu_count() - 1;
     let mut ids = alloc::vec::Vec::new();
     for _ in 0..3 {
         let id = crate::sched::spawn("spin2", spinner, 0);
         crate::sched::set_affinity(id, 1 << 2);
         ids.push(id);
     }
-    // Allowed on 2 and 3 before CPU 3 is dedicated: the reservation must
-    // strip 3 from it.
-    let wide = crate::sched::spawn("spin23", spinner, 1);
-    crate::sched::set_affinity(wide, (1 << 2) | (1 << 3));
+    // Dedication must remove the reserved slot from this task's affinity.
+    let wide = crate::sched::spawn("spin-wide", spinner, cpu);
+    crate::sched::set_affinity(wide, (1 << 2) | (1 << cpu));
     ids.push(wide);
     let control = crate::sched::spawn("ctl-probe", probe, 0);
     crate::sched::set_affinity(control, 1 << 2);
     ids.push(control);
-    let Some(dedicated) = crate::sched::dedicate_cpu(3, "vcpu-probe", probe, 1) else {
-        crate::println!("DEDICATED_FAIL: dedicate_cpu(3) refused");
+    let Some(dedicated) = crate::sched::dedicate_cpu(cpu, "vcpu-probe", probe, 1) else {
+        crate::println!("DEDICATED_FAIL: dedicate_cpu({cpu}) refused");
         return;
     };
     ids.push(dedicated);
@@ -189,15 +189,15 @@ pub fn run() {
 
     let (ctl, ded) = (SLICES[0].load(Ordering::Relaxed), SLICES[1].load(Ordering::Relaxed));
     let ded_cpu = CPU_SEEN[1].load(Ordering::Relaxed);
-    let on3 = SPINNER_ON_3.load(Ordering::Relaxed);
+    let on_dedicated = SPINNER_ON_DEDICATED.load(Ordering::Relaxed);
     let reserved_after = crate::sched::reserved_cpus();
     crate::println!(
-        "  dedicated: vcpu-probe on cpu {} switched in {}x during {} ms ({} loops); control on cpu 2 switched in {}x ({} loops); spin23 ran on cpu 3: {}; reserved after: {:#x}",
+        "  dedicated: vcpu-probe on cpu {} switched in {}x during {} ms ({} loops); control on cpu 2 switched in {}x ({} loops); wide spinner ran on cpu {cpu}: {}; reserved after: {:#x}",
         ded_cpu, ded, RUN_NS / 1_000_000, LOOPS[1].load(Ordering::Relaxed),
-        ctl, LOOPS[0].load(Ordering::Relaxed), on3, reserved_after
+        ctl, LOOPS[0].load(Ordering::Relaxed), on_dedicated, reserved_after
     );
-    let cores = ded == 0 && ded_cpu == 3 && ctl > 2 && !on3 && reserved_after & (1 << 3) == 0;
-    let timers = timer_phase();
+    let cores = ded == 0 && ded_cpu == cpu as u64 && ctl > 2 && !on_dedicated && reserved_after & (1 << cpu) == 0;
+    let timers = timer_phase(cpu);
     crate::println!("{}", if cores { "DEDICATED_PASS" } else { "DEDICATED_FAIL" });
     crate::println!("{}", if timers { "HRTIMER_PASS" } else { "HRTIMER_FAIL" });
 }

@@ -223,22 +223,7 @@ gdt:
     # 0x28 + n*16; zeros until tss_x86 writes the base and limit.
 .global gdt_tss
 gdt_tss:
-    .quad   0
-    .quad   0
-    .quad   0
-    .quad   0
-    .quad   0
-    .quad   0
-    .quad   0
-    .quad   0
-    .quad   0
-    .quad   0
-    .quad   0
-    .quad   0
-    .quad   0
-    .quad   0
-    .quad   0
-    .quad   0
+    .zero   16 * {cpu_slots}
 gdt_end:
 
 .global gdt_pointer
@@ -279,11 +264,11 @@ boot_info:  .long 0
 // not a hang.
 .align 8
 .global ap_stack
-ap_stack:      .quad 0, 0, 0, 0, 0, 0, 0, 0
+ap_stack: .zero 8 * {cpu_slots}
 .global ap_ready
-ap_ready:      .quad 0, 0, 0, 0, 0, 0, 0, 0
+ap_ready: .zero 8 * {cpu_slots}
 .global ap_go
-ap_go:         .quad 0, 0, 0, 0, 0, 0, 0, 0
+ap_go: .zero 8 * {cpu_slots}
 // The logical CPU index the BSP is currently bringing up. Written before
 // the STARTUP IPI and read by the AP as its own slot; one at a time, so a
 // single word is enough and the BSP's serialised loop is what makes it safe.

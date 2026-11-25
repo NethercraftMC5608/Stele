@@ -10,6 +10,7 @@ use stela_engine::machine::{
     NativeCode, NativeExit, NoDevices, Regime, Stop,
 };
 mod board;
+mod disk;
 mod irq;
 mod mount;
 mod shadow;
@@ -213,7 +214,7 @@ impl Host for BootHost {
     /// On a dedicated core the deadline arms that core's hrtimer; elsewhere
     /// (the pre-SMP boot probe) `wait_for_interrupt` waits on the counter.
     fn arm_timer(&mut self, deadline: Option<u64>) {
-        GUEST_TIMER.store(false, core::sync::atomic::Ordering::Release);
+        guest_timer().store(false, core::sync::atomic::Ordering::Release);
         match deadline {
             None => {
                 self.deadline = None;
@@ -235,7 +236,7 @@ impl Host for BootHost {
         if self.hrtimer {
             // Host device work ends the halt as well -- a raised line or
             // a kick (`irq`): the engine then advances the devices.
-            while !GUEST_TIMER.swap(false, Ordering::AcqRel) && !irq::host_line() && !irq::take_kick() {
+            while !guest_timer().swap(false, Ordering::AcqRel) && !irq::host_line() && !irq::take_kick() {
                 unsafe { core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack)) };
             }
             return;
@@ -248,15 +249,20 @@ impl Host for BootHost {
         }
     }
     fn poll_interrupt(&mut self) -> bool {
-        GUEST_TIMER.swap(false, core::sync::atomic::Ordering::AcqRel)
+        guest_timer().swap(false, core::sync::atomic::Ordering::AcqRel)
     }
 }
 
 const GUEST_HZ: u128 = 24_000_000;
-static GUEST_TIMER: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static GUEST_TIMERS: [core::sync::atomic::AtomicBool; crate::sched::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; crate::sched::MAX_CPUS];
+
+fn guest_timer() -> &'static core::sync::atomic::AtomicBool {
+    &GUEST_TIMERS[crate::arch::cpu_id()]
+}
 
 fn guest_timer_fired() {
-    GUEST_TIMER.store(true, core::sync::atomic::Ordering::Release);
+    guest_timer().store(true, core::sync::atomic::Ordering::Release);
 }
 
 fn guest_count(tsc_base: u64) -> u64 {

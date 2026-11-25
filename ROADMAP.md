@@ -420,14 +420,22 @@ What Stela's runtime needs from the kernel underneath it.
         IOGraphics power, AppleARMBacklight, IOThunderboltFamily,
         AppleCredentialManager, AppleSEPKeyStore, CoreAnalyticsHub: 218
         console lines and still moving after 150 s (138 M blocks).
-  - [ ] A guest framebuffer filling `boot_args.Video` and `/vram`, as
-        `stela.efi` does, so the boot screen draws without `-noprogress`.
+  - [x] A 1920×1080 guest framebuffer fills `boot_args.Video` and `/vram`
+        using the same bundle patch rules as `stela.efi`. Under QEMU/KVM
+        XNU drew pixels during `-progress` and reached restore userspace
+        (2026-11-25). The scanout remains headless.
 - [x] Root filesystem mounted (restore ramdisk, 2026-11-25): the bundle is read
       from an NVMe disk image through LKL (`tests/bundle-disk.py`, cpio on
       `/dev/nvme0n1`) into 4 GiB of guest DRAM; under KVM on an x86 PC XNU
       mounts `md0` (APFS) and starts ANS2, PMP/SMC/SEP/DCPEXT/GFX mailboxes,
-      PMGR and CLPC, with nk appending `-disable_mcc` as stela.efi does. Stops
-      at an "Unhandled E-core error" panic on PE 3 (see nk/docs/HANDOFF-XNU.md).
+      PMGR and CLPC, with nk appending `-disable_mcc` as stela.efi does.
+- [x] Restore userspace starts (2026-11-25, QEMU/KVM on Bazzite).
+      Withdraw the hidden ANE energy counter and shadow lower guest RAM
+      for XNU's launchd stack writes. XNU starts PID 1 and libignition
+      prints its boot arguments. See [the XNU handoff](nk/docs/HANDOFF-XNU.md).
+- [x] Launch the restore daemon (2026-11-25, QEMU/KVM on Bazzite).
+      Launchd spawns `restored_external` and marks it running. The probe
+      queues a USB QueryType request to verify when its endpoint is ready.
 - [ ] Get as far as the root filesystem mount on the reference timeline.
 
 ## Phase 6: device bridges (fake Apple device → Linux)

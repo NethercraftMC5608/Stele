@@ -469,6 +469,14 @@ impl<H: Host, T: ServiceTransport> Host for ServiceHost<H, T> {
     fn report(&mut self, event: &crate::machine::Event) {
         self.local.report(event);
     }
+
+    fn report_user_svc(&mut self, pc: u64, immediate: u16, state: &GuestState) {
+        self.local.report_user_svc(pc, immediate, state);
+    }
+
+    fn observes_user_svc(&self) -> bool {
+        self.local.observes_user_svc()
+    }
 }
 
 #[cfg(test)]

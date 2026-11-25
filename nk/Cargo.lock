@@ -503,13 +503,13 @@ dependencies = [
 name = "nk-core"
 version = "0.1.0"
 dependencies = [
- "serde_json",
  "stela-compiler",
  "stela-contracts",
  "stela-crypto",
  "stela-driver-base",
  "stela-engine",
  "stela-formats",
+ "stela-loader",
  "stela-runtime",
  "stela-soc",
  "stela-soc-data",
@@ -943,6 +943,22 @@ dependencies = [
  "sha2",
  "stela-contracts",
  "stela-crypto",
+]
+
+[[package]]
+name = "stela-loader"
+version = "0.5.0"
+dependencies = [
+ "hex",
+ "object",
+ "serde",
+ "serde_json",
+ "sha2",
+ "stela-contracts",
+ "stela-crypto",
+ "stela-driver-core",
+ "stela-formats",
+ "stela-soc-data",
 ]
 
 [[package]]
