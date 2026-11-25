@@ -91,6 +91,7 @@ isr_common:
     mov     %rsp, %rbx
     sub     $640, %rsp
     fxsave  (%rsp)
+    mov     %rsp, %rsi                      // captured FP/SIMD state
     cld                                     // SysV requires DF clear on entry
     call    x86_trap
     fxrstor (%rsp)

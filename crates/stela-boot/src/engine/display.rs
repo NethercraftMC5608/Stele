@@ -545,10 +545,6 @@ impl Scanout for GopScanout {
     }
 }
 
-const BYTES_PER_PIXEL: u64 = 4;
-/// The guest framebuffer is whole 16 KiB pages.
-const PAGE: u64 = 0x4000;
-
 /// The kernel's boot framebuffer for a `width` by `height` screen, ending at
 /// `dram_end`. Nothing copies it to the screen: the kernel's boot console
 /// and verbose text there reach the boot log through the debug UART, and
@@ -558,17 +554,7 @@ pub fn boot_framebuffer(
     (width, height): (usize, usize),
     dram_end: u64,
 ) -> Option<boot_bundle::Framebuffer> {
-    let (width, height) = (width as u64, height as u64);
-    let row_bytes = width * BYTES_PER_PIXEL;
-    let bytes = (row_bytes * height).next_multiple_of(PAGE);
-    Some(boot_bundle::Framebuffer {
-        guest_pa: dram_end.checked_sub(bytes)?,
-        bytes,
-        row_bytes,
-        width,
-        height,
-        bits_per_pixel: BYTES_PER_PIXEL * 8,
-    })
+    boot_bundle::Framebuffer::at_dram_end(width as u64, height as u64, dram_end)
 }
 
 /// The scanout of a machine whose only screen was the firmware's on a GPU

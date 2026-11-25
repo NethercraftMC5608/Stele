@@ -44,6 +44,7 @@ its tree in a docker volume for the same reason.
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import os
 import shlex
@@ -60,11 +61,10 @@ BUILD = HERE / "build"
 STUBS = KERNEL / "linux" / "stubs"
 EMUL = KERNEL / "linux" / "emul"
 
-# pkg/ is the project's own ELF reader. Reused rather than reimplemented, and
-# rather than shelling out to nm: the same file already answers this question
-# for packages, and a .o is only an ELF with no program headers.
-sys.path.insert(0, str(ROOT / "pkg"))
-import npkg_elf  # noqa: E402
+# The legacy individual-driver reports use NETHOS's package ELF reader.
+# LKL builds have their own ABI checker and do not need that optional module.
+# Import it only when a legacy report actually analyzes an object: Stele's
+# imported nk tree intentionally does not include the NETHOS package manager.
 
 IMAGE = "nethos-ldk"
 SRC_VOLUME = "nethos-ldk-src"
@@ -126,6 +126,19 @@ def say(msg):
 def die(msg):
     print(f"\033[1;31mERROR:\033[0m {msg}", file=sys.stderr)
     raise SystemExit(1)
+
+
+def legacy_elf():
+    pkg = ROOT / "pkg"
+    if pkg.is_dir() and str(pkg) not in sys.path:
+        sys.path.insert(0, str(pkg))
+    try:
+        return importlib.import_module("npkg_elf")
+    except ModuleNotFoundError as error:
+        if error.name != "npkg_elf":
+            raise
+        die("individual-driver object analysis needs NETHOS pkg/npkg_elf.py on PYTHONPATH; "
+            "the independent 'lkl' command does not need it")
 
 
 def have_docker() -> bool:
@@ -264,7 +277,7 @@ def shim_symbols() -> set[str]:
     """
     provided: set[str] = set()
     for obj in sorted((BUILD / "_shim").glob("*.o")):
-        defined, _ = npkg_elf.symbols(str(obj))
+        defined, _ = legacy_elf().symbols(str(obj))
         provided |= defined
     return provided
 
@@ -294,7 +307,7 @@ def analyse(port: dict) -> dict:
     defined: set[str] = set()
     undefined: set[str] = set()
     for obj in objs:
-        d, u = npkg_elf.symbols(str(obj))
+        d, u = legacy_elf().symbols(str(obj))
         defined |= d
         undefined |= u
 
@@ -308,7 +321,7 @@ def analyse(port: dict) -> dict:
     shim_def: set[str] = set()
     shim_undef: set[str] = set()
     for obj in sorted((BUILD / "_shim").glob("*.o")):
-        d, u = npkg_elf.symbols(str(obj))
+        d, u = legacy_elf().symbols(str(obj))
         shim_def |= d
         shim_undef |= u
 
@@ -328,7 +341,7 @@ def analyse(port: dict) -> dict:
     called: set[str] = set()
     loaded: set[str] = set()
     for obj in objs + sorted((BUILD / "_shim").glob("*.o")):
-        c, l = npkg_elf.references(str(obj))
+        c, l = legacy_elf().references(str(obj))
         called |= c
         loaded |= l
 
@@ -593,6 +606,16 @@ done
 
 # ------------------------------------------------------------------ lkl --
 
+def docker_arch():
+    """The Docker daemon's architecture (the VM's, under Colima)."""
+    try:
+        out = subprocess.run(["docker", "info", "--format", "{{.Architecture}}"],
+                             capture_output=True, text=True, check=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return ""
+    return (out or "").strip()
+
+
 def cmd_lkl(args):
     """Fetch LKL and build it into a single relocatable object.
 
@@ -615,17 +638,45 @@ def cmd_lkl(args):
     arch = getattr(args, "arch", "aarch64")
     platform = "linux/arm64" if arch == "aarch64" else "linux/amd64"
     volume = LKL_VOLUME if arch == "aarch64" else f"{LKL_VOLUME}-{arch}"
+    # x86-64 on an arm64 Docker host: cross-compile natively rather than run
+    # the amd64 compiler under emulation. Same source volume (Kbuild rebuilds
+    # once when the compiler changes); OUTPUT_FORMAT comes from the cross
+    # toolchain's objdump, so the result is the same elf64-x86-64 archive.
+    cross = ""
+    if arch == "x86_64" and docker_arch() in ("aarch64", "arm64"):
+        cross = "x86_64-linux-gnu-"
+        platform = "linux/arm64"
     # A separate image per platform, built from the same Dockerfile. Docker
     # resolves an image name to one architecture, so asking for the arm64
     # image with --platform linux/amd64 does not emulate it -- it tries to
     # pull an amd64 variant that was never pushed anywhere, and fails with
     # "pull access denied" for an image that is plainly built locally.
-    image = IMAGE if arch == "aarch64" else f"{IMAGE}-amd64"
+    image = IMAGE if arch == "aarch64" else (f"{IMAGE}-cross-amd64" if cross else f"{IMAGE}-amd64")
     # -mno-outline-atomics is an aarch64 flag and gcc refuses it elsewhere.
-    kcflags = "-mno-outline-atomics" if arch == "aarch64" else ""
+    # x86-64: -mno-red-zone, as arch/x86's own Makefile has it. arch/lkl is
+    # built like userspace and so keeps the 128-byte red zone below %rsp --
+    # but under nk, Linux runs at ring 0, where an interrupt pushes its frame
+    # onto the current stack, straight through the red zone. With real
+    # device interrupts arriving mid-driver that overwrote a leaf function's
+    # locals: host_iomem_access's `val` pointer, then the caller's frame
+    # (e1000e_update_stats with %rbp = 0). nk's own Rust target already has
+    # the red zone disabled.
+    kcflags = "-mno-outline-atomics" if arch == "aarch64" else "-mno-red-zone"
+    hostcflags = "" if arch == "aarch64" else "-mno-red-zone"
     say(f"Fetching lkl/linux for {arch} (shallow; a few minutes the first time)")
     subprocess.run(["docker", "volume", "create", volume],
                    check=True, stdout=subprocess.DEVNULL)
+    # A fresh Docker installation may not have the per-architecture builder
+    # image. Build it from this checkout instead of trying to pull a private
+    # local image name from Docker Hub. Existing builder images are reused.
+    probe = subprocess.run(["docker", "image", "inspect", image],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if probe.returncode != 0:
+        say(f"Building {image} for {platform}")
+        build = ["docker", "build", "--platform", platform, "-t", image]
+        if cross:
+            build += ["--build-arg", "CROSS=amd64"]
+        subprocess.run(build + [str(HERE)], check=True)
     script = """
 set -e
 command -v git >/dev/null || { apt-get update -qq && apt-get install -y -qq git; } >/dev/null 2>&1
@@ -639,6 +690,22 @@ cd linux
 # afternoon on backslashes.
 python3 /shim/ldk/patch-lkl.py /shim
 
+# The tree's host tools (scripts/kconfig/conf, fixdep, ...) are binaries for
+# whichever machine built them: x86 ones from the old emulated amd64 builder
+# cannot run in the native arm64 cross builder (qemu-x86_64: cannot open
+# ld-linux-x86-64.so.2). When the builder or toolchain changes, clean the
+# tree once, keeping .config and its hash.
+HOSTKEY="$(uname -m) __CROSS__"
+if [ -f .config ] && [ "$(cat .nk-build-host 2>/dev/null)" != "$HOSTKEY" ]; then
+  echo "  build host changed ($(cat .nk-build-host 2>/dev/null || echo unknown) -> $HOSTKEY): mrproper once"
+  cp .config /tmp/nk.config.keep
+  cp .nk-config-hash /tmp/nk.hash.keep 2>/dev/null || true
+  make ARCH=lkl mrproper >/dev/null 2>&1 || true
+  cp /tmp/nk.config.keep .config
+  cp /tmp/nk.hash.keep .nk-config-hash 2>/dev/null || true
+fi
+echo "$HOSTKEY" > .nk-build-host
+
 # The configuration is derived from nk.config, and derived again whenever it
 # changes.
 #
@@ -651,11 +718,15 @@ python3 /shim/ldk/patch-lkl.py /shim
 #
 # So: when nk.config changes, start from defconfig. Deterministic, and the
 # only cost is a full rebuild on a file that changes rarely.
-WANT=$(md5sum /shim/lkl/nk.config | cut -d" " -f1)
+# An architecture's own fragment (lkl/nk-<arch>.config) follows the shared
+# one and is part of the hash; cat-ing nk.config alone hashes exactly as
+# md5sum of the file did, so an architecture without one is not rebuilt.
+WANT=$(cat /shim/lkl/nk.config /shim/lkl/nk-__ARCH__.config 2>/dev/null | md5sum | cut -d" " -f1)
 if [ ! -f .config ] || [ "$(cat .nk-config-hash 2>/dev/null)" != "$WANT" ]; then
-  make ARCH=lkl defconfig >/dev/null
+  make ARCH=lkl CROSS_COMPILE="__CROSS__" defconfig >/dev/null
   cat /shim/lkl/nk.config >> .config
-  make ARCH=lkl olddefconfig >/dev/null
+  if [ -f /shim/lkl/nk-__ARCH__.config ]; then cat /shim/lkl/nk-__ARCH__.config >> .config; fi
+  make ARCH=lkl CROSS_COMPILE="__CROSS__" olddefconfig >/dev/null
   echo "$WANT" > .nk-config-hash
   echo "  configured: from arch/lkl defconfig plus kernel/lkl/nk.config"
 fi
@@ -677,7 +748,7 @@ fi
 # real failure and is reported as one.
 attempt=1
 while [ "$attempt" -le 8 ]; do
-    if make ARCH=lkl KCFLAGS="__KCFLAGS__" -j$(nproc) >/tmp/build.log 2>&1; then
+    if make ARCH=lkl CROSS_COMPILE="__CROSS__" KCFLAGS="__KCFLAGS__" -j$(nproc) >/tmp/build.log 2>&1; then
         break
     fi
     if ! grep -qE "Error 139|signal 11|internal compiler error" /tmp/build.log; then
@@ -694,16 +765,23 @@ fi
 cp arch/lkl/include/uapi/asm/host_ops.h /out/
 cp arch/lkl/include/uapi/lkl.h /out/ 2>/dev/null || true
 # Stripped of debug info: 344MB to 20MB, and nk links the whole thing.
-strip --strip-debug lkl.o -o /out/lkl.o
-gcc -c -ffreestanding -fno-stack-protector -fno-PIE -mgeneral-regs-only \
+__CROSS__strip --strip-debug lkl.o -o /out/lkl.o
+__CROSS__gcc -c -ffreestanding -fno-stack-protector -fno-PIE -mgeneral-regs-only __HOSTCFLAGS__ \
     -Wall -Wextra -Wno-unused-parameter -I/out /shim/lkl/nk-host.c -o /out/nk-host.o
-rm -f /out/libnklkl.a && ar rcs /out/libnklkl.a /out/lkl.o /out/nk-host.o
+rm -f /out/libnklkl.a.tmp && __CROSS__ar rcs /out/libnklkl.a.tmp /out/lkl.o /out/nk-host.o
+# Verify the private syscall table before publishing the new archive.
+# A failed build leaves the prior archive intact.
+python3 /shim/ldk/lkl_abi.py /out/libnklkl.a.tmp
+mv /out/libnklkl.a.tmp /out/libnklkl.a
 echo "  lkl.o: $(stat -c%s /out/lkl.o) bytes stripped"
 echo "  the whole Linux kernel still wants, from nk:"
-ld -r -o /tmp/c.o /out/lkl.o /out/nk-host.o
-nm --undefined-only /tmp/c.o | awk '{print "    " $2}' | sort -u
+__CROSS__ld -r -o /tmp/c.o /out/lkl.o /out/nk-host.o
+__CROSS__nm --undefined-only /tmp/c.o | awk '{print "    " $2}' | sort -u
 """
     script = script.replace("__KCFLAGS__", kcflags)
+    script = script.replace("__ARCH__", arch)
+    script = script.replace("__HOSTCFLAGS__", hostcflags)
+    script = script.replace("__CROSS__", cross)
     # aarch64 keeps build/lkl so every existing path and script still finds
     # it; a second architecture gets its own directory beside it.
     out = BUILD / ("lkl" if arch == "aarch64" else f"lkl-{arch}")

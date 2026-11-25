@@ -55,10 +55,9 @@ impl Tss {
     }
 }
 
-pub const MAX_CPUS: usize = 8;
+const MAX_CPUS: usize = crate::sched::MAX_CPUS;
 
-static mut TSS: [Tss; MAX_CPUS] = [Tss::new(), Tss::new(), Tss::new(), Tss::new(),
-    Tss::new(), Tss::new(), Tss::new(), Tss::new()];
+static mut TSS: [Tss; MAX_CPUS] = [const { Tss::new() }; MAX_CPUS];
 
 /// A stack for exceptions that cannot trust the one they interrupted.
 ///
@@ -68,10 +67,7 @@ static mut TSS: [Tss; MAX_CPUS] = [Tss::new(), Tss::new(), Tss::new(), Tss::new(
 /// CPUs double-faulting at once on one stack would corrupt each other.
 #[repr(align(16))]
 struct IstStack([u8; 8192]);
-static mut DF_STACK: [IstStack; MAX_CPUS] = [IstStack([0; 8192]), IstStack([0; 8192]),
-    IstStack([0; 8192]), IstStack([0; 8192]),
-    IstStack([0; 8192]), IstStack([0; 8192]),
-    IstStack([0; 8192]), IstStack([0; 8192])];
+static mut DF_STACK: [IstStack; MAX_CPUS] = [const { IstStack([0; 8192]) }; MAX_CPUS];
 
 unsafe extern "C" {
     /// The 16-byte TSS slots in the GDT, from boot-x86_64.s. One per CPU:

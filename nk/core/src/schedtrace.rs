@@ -101,7 +101,7 @@ const RING_MASK: u64 = (RING - 1) as u64;
 
 /// One ring per CPU. One CPU today; indexed by CPU id so that more is a
 /// bigger array rather than a different design.
-pub const MAX_CPUS: usize = 8;
+pub const MAX_CPUS: usize = crate::sched::MAX_CPUS;
 
 static mut RINGS: [[SchedEvent; RING]; MAX_CPUS] = [[SchedEvent::EMPTY; RING]; MAX_CPUS];
 /// Monotonic write counter per CPU. The index is this modulo the ring size;

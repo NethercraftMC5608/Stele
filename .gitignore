@@ -1,4 +1,5 @@
 /target/
+/target-*/
 /crates/*/target/
 /*.rcgu.o
 /.stela/

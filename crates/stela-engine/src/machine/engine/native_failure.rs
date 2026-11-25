@@ -243,7 +243,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                                 | FaultCause::Translation(_)
                                 | FaultCause::Watched
                                 | FaultCause::TagChecked => true,
-                                FaultCause::Guest(_) => false,
+                                FaultCause::Guest(_) | FaultCause::UnmappedRam => false,
                             }
                     })
             }
@@ -358,6 +358,13 @@ impl<H: Host, D: Devices> Machine<H, D> {
             }
             FaultCause::Translation(unsupported) => {
                 Err(self.unsupported(RequirementKind::Translation(unsupported)))
+            }
+            FaultCause::UnmappedRam => {
+                let mut requirement = self.requirement(RequirementKind::Native(
+                    "host could not map translated guest RAM",
+                ));
+                requirement.address = Some(fault.address);
+                Err(Stop::Unsupported(requirement))
             }
             FaultCause::Watched | FaultCause::TagChecked => self.watched_access(index, pc),
             // Native blocks fault, by #UD or at the access with a #GP, for a

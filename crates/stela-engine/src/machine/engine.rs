@@ -384,6 +384,8 @@ pub enum FaultCause {
     Guest(mmu::Fault),
     /// The access translated to a physical address that is not RAM.
     Device { physical: u64 },
+    /// Guest translation succeeded but the host could not map the RAM.
+    UnmappedRam,
     /// The guest configured translation this engine does not implement.
     Translation(mmu::Unsupported),
     /// An x86 #GP: the address is not canonical for x86 (tags, wild pointers).

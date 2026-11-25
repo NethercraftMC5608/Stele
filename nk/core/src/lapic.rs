@@ -11,9 +11,70 @@
 //! timer for per-CPU ticks, and INIT/STARTUP sequencing. The I/O APIC (device
 //! routing) is not here -- devices stay on the PIC until a later stage.
 
-/// Default physical base. Matches QEMU's q35 and every real PC; relocated
-/// only by firmware doing something exotic, which nk does not support yet.
-pub const BASE: usize = 0xfee0_0000;
+use core::sync::atomic::{AtomicU32, AtomicU8, AtomicUsize, Ordering};
+
+static BASE: AtomicUsize = AtomicUsize::new(0xfee0_0000);
+static APIC_IDS: [AtomicU32; crate::sched::MAX_CPUS] =
+    [const { AtomicU32::new(u32::MAX) }; crate::sched::MAX_CPUS];
+
+/// Hardware-to-logical slots for the syscall entry's stack lookup.
+#[no_mangle]
+static nk_apic_slots: [AtomicU8; 256] = [const { AtomicU8::new(u8::MAX) }; 256];
+static CPU_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+pub fn base() -> usize { BASE.load(Ordering::Relaxed) }
+
+/// Install the firmware topology before the scheduler or secondary CPUs run.
+/// Slot zero is always the BSP, regardless of its physical APIC ID.
+pub fn configure_topology(ids: &[u32]) {
+    let bsp = id();
+    APIC_IDS[0].store(bsp, Ordering::Relaxed);
+    nk_apic_slots[bsp as usize].store(0, Ordering::Relaxed);
+    let mut count = 1;
+    for &apic in ids {
+        if apic == bsp || apic > 255 || count == APIC_IDS.len() { continue; }
+        if APIC_IDS[..count].iter().any(|v| v.load(Ordering::Relaxed) == apic) { continue; }
+        APIC_IDS[count].store(apic, Ordering::Relaxed);
+        nk_apic_slots[apic as usize].store(count as u8, Ordering::Relaxed);
+        count += 1;
+    }
+    CPU_COUNT.store(count, Ordering::Release);
+}
+pub fn cpu_count() -> usize { CPU_COUNT.load(Ordering::Acquire).max(1) }
+pub fn apic_id(cpu: usize) -> Option<u32> {
+    (cpu < CPU_COUNT.load(Ordering::Acquire)).then(|| APIC_IDS[cpu].load(Ordering::Relaxed))
+}
+pub fn logical_id() -> usize {
+    let count = CPU_COUNT.load(Ordering::Acquire);
+    // Before discovery only the BSP executes; no physical ID is a task index.
+    if count == 0 { return 0; }
+    let slot = usize::from(nk_apic_slots[id() as usize].load(Ordering::Relaxed));
+    assert!(slot < count, "CPU absent from the firmware topology");
+    slot
+}
+
+unsafe fn apic_msr() -> u64 {
+    let lo: u32; let hi: u32;
+    core::arch::asm!("rdmsr", in("ecx") 0x1bu32, out("eax") lo, out("edx") hi, options(nostack));
+    ((hi as u64)<<32) | lo as u64
+}
+/// Learn the current base before any APIC reads. x2APIC needs a separate
+/// MSR interface; fail explicitly rather than accessing disabled xAPIC MMIO.
+pub unsafe fn discover_base() {
+    let msr = apic_msr();
+    assert!(msr & (1<<10) == 0, "x2APIC mode is not supported yet");
+    let address = msr & 0x000f_ffff_ffff_f000;
+    assert!(address != 0 && address < 1<<32, "LAPIC outside boot identity map");
+    BASE.store(address as usize, Ordering::Relaxed);
+}
+pub unsafe fn set_base(address: u64) {
+    assert!(address != 0 && address & 4095 == 0 && address < 1<<32);
+    BASE.store(address as usize, Ordering::Relaxed);
+    let old = apic_msr();
+    let msr = address | (old & 0xfff) | (1<<11);
+    core::arch::asm!("wrmsr", in("ecx") 0x1bu32, in("eax") msr as u32,
+        in("edx") (msr>>32) as u32, options(nostack));
+}
 
 const ID: usize = 0x020;
 const EOI: usize = 0x0b0;
@@ -33,12 +94,12 @@ const SPURIOUS_VECTOR: u32 = 0x1ff;
 
 #[inline]
 unsafe fn read(off: usize) -> u32 {
-    core::ptr::read_volatile((BASE + off) as *const u32)
+    core::ptr::read_volatile((base() + off) as *const u32)
 }
 
 #[inline]
 unsafe fn write(off: usize, v: u32) {
-    core::ptr::write_volatile((BASE + off) as *mut u32, v);
+    core::ptr::write_volatile((base() + off) as *mut u32, v);
 }
 
 /// This CPU's APIC ID. The same value `arch::cpu_id` derives from CPUID,
@@ -51,6 +112,7 @@ pub fn id() -> u32 {
 /// non-zero and have bit 8 set or the LAPIC stays disabled and every ICR
 /// write is silently dropped -- measured as IPIs that never arrive.
 pub unsafe fn init() {
+    set_base(base() as u64);
     write(SPURIOUS, SPURIOUS_VECTOR);
 }
 
@@ -203,6 +265,38 @@ pub unsafe fn calibrate_timer() {
     let bus = ticks * 100 * 16;
     BUS_HZ.store(bus, core::sync::atomic::Ordering::Relaxed);
     crate::println!("  lapic:  timer bus {} MHz", bus / 1_000_000);
+}
+
+/// Stop this CPU's periodic tick (mask the LVT timer). Used on a dedicated
+/// core while its one task runs: nothing else may run there, so a tick can
+/// only interrupt it. Wakes still arrive by IPI.
+pub unsafe fn mask_timer() {
+    write(LVT_TIMER, read(LVT_TIMER) | 1 << 16);
+}
+
+/// Undo `mask_timer`.
+pub unsafe fn unmask_timer() {
+    write(LVT_TIMER, read(LVT_TIMER) & !(1 << 16));
+}
+
+/// One-shot timer mode at `vector`, unarmed: TSC-deadline (LVT bits 18:17 =
+/// 10b, armed through IA32_TSC_DEADLINE) or count mode (armed by writing the
+/// initial count). Stops any periodic tick. See hrtimer.rs.
+pub unsafe fn oneshot_mode(vector: u8, tsc_deadline: bool) {
+    write(TIMER_INIT, 0);
+    write(TIMER_DIV, 0x3);
+    let mode = if tsc_deadline { 0b10 << 17 } else { 0 };
+    write(LVT_TIMER, mode | vector as u32);
+}
+
+/// The count-mode timer's current count.
+pub unsafe fn current_count() -> u32 {
+    read(TIMER_COUNT)
+}
+
+/// Arm count-mode one-shot (0 disarms).
+pub unsafe fn set_initial_count(count: u32) {
+    write(TIMER_INIT, count);
 }
 
 /// Start periodic LAPIC timer ticks on this CPU at `vector`.

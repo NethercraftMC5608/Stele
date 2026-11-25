@@ -11,11 +11,37 @@
 //! machine is far worse. The bump pointer costs nothing and reaches the same
 //! state lazily.
 //!
-//! No lock. Every CPU but affinity 0 is parked in boot.s, so there is exactly
-//! one caller. SMP bring-up has to add one here, and this comment is the note
-//! that it is missing rather than merely absent.
+//! One spinlock, taken with interrupts masked (`Held`): after SMP, CPU 0
+//! (Linux, the heap) and the APs (dedicated cores building guest RAM and
+//! stacks) allocate at the same time, and an unlocked free-list pop loses
+//! or duplicates a frame. Zeroing happens outside it.
 
 use crate::println;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+static LOCK: AtomicBool = AtomicBool::new(false);
+
+/// The allocator's lock, released on drop. IF is masked while held so an
+/// interrupt on the same CPU cannot try to take it again.
+struct Held(u64);
+impl Held {
+    fn take() -> Self {
+        let flags = crate::sync::irq_save();
+        while LOCK
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        Held(flags)
+    }
+}
+impl Drop for Held {
+    fn drop(&mut self) {
+        LOCK.store(false, Ordering::Release);
+        unsafe { crate::sync::irq_restore(self.0) };
+    }
+}
 
 pub const PAGE: usize = 4096;
 
@@ -77,6 +103,56 @@ pub unsafe fn add(start: usize, end: usize) {
     f.total += (end - start) / PAGE;
 }
 
+// --- RAM above nk's identity map ------------------------------------------
+
+/// Physical RAM nk cannot reach through its identity map. Frames from here
+/// have no kernel virtual address: they are only for memory something maps
+/// itself, such as a translated guest's DRAM (`paging::map_guest_dram`).
+/// Bump-only and never returned: there is nowhere to thread a free list
+/// through pages nk cannot see.
+static mut HIGH: [Region; MAX_REGIONS] = [Region { next: 0, end: 0 }; MAX_REGIONS];
+static mut HIGH_REGIONS: usize = 0;
+
+/// Record `[start, end)` as high RAM.
+///
+/// # Safety
+/// Real RAM nothing else owns, at boot.
+pub unsafe fn add_high(start: u64, end: u64) {
+    let start = align_up(start as usize, PAGE);
+    let end = end as usize & !(PAGE - 1);
+    let regions = &mut *(&raw mut HIGH);
+    if end <= start || HIGH_REGIONS == MAX_REGIONS {
+        return;
+    }
+    regions[HIGH_REGIONS] = Region { next: start, end };
+    HIGH_REGIONS += 1;
+}
+
+/// The physical address of one high frame, NOT zeroed (nk cannot see it:
+/// the caller zeroes it once mapped), or None when none is left.
+pub fn alloc_high() -> Option<u64> {
+    let _held = Held::take();
+    unsafe {
+        let regions = &mut *(&raw mut HIGH);
+        for r in &mut regions[..HIGH_REGIONS] {
+            if r.next < r.end {
+                let frame = r.next;
+                r.next += PAGE;
+                return Some(frame as u64);
+            }
+        }
+    }
+    None
+}
+
+/// High RAM left, in bytes.
+pub fn high_free() -> u64 {
+    let _held = Held::take();
+    unsafe {
+        (&*(&raw const HIGH))[..HIGH_REGIONS].iter().map(|r| (r.end - r.next) as u64).sum()
+    }
+}
+
 /// One zeroed frame, or None when memory is gone.
 ///
 /// Zeroed unconditionally. Page tables require it, Linux's `kzalloc` sits on
@@ -85,6 +161,7 @@ pub unsafe fn add(start: usize, end: usize) {
 /// later, in something entirely unrelated.
 pub fn alloc() -> Option<*mut u8> {
     unsafe {
+        let held = Held::take();
         let f = &mut *(&raw mut FRAMES);
         let p = if !f.free.is_null() {
             let p = f.free;
@@ -104,8 +181,9 @@ pub fn alloc() -> Option<*mut u8> {
             }
             got
         };
-        core::ptr::write_bytes(p, 0, PAGE);
         f.used += 1;
+        drop(held);
+        core::ptr::write_bytes(p, 0, PAGE);
         Some(p)
     }
 }
@@ -135,12 +213,14 @@ pub fn alloc_contiguous(n: usize) -> Option<*mut u8> {
 pub fn alloc_contiguous_aligned(n: usize, align: usize) -> Option<*mut u8> {
     assert!(align.is_power_of_two() && align >= PAGE);
     unsafe {
+        let held = Held::take();
         let f = &mut *(&raw mut FRAMES);
         for r in &mut f.regions[..f.nregions] {
             let start = (r.next + align - 1) & !(align - 1);
             if start < r.end && r.end - start >= n * PAGE {
                 f.used += (start - r.next) / PAGE + n;
                 r.next = start + n * PAGE;
+                drop(held);
                 let p = start as *mut u8;
                 core::ptr::write_bytes(p, 0, n * PAGE);
                 return Some(p);
@@ -153,6 +233,7 @@ pub fn alloc_contiguous_aligned(n: usize, align: usize) -> Option<*mut u8> {
 /// # Safety
 /// `p` must have come from `alloc` and must not be used again.
 pub unsafe fn free(p: *mut u8) {
+    let _held = Held::take();
     let f = &mut *(&raw mut FRAMES);
     let node = p as *mut FreeFrame;
     (*node).next = f.free;
@@ -162,6 +243,7 @@ pub unsafe fn free(p: *mut u8) {
 
 pub fn stats() -> (usize, usize) {
     unsafe {
+        let _held = Held::take();
         let f = &*(&raw const FRAMES);
         (f.used, f.total)
     }

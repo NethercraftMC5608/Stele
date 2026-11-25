@@ -419,7 +419,47 @@ pub fn hide_unmodeled(tree: &mut DeviceTree) -> Vec<String> {
     retire_hidden_service_identities(tree, &hidden);
     retire_hidden_acio_parents(tree, &mut hidden);
     retire_hidden_capabilities(tree, &mut hidden);
+    if withdraw_hidden_ane_energy(tree) {
+        hidden.push("/arm-io/pmgr hw-dpe-reg ANE".into());
+    }
     hidden
+}
+
+/// PMGR advertises its energy counters separately from their devices.
+/// Withdraw the direct 64-bit T8112 ANE sample when the ANE is hidden.
+/// Also used by nk when booting bundles prepared before this admission rule.
+pub fn withdraw_hidden_ane_energy(tree: &mut DeviceTree) -> bool {
+    const RECORD_BYTES: usize = 40;
+    let Some(ane) = tree.node("/arm-io/ane") else {
+        return false;
+    };
+    if ane.property(COMPATIBLE).is_some() && ane.property(IGNORE).is_none() {
+        return false;
+    }
+    let Some(records) = tree
+        .node_mut("/arm-io/pmgr")
+        .and_then(|pmgr| pmgr.property_mut("hw-dpe-reg"))
+    else {
+        return false;
+    };
+    let (entries, trailing) = records.value.as_chunks::<RECORD_BYTES>();
+    if records.placeholder || !trailing.is_empty() {
+        return false;
+    }
+    let retained: Vec<u8> = entries
+        .iter()
+        .filter(|entry| {
+            entry[16..24] != [0x88, 0, 1, 0, 0, 0, 1, 64]
+                || !entry[24..].starts_with(b"ANE\0")
+        })
+        .flatten()
+        .copied()
+        .collect();
+    if retained.len() == records.value.len() {
+        return false;
+    }
+    records.value = retained;
+    true
 }
 
 /// Drop each hidden device's raw capability claims

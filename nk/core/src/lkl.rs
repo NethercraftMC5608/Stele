@@ -35,12 +35,29 @@ pub fn boot() -> bool {
     crate::sched::set_lkl_active();
     // Memory comes from nk's frame allocator through the host's page_alloc,
     // so this is how much of nk's RAM Linux is allowed to take.
-    let cmdline = if cfg!(target_arch = "aarch64") {
-        c"mem=768M loglevel=8"
+    let base: &[u8] = if cfg!(target_arch = "aarch64") {
+        b"mem=768M loglevel=8"
     } else {
-        c"mem=448M loglevel=8"
+        b"mem=448M loglevel=8"
     };
-    let rc = unsafe { lkl_start_kernel(cmdline.as_ptr() as *const u8) };
+    // Room for the base and `lkl_pci=` with up to eight devices, NUL-terminated. Static
+    // because Linux keeps pointers into its command line.
+    static mut CMDLINE: [u8; 160] = [0; 160];
+    let cmdline = unsafe { &mut *(&raw mut CMDLINE) };
+    cmdline[..base.len()].copy_from_slice(base);
+    #[allow(unused_mut)]
+    let mut len = base.len();
+    #[cfg(target_arch = "x86_64")]
+    {
+        let end = cmdline.len() - 1;
+        len += crate::lkl_pci_x86::cmdline_arg(&mut cmdline[len..end]);
+    }
+    cmdline[len] = 0;
+    crate::println!(
+        "  linux:  cmdline {}",
+        core::str::from_utf8(&cmdline[..len]).unwrap_or("?")
+    );
+    let rc = unsafe { lkl_start_kernel(cmdline.as_ptr()) };
     if rc != 0 {
         crate::println!("  linux:  the kernel did not start: {}", rc);
         return false;

@@ -220,8 +220,8 @@ syscall_entry:
     // Stash user RSP in this CPU's scratch slot, load this CPU's kernel stack.
     //
     // Per-CPU because two CPUs in `syscall` at once share nothing else here:
-    // each names its slot by APIC ID (EBX bits 24..31 from CPUID.1, masked
-    // to 8 slots), so CPU 1's entry cannot clobber CPU 0's saved RSP. IF is
+    // each resolves its APIC ID (EBX bits 24..31 from CPUID.1) to a
+    // dense slot, so CPU 1 cannot clobber CPU 0's saved RSP. IF is
     // still masked by FMASK across the sequence, so no interrupt can land
     // between the stash and the reload on the same CPU either.
     // Stash first, index second. The pushes below move RSP, so the value
@@ -247,7 +247,11 @@ syscall_entry:
     mov     $1, %eax
     cpuid
     shr     $24, %ebx
-    and     $7, %ebx
+    movzbl  nk_apic_slots(,%rbx), %ebx
+    cmp     ${cpu_slots}, %ebx
+    jb      1f
+    ud2
+1:
     lea     40(%rsp), %rax
     mov     %rax, user_rsp_scratch(,%rbx,8)
     mov     kernel_sp_scratch(,%rbx,8), %rax
@@ -316,7 +320,11 @@ syscall_entry:
     mov     $1, %eax
     cpuid
     shr     $24, %ebx
-    and     $7, %ebx
+    movzbl  nk_apic_slots(,%rbx), %ebx
+    cmp     ${cpu_slots}, %ebx
+    jb      1f
+    ud2
+1:
     mov     user_rsp_scratch(,%rbx,8), %rax
     pop     %rbx
     mov     %rax, 264(%rsp)                 # sp = user rsp
@@ -329,10 +337,25 @@ syscall_entry:
     mov     %r14, 88(%rsp)                  # x[11]
     mov     %r15, 96(%rsp)                  # x[12]
     mov     %rdi, 104(%rsp)
+    mov     %rcx, 112(%rsp)                 # x[14], full iret restore
+    mov     %r11, 120(%rsp)                 # x[15]
 
+    // Preserve FP/SIMD even for the hidden page-in syscall: unlike a normal
+    // call, a fault can interrupt vectorized libc code with live XMM values.
     // Call Rust syscall handler: rdi = &mut Frame
     mov     %rsp, %rdi
+    sub     $512, %rsp
+    fxsave  (%rsp)
     call    rust_syscall
+    fxrstor (%rsp)
+    add     $512, %rsp
+    cmpq    $0, 128(%rsp)                  # full fault-frame return?
+    je      4f
+    mov     %rsp, %rdi
+    mov     %cr3, %rsi
+    lea     272(%rsp), %rdx
+    jmp     resume_user
+4:
 
     // Restore callee-saved registers
     mov     48(%rsp), %rbx
@@ -423,13 +446,13 @@ x86_syscall_init:
 .section ".data"
 .align 8
 // Per-CPU syscall scratch: word 0 of each 8-byte slot is the saved user RSP.
-// Indexed by (APIC ID & 7), matching arch::cpu_id. One global word was safe
+// Indexed by the LAPIC topology slot, matching arch::cpu_id. One global word was safe
 // with one CPU; two CPUs in `syscall` at once would store to the same word
 // and return to each other's stacks.
 .global user_rsp_scratch
-user_rsp_scratch:  .quad 0, 0, 0, 0, 0, 0, 0, 0
+user_rsp_scratch:  .zero 8 * {cpu_slots}
 .global kernel_sp_scratch
-kernel_sp_scratch: .quad 0, 0, 0, 0, 0, 0, 0, 0
+kernel_sp_scratch: .zero 8 * {cpu_slots}
 
 // ------------------------------------------------------------ resume_user --
 //
@@ -489,6 +512,8 @@ resume_user:
     // r10 last but two: until the pushes above it held the user rsp.
     mov     24(%rdi), %r10
     mov     16(%rdi), %rdx
+    mov     112(%rdi), %rcx
+    mov     120(%rdi), %r11
     mov     104(%rdi), %rdi
 
     iretq

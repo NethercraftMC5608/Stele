@@ -65,6 +65,15 @@ pub unsafe fn pic_eoi(irq: u8) {
     outb(PIC1_CMD, PIC_EOI);
 }
 
+/// Caller serializes PIC changes with local interrupts masked.
+pub unsafe fn pic_mask(irq: u8, masked: bool) {
+    assert!(irq < 16);
+    let port = if irq < 8 {PIC1_DATA} else {PIC2_DATA};
+    let bit = 1 << (irq%8);
+    let current = inb(port);
+    outb(port,if masked {current|bit} else {current&!bit});
+}
+
 // ------------------------------------------------------------------ IDT --
 //
 // 256 entries, each 16 bytes. Descriptors are 64-bit interrupt gates:
@@ -182,17 +191,23 @@ const EXCEPTION_NAMES: [&str; 32] = [
 /// # Safety
 /// Called only from `isr_common` with a valid frame on the current stack.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn x86_trap(frame: *mut TrapFrame) {
+pub unsafe extern "C" fn x86_trap(frame: *mut TrapFrame, fp: *const u8) {
     let f = &mut *frame;
+    #[cfg(feature = "stela")]
+    if crate::stela_nk::recover_native_fault(f, fp) {
+        return;
+    }
+    #[cfg(not(feature = "stela"))]
+    let _ = fp;
     match f.vector {
         // IRQ 0: the timer.
-        32 => {
+        32 | 0x40 => {
             // EOI before any switch, not after. `cpu_switch` does not return
             // here -- it returns into some other task -- so an EOI placed
             // after it is never reached, the PIC still considers IRQ 0 in
             // service, and the timer ticks exactly once. This is the same
             // trap the aarch64 path documents at its `gic::eoi`.
-            pic_eoi(0);
+            if f.vector == 32 { pic_eoi(0); } else { crate::lapic::eoi(); }
             crate::timer::on_tick();
             crate::hostops::tick_timers();
 
@@ -249,6 +264,28 @@ pub unsafe extern "C" fn x86_trap(frame: *mut TrapFrame) {
                 crate::sched::schedule();
             }
         }
+        // High-resolution one-shot timer on a dedicated core (hrtimer.rs).
+        // EOI first; the callback is bounded and does not switch.
+        // On CPU 0 it carries Linux's one-shots (hostops): the callback may
+        // have woken the timer thread, so act on need_resched as the tick
+        // does. Never on a dedicated core, whose guest may be mid-WFI.
+        0xee => {
+            crate::lapic::eoi();
+            crate::hrtimer::fire();
+            if crate::arch::cpu_id() == 0
+                && crate::sched::preempt_enabled()
+                && crate::sched::take_need_resched()
+            {
+                crate::sched::schedule();
+            }
+        }
+        // Kick from another CPU: host device work for a dedicated core's
+        // guest (stela_nk::host::irq). Ending the halt is the whole effect.
+        #[cfg(feature = "stela")]
+        0xed => {
+            crate::lapic::eoi();
+            crate::stela_nk::kicked();
+        }
         // Reschedule IPI from another CPU (LAPIC vector 0xf0). LAPIC EOI,
         // not PIC: this interrupt never went through the 8259. The sender
         // already set this CPU's need_resched; act on it at the same safe
@@ -258,6 +295,13 @@ pub unsafe extern "C" fn x86_trap(frame: *mut TrapFrame) {
             if crate::sched::preempt_enabled() && crate::sched::take_need_resched() {
                 crate::sched::schedule();
             }
+        }
+        // Device MSI/MSI-X and explicitly routed IOAPIC interrupts. Device
+        // callbacks acknowledge their source before EOI; LKL work runs in
+        // its IRQ pump rather than blocking this interrupt frame.
+        0x50..=0xdf => {
+            crate::device_irq_x86::dispatch(f.vector as u8);
+            crate::lapic::eoi();
         }
         // The remaining PIC lines: acknowledge so the controller does not
         // wedge on an unacknowledged interrupt.
@@ -285,6 +329,18 @@ pub unsafe extern "C" fn x86_trap(frame: *mut TrapFrame) {
             let cr2: u64;
             core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack));
             if crate::reserve::fault_in(cr2) {
+                return;
+            }
+            let mut saved = crate::user::Frame {
+                x: [0; 31], elr: f.rip, spsr: f.rflags, sp: f.rsp,
+            };
+            saved.x[..16].copy_from_slice(&[
+                f.rax, f.rsi, f.rdx, f.r10, f.r8, f.r9, f.rbx, f.rbp,
+                0, f.r12, f.r13, f.r14, f.r15, f.rdi, f.rcx, f.r11,
+            ]);
+            if crate::reserve::defer_file_fault(&mut saved, cr2) {
+                f.rax = saved.x[8];
+                f.rip = saved.elr;
                 return;
             }
             report_trap(f, 14);

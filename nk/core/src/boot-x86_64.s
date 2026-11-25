@@ -27,9 +27,19 @@ multiboot_header:
     .long   0                               # architecture: i386 (32-bit protected mode)
     .long   multiboot_header_end - multiboot_header
     .long   -(0xe85250d6 + 0 + (multiboot_header_end - multiboot_header))
-    # The end tag, and nothing else. Every optional tag is a request for the
-    # loader to do more work before handing over, and this kernel wants to
-    # be handed the machine as it is.
+    # One optional request: a framebuffer (type 5, flag 1 = optional),
+    # with no preferred size and 32 bits per pixel. Under UEFI there is no
+    # VGA text mode, so a PC with no serial port shows nk nothing without
+    # it; GRUB answers with the GOP framebuffer in info tag 8 (fbcon.rs).
+    # Optional, so a loader without graphics still boots nk.
+    .align 8
+    .short  5                               # type: framebuffer
+    .short  1                               # flags: optional
+    .long   20                              # size
+    .long   0                               # width: no preference
+    .long   0                               # height: no preference
+    .long   32                              # depth
+    .align 8
     .short  0                               # type: end
     .short  0                               # flags
     .long   8                               # size
@@ -146,6 +156,13 @@ _start_common:
     # SSE instruction traps. MP set is the pair it is normally used with.
     and     $~(1 << 2), %eax                # EM: clear
     or      $(1 << 1), %eax                 # MP: monitor coprocessor
+    # NE: deliver x87 errors as #MF instead of the legacy external FERR#
+    # route. PVH leaves this clear; canonical native-system RAM admission
+    # requires the architectural exception path, just as SSE uses vector 19.
+    or      $(1 << 5), %eax
+    # CD and NW clear: firmware normally leaves the BSP's caches on, but the
+    # reset value has them off, and nothing later would correct it.
+    and     $~((1 << 29) | (1 << 30)), %eax
     mov     %eax, %cr0
 
     # A 64-bit code segment, and a far jump to load it. Until this jump the
@@ -206,22 +223,7 @@ gdt:
     # 0x28 + n*16; zeros until tss_x86 writes the base and limit.
 .global gdt_tss
 gdt_tss:
-    .quad   0
-    .quad   0
-    .quad   0
-    .quad   0
-    .quad   0
-    .quad   0
-    .quad   0
-    .quad   0
-    .quad   0
-    .quad   0
-    .quad   0
-    .quad   0
-    .quad   0
-    .quad   0
-    .quad   0
-    .quad   0
+    .zero   16 * {cpu_slots}
 gdt_end:
 
 .global gdt_pointer
@@ -262,11 +264,11 @@ boot_info:  .long 0
 // not a hang.
 .align 8
 .global ap_stack
-ap_stack:      .quad 0, 0, 0, 0, 0, 0, 0, 0
+ap_stack: .zero 8 * {cpu_slots}
 .global ap_ready
-ap_ready:      .quad 0, 0, 0, 0, 0, 0, 0, 0
+ap_ready: .zero 8 * {cpu_slots}
 .global ap_go
-ap_go:         .quad 0, 0, 0, 0, 0, 0, 0, 0
+ap_go: .zero 8 * {cpu_slots}
 // The logical CPU index the BSP is currently bringing up. Written before
 // the STARTUP IPI and read by the AP as its own slot; one at a time, so a
 // single word is enough and the BSP's serialised loop is what makes it safe.
@@ -459,12 +461,18 @@ ap_prot:
 
     movb    $0x49, %al                // 'I': EFER.LME enabled
     outb    %al, %dx
-    // CR0: PG + WP + MP, EM clear.
+    // CR0: PG + WP + MP + NE, EM clear (same exception policy as the BSP),
+    // and CD + NW clear. INIT leaves an AP with CR0 = 0x60000010: caches
+    // disabled. Nothing else turns them on, so without this every AP ran
+    // uncached -- slow everywhere, and refused by the engine's native RAM
+    // admission, which forbids CD and NW.
     mov     %cr0, %eax
     or      $(1 << 31), %eax
     or      $(1 << 16), %eax
     or      $(1 << 1), %eax
+    or      $(1 << 5), %eax
     and     $~(1 << 2), %eax
+    and     $~((1 << 29) | (1 << 30)), %eax   // NW, CD: caches on
     mov     %eax, %cr0
 
     movb    $0x4a, %al                // 'J': CR0.PG enabled, long mode live

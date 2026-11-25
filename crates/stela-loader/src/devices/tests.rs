@@ -1445,15 +1445,35 @@ fn a_hidden_neural_engine_withdraws_its_capability_and_keeps_its_links() {
     // A device the machine models keeps the property.
     let mut uart = node("uart0", Some(board::UART.as_bytes()), vec![]);
     uart.set_property("ane-type", vec![1, 0, 0, 0]).unwrap();
+    let mut ane_energy = [0u8; 40];
+    ane_energy[16..24].copy_from_slice(&[0x88, 0, 1, 0, 0, 0, 1, 64]);
+    ane_energy[24..28].copy_from_slice(b"ANE\0");
+    let mut other_energy = ane_energy;
+    other_energy[24..28].copy_from_slice(b"ISP\0");
+    let mut pmgr = node("pmgr", None, vec![]);
+    pmgr.set_property("hw-dpe-reg", [ane_energy, other_energy].concat())
+        .unwrap();
     let mut tree = DeviceTree {
         root: node(
             "device-tree",
             None,
-            vec![node("arm-io", None, vec![ane, uart])],
+            vec![node("arm-io", None, vec![ane, uart, pmgr])],
         ),
     };
+    assert!(!withdraw_hidden_ane_energy(&mut tree));
     let hidden = hide_unmodeled(&mut tree);
-    assert_eq!(hidden, ["/arm-io/ane", "/arm-io/ane ane-type"]);
+    assert_eq!(
+        hidden,
+        [
+            "/arm-io/ane",
+            "/arm-io/ane ane-type",
+            "/arm-io/pmgr hw-dpe-reg ANE",
+        ]
+    );
+    assert_eq!(
+        tree.property("/arm-io/pmgr", "hw-dpe-reg").unwrap().value,
+        other_energy
+    );
     assert!(tree.property("/arm-io/ane", "ane-type").is_none());
     assert!(tree.property("/arm-io/ane", COMPATIBLE).is_none());
     for key in [

@@ -246,6 +246,8 @@ pub fn sigaction(sig: u64, action: u64, old: u64) -> i64 {
             flags,
             restorer,
         });
+        #[cfg(target_arch = "x86_64")]
+        mirror_to_lkl(sig, handler);
         // A handler installed for a pending signal makes it deliverable:
         // wake the task in case it is waiting in `sigsuspend` or `pause`.
         if handler != SIG_DFL && handler != SIG_IGN {
@@ -253,6 +255,35 @@ pub fn sigaction(sig: u64, action: u64, old: u64) -> i64 {
         }
     }
     0
+}
+
+/// Tell Linux what this process does with `sig`, coarsely.
+///
+/// nk keeps the real dispositions; Linux keeps its own for the process's LKL
+/// task, and those were all SIG_DFL. So a signal Linux raises itself -- an
+/// itimer's SIGALRM, a socket's SIGPIPE -- took Linux's *default* action,
+/// which for SIGALRM is terminate: Linux marked the task dying, every
+/// interruptible wait returned -EINTR from then on, and busybox ping spun in
+/// recvfrom after its first reply instead of running its alarm handler.
+///
+/// Linux only needs to know caught / ignored / default. A caught signal gets
+/// a placeholder handler there (never run: LKL tasks do not return to user
+/// space through Linux), so Linux interrupts the wait and leaves the signal
+/// pending; `user::lkl_interrupted` then moves it to nk, which runs the real
+/// handler. Kernel buffers; the LKL-side struct is the asm-generic
+/// handler/flags/restorer/mask layout.
+#[cfg(target_arch = "x86_64")]
+fn mirror_to_lkl(sig: u64, handler: u64) {
+    if sig == SIGKILL || sig == SIGSTOP || sig == 0 || sig > 64 {
+        return;
+    }
+    const PLACEHOLDER: u64 = 2; // neither SIG_DFL (0) nor SIG_IGN (1)
+    let lkl_handler = if handler == SIG_DFL || handler == SIG_IGN { handler } else { PLACEHOLDER };
+    let act: [u64; 4] = [lkl_handler, 0, 0, 0];
+    let was = sched::set_user_syscall(false);
+    // asm-generic rt_sigaction = 134
+    let _ = crate::lkl::syscall(134, [sig as i64, act.as_ptr() as i64, 0, 8, 0, 0]);
+    sched::set_user_syscall(was);
 }
 
 /// # rt_sigprocmask(how, set, oldset)
@@ -460,13 +491,81 @@ pub fn deliver(frame: &mut crate::user::Frame) -> bool {
     // A handler. Block the signal itself unless `SA_NODEFER`, plus the
     // handler's mask; unblock on `rt_sigreturn`.
     sched::clear_signal_pending(me, bit(sig));
-    let mut mask = sched::signal_mask(me) | act.mask;
+    let saved_mask = mask;
+    let mut handler_mask = saved_mask | act.mask;
     if act.flags & SA_NODEFER == 0 {
-        mask |= bit(sig);
+        handler_mask |= bit(sig);
     }
-    sched::set_signal_mask(me, mask);
-    build_frame(frame, me, sig, &act);
+    sched::set_signal_mask(me, handler_mask);
+    // An interrupted syscall the handler should not see as EINTR: rewind the
+    // context the frame saves, so `rt_sigreturn` re-runs the call. Linux's
+    // rules (`arch/*/kernel/signal.c`, `handle_signal`): ERESTARTSYS only
+    // with SA_RESTART, ERESTARTNOINTR always, ERESTARTNOHAND and
+    // ERESTART_RESTARTBLOCK never once a handler runs.
+    let restart = RESTART[me.min(sched::MAX_TASKS - 1)].swap(0, Ordering::AcqRel);
+    if restart == ERESTARTNOINTR || (restart == ERESTARTSYS && act.flags & SA_RESTART != 0) {
+        rewind(frame, me);
+    }
+    build_frame(frame, me, sig, &act, saved_mask);
     true
+}
+
+// --- SA_RESTART ------------------------------------------------------------
+
+pub const ERESTARTSYS: i64 = -512;
+pub const ERESTARTNOINTR: i64 = -513;
+pub const ERESTARTNOHAND: i64 = -514;
+pub const ERESTART_RESTARTBLOCK: i64 = -516;
+
+use core::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+/// Per task: the restart code the current syscall came back with (0: none),
+/// and its first argument, which the return value overwrites in `x0`.
+static RESTART: [AtomicI64; sched::MAX_TASKS] = [const { AtomicI64::new(0) }; sched::MAX_TASKS];
+static ARG0: [AtomicU64; sched::MAX_TASKS] = [const { AtomicU64::new(0) }; sched::MAX_TASKS];
+
+/// A syscall is starting on task `me`: forget an old restart, keep `x0`.
+pub fn syscall_begin(me: usize, frame: &crate::user::Frame) {
+    let me = me.min(sched::MAX_TASKS - 1);
+    RESTART[me].store(0, Ordering::Relaxed);
+    ARG0[me].store(frame.x[0], Ordering::Relaxed);
+}
+
+/// The current syscall came back from Linux with restart code `code`
+/// (-512..=-516); the caller returns EINTR unless delivery restarts it.
+pub fn note_restart(code: i64) {
+    let me = sched::current_id().min(sched::MAX_TASKS - 1);
+    RESTART[me].store(code, Ordering::Release);
+}
+
+/// Put `frame` back on its syscall instruction with its arguments, so the
+/// return re-executes the call. x86-64 returns `x0` in rax, where the
+/// syscall number goes, and keeps rdi in its own slot; aarch64 returns
+/// `x0` in x0, the first argument, and keeps the number in x8.
+fn rewind(frame: &mut crate::user::Frame, me: usize) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let _ = me;
+        frame.x[0] = frame.x[8];
+        frame.elr -= 2; // `syscall` is 0f 05
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        frame.x[0] = ARG0[me.min(sched::MAX_TASKS - 1)].load(Ordering::Relaxed);
+        frame.elr -= 4; // `svc #0`
+    }
+}
+
+/// After a syscall delivered no handler: a call Linux interrupted restarts,
+/// as Linux restarts it when no handler runs (the signal was ignored or had
+/// a default action that does not terminate). True when rewound.
+pub fn restart_unhandled(frame: &mut crate::user::Frame) -> bool {
+    let me = sched::current_id();
+    let code = RESTART[me.min(sched::MAX_TASKS - 1)].swap(0, Ordering::AcqRel);
+    if matches!(code, ERESTARTSYS | ERESTARTNOINTR | ERESTARTNOHAND | ERESTART_RESTARTBLOCK) {
+        rewind(frame, me);
+        return true;
+    }
+    false
 }
 
 /// Build the `rt_sigframe` on the user's stack and redirect the frame.
@@ -478,7 +577,7 @@ pub fn deliver(frame: &mut crate::user::Frame) -> bool {
 /// number, `x1` a pointer to `siginfo`, `x2` a pointer to `ucontext`.
 /// `rt_sigreturn` (139) restores everything from the `ucontext`.
 #[cfg(nk_lkl)]
-fn build_frame(frame: &mut crate::user::Frame, me: usize, sig: u64, act: &Action) {
+fn build_frame(frame: &mut crate::user::Frame, me: usize, sig: u64, act: &Action, saved_mask: u64) {
     // 128 (siginfo) + 4560 (ucontext) + 128 (restorer gap), rounded to
     // keep the stack 16-byte aligned: 128+4560 = 4688, +16 = 4704.
     const FRAME_SIZE: u64 = 4704;
@@ -523,8 +622,10 @@ fn build_frame(frame: &mut crate::user::Frame, me: usize, sig: u64, act: &Action
     uc[16..24].copy_from_slice(&frame.sp.to_le_bytes());
     uc[24..32].copy_from_slice(&0u64.to_le_bytes());
     uc[32..40].copy_from_slice(&0u64.to_le_bytes());
-    let mask = sched::signal_mask(me);
-    uc[40..48].copy_from_slice(&mask.to_le_bytes());
+    // Save the interrupted mask, before adding the signal/handler mask.
+    // Restoring the temporary handler mask permanently blocked the signal
+    // after its first delivery on both architectures.
+    uc[40..48].copy_from_slice(&saved_mask.to_le_bytes());
     // mcontext at uc+176: fault 0, regs[31] = frame x, sp, pc, pstate.
     let m = 176;
     for i in 0..31 {
@@ -542,7 +643,6 @@ fn build_frame(frame: &mut crate::user::Frame, me: usize, sig: u64, act: &Action
     // validates it points at readable memory before restoring.
     uc[0..8].copy_from_slice(&(sp + 128).to_le_bytes());
     // __reserved (m+288, 4096 bytes) stays zero: no extra context.
-    let saved_mask = sched::signal_mask(me);
     if uaccess::copy_to_user(sp, &info).is_err() || uaccess::copy_to_user(sp + 128, &uc).is_err() {
         // The stack cannot hold the frame: the process is out of address
         // space or its pointer is corrupt. Terminate rather than deliver

@@ -36,58 +36,18 @@ pub fn halt() {
     unsafe { core::arch::asm!("hlt", options(nomem, nostack)) };
 }
 
-/// Which CPU this is: the initial APIC ID, bits 24..31 of EBX from CPUID.1.
-///
-/// QEMU's q35 assigns APIC IDs 0..N in boot order, so this is the CPU index
-/// for the machines nk boots on. Masked to three bits to match MAX_CPUS.
-/// Reads CPUID, not the LAPIC ID register: CPUID works before the LAPIC is
-/// mapped or enabled, and `cpu_id` is called from paths that run before it.
+/// Dense logical index established from the enabled MADT processors.
 #[inline]
 pub fn cpu_id() -> usize {
-    // rbx is LLVM's, so CPUID's ebx output is swapped out through a scratch
-    // register -- and the swap has to be the full 64 bits. With 32-bit
-    // `mov`/`xchg` the restore wrote ebx, which zeroes rbx's upper half, and
-    // whatever the compiler was keeping there lost it: x86_legacy held a
-    // syscall's result in rbx across set_user_syscall (which calls this), so
-    // mkdirat's -17 reached busybox as 0xffffffef and glibc never set errno.
-    //
-    // eax is an output too: CPUID overwrites it, and declaring it input-only
-    // let the compiler assume it survived.
-    let rbx: u64;
-    unsafe {
-        core::arch::asm!(
-            "mov {tmp}, rbx",
-            "cpuid",
-            "xchg {tmp}, rbx",
-            tmp = out(reg) rbx,
-            inout("eax") 1u32 => _,
-            out("ecx") _,
-            out("edx") _,
-            options(nomem, nostack, preserves_flags),
-        );
-    }
-    let from_cpuid = ((rbx >> 24) & 0x7) as usize;
-    // CPUID is not trustworthy this early on a secondary: the bring-up loop
-    // showed it reading 0 while the same CPU's LAPIC id was already 1. The
-    // architectural stand-in is the local APIC id; the firmware/APIC-derived
-    // dense mapping is the eventual design. Temporary, per the clean-tree
-    // parity pass.
-    let from_lapic = (crate::lapic::id() & 0xff) as usize;
-    if from_cpuid != from_lapic {
-        return from_lapic;
-    }
-    from_cpuid
+    crate::lapic::logical_id()
 }
 
-/// Interrupt another CPU so it takes its pending reschedule promptly.
-///
-/// Maps the CPU index to an APIC ID 1:1 -- true on QEMU's q35 and on every
-/// machine nk boots, where firmware assigns IDs densely from 0. Sends the
-/// reschedule vector; the target's handler sets its own need_resched and the
-/// switch happens at the next safe point, exactly like a local wakeup.
+/// Address the physical APIC that owns a logical scheduler slot.
 #[inline]
 pub fn send_ipi(cpu: usize) {
-    unsafe { crate::lapic::send_ipi(cpu as u32, crate::lapic::IPI_VECTOR) };
+    if let Some(apic) = crate::lapic::apic_id(cpu) {
+        unsafe { crate::lapic::send_ipi(apic, crate::lapic::IPI_VECTOR) };
+    }
 }
 
 /// Load `%fs.base` with the thread-local storage base.

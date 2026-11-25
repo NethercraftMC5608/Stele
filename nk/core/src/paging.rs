@@ -70,6 +70,80 @@ const ATTR_NORMAL: u64 = 1;
 
 const GB: u64 = 1 << 30;
 
+/// Mark an existing x86 boot identity range as supervisor-only, uncached
+/// MMIO. Called before APs/user address spaces exist. Rounds to the boot
+/// map's 2 MiB leaves; callers must ensure those leaves contain no RAM.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn identity_mmio(start: u64, end: u64) -> bool {
+    if start >= end || end > 1<<32 { return false; }
+    let root = table_of(crate::arch::current_page_table()) as *mut u64;
+    let lo = start & !(BLOCK_2MB-1);
+    let hi = end.div_ceil(BLOCK_2MB)*BLOCK_2MB;
+    // Validate every leaf first; this only changes the initial huge map.
+    for va in (lo..hi).step_by(BLOCK_2MB as usize) {
+        let e0 = *root.add(((va>>39)&511) as usize);
+        if e0 & pte::VALID == 0 { return false; }
+        let pdpt = table_of(e0) as *const u64;
+        let e1 = *pdpt.add(((va>>30)&511) as usize);
+        if e1 & pte::VALID == 0 || pte::is_block(e1) { return false; }
+        let pd = table_of(e1) as *const u64;
+        let e2 = *pd.add(((va>>21)&511) as usize);
+        if e2 & pte::VALID == 0 || !pte::is_block(e2) || e2 & 0x000f_ffff_ffe0_0000 != va { return false; }
+    }
+    for va in (lo..hi).step_by(BLOCK_2MB as usize) {
+        let pdpt = table_of(*root.add(((va>>39)&511) as usize)) as *const u64;
+        let pd = table_of(*pdpt.add(((va>>30)&511) as usize)) as *mut u64;
+        let entry = pd.add(((va>>21)&511) as usize);
+        *entry = (*entry | pte::PCD | pte::PWT | pte::NX) & !pte::USER;
+    }
+    crate::arch::tlb_flush_all();
+    true
+}
+
+/// Change one exclusively owned boot identity RAM page between RW/NX and RX.
+/// Called only before APs and user address spaces exist: no remote TLB can
+/// retain the old rights. There is no writable alias of this identity page.
+///
+/// # Safety
+/// `page` is an allocated, exclusively owned 4 KiB RAM frame in the kernel
+/// identity arena. No references or execution may overlap a rights change.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn boot_code_rights(page: u64, executable: bool) {
+    assert!(page >= 1 << 30 && page < 1 << 32 && page & 4095 == 0);
+    let root = table_of(crate::arch::current_page_table()) as *mut u64;
+    let l1 = next_table(root.add(((page >> L0_SHIFT) & 511) as usize));
+    let l2 = next_table(l1.add(((page >> L1_SHIFT) & 511) as usize));
+    let l3 = next_table(l2.add(((page >> L2_SHIFT) & 511) as usize));
+    let entry = l3.add(((page >> L3_SHIFT) & 511) as usize);
+    assert_eq!(*entry & ADDR, page);
+    assert_ne!(*entry & pte::VALID, 0);
+    *entry = (*entry & !(pte::WRITABLE | pte::NX | pte::USER))
+        | if executable { 0 } else { pte::WRITABLE | pte::NX };
+    crate::arch::memory_barrier();
+    crate::arch::tlb_flush_all();
+}
+
+/// Install a borrowed RAM page in an inactive boot guest's private low subtree.
+/// ARM code is data to x86: these leaves are always NX and supervisor-only.
+/// # Safety
+/// `root` is a private root from new_address_space, inactive and pre-SMP;
+/// `pa` is owned live RAM. The owner must remove borrowed leaves before
+/// destroy_user_address_space, which normally frees a process's leaf frames.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn boot_shadow_page(root: u64, va: u64, pa: u64, writable: bool) {
+    assert_ne!(root, kernel_address_space());
+    assert!(va >= crate::user::USER_BASE && va < 1 << 30 && va & 4095 == 0);
+    assert_eq!(pa & 4095, 0);
+    assert_ne!(root, table_of(crate::arch::current_page_table()));
+    let l0 = root as *mut u64;
+    let l1 = next_table(l0.add(((va >> L0_SHIFT) & 511) as usize));
+    let l2 = next_table(l1.add(((va >> L1_SHIFT) & 511) as usize));
+    let l3 = next_table(l2.add(((va >> L2_SHIFT) & 511) as usize));
+    *l3.add(((va >> L3_SHIFT) & 511) as usize) = pa | pte::VALID | pte::NX
+        | if writable { pte::WRITABLE } else { 0 };
+    crate::arch::memory_barrier();
+}
+
 /// What nk maps as Device memory, rounded outwards to 2MB blocks.
 ///
 /// From the machine rather than from a guess would be better, and the device
@@ -305,6 +379,152 @@ pub unsafe fn reserve_linux_window() {
         va += 1 << L1_SHIFT;
     }
     crate::arch::memory_barrier();
+}
+
+/// A kernel window for device MMIO that the low 4 GiB identity map does not
+/// reach: firmware puts 64-bit BARs high (QEMU's NVMe at 768 GiB), and real
+/// PCs do the same. 1 GiB at 12 GiB, inside PML4[0] and clear of the identity
+/// map (0-4 GiB) and Linux's window (4-8 GiB).
+#[cfg(target_arch = "x86_64")]
+pub const MMIO_VA_BASE: u64 = 12 << 30;
+#[cfg(target_arch = "x86_64")]
+pub const MMIO_VA_SIZE: u64 = 1 << 30;
+#[cfg(target_arch = "x86_64")]
+static MMIO_NEXT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Create the MMIO window's directory before any process exists, for the
+/// same reason as `reserve_linux_window`: address spaces copy the kernel's
+/// upper tables by pointer, so a directory made later would be missing from
+/// every process created before it -- and Linux drives devices from inside a
+/// process's syscalls, on that process's CR3.
+///
+/// # Safety
+/// The frame allocator is up and no process exists yet.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn reserve_mmio_window() {
+    let l0 = table_of(kernel_address_space()) as *mut u64;
+    let va = MMIO_VA_BASE;
+    let l1 = next_table(l0.add(((va >> L0_SHIFT) & 511) as usize));
+    let l1e = l1.add(((va >> L1_SHIFT) & 511) as usize);
+    assert!(
+        *l1e & pte::VALID == 0 || !pte::is_block(*l1e),
+        "the MMIO window overlaps a block mapping at {va:#x}"
+    );
+    next_table(l1e);
+    crate::arch::memory_barrier();
+}
+
+/// Map `[phys, phys+len)` uncached, supervisor-only and non-executable into
+/// the MMIO window, in 2 MiB pages, and return the virtual address of `phys`.
+/// Bump-allocated: device mappings live as long as the machine.
+///
+/// # Safety
+/// `reserve_mmio_window` has run, and the range is device memory, not RAM.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn map_mmio_high(phys: u64, len: u64) -> Option<u64> {
+    use core::sync::atomic::Ordering;
+    let lo = phys & !(BLOCK_2MB - 1);
+    let hi = phys.checked_add(len)?.div_ceil(BLOCK_2MB) * BLOCK_2MB;
+    let span = hi - lo;
+    let off = MMIO_NEXT
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            (n + span <= MMIO_VA_SIZE).then_some(n + span)
+        })
+        .ok()?;
+    let l0 = table_of(kernel_address_space()) as *const u64;
+    let e0 = *l0.add(((MMIO_VA_BASE >> L0_SHIFT) & 511) as usize);
+    let l1 = (e0 & ADDR) as *const u64;
+    let e1 = *l1.add(((MMIO_VA_BASE >> L1_SHIFT) & 511) as usize);
+    if !is_table(e1) {
+        return None; // reserve_mmio_window has not run
+    }
+    let pd = (e1 & ADDR) as *mut u64;
+    let mut i = 0;
+    while i < span {
+        let va = MMIO_VA_BASE + off + i;
+        *pd.add(((va >> L2_SHIFT) & 511) as usize) =
+            (lo + i) | pte::VALID | pte::WRITABLE | pte::HUGE | pte::PCD | pte::PWT | pte::NX;
+        i += BLOCK_2MB;
+    }
+    crate::arch::tlb_flush_all();
+    Some(MMIO_VA_BASE + off + (phys - lo))
+}
+
+/// Guest DRAM for translated ARM64 guests, at the guest's own physical
+/// addresses: the M2's DRAM starts at 32 GiB, which nk's map leaves free
+/// (identity 0-4 GiB, Linux 4-8 GiB, MMIO 12-13 GiB); 8 GiB of window. Native guest code
+/// then reaches guest RAM with the MMU off at the address the guest uses.
+#[cfg(target_arch = "x86_64")]
+pub const GUEST_DRAM_VA: u64 = 0x8_0000_0000;
+#[cfg(target_arch = "x86_64")]
+pub const GUEST_DRAM_SIZE: u64 = 8 << 30;
+
+/// Create the guest DRAM window's directory before any process exists, for
+/// the same reason as `reserve_mmio_window`.
+///
+/// # Safety
+/// The frame allocator is up and no process exists yet.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn reserve_guest_dram_window() {
+    let l0 = table_of(kernel_address_space()) as *mut u64;
+    let mut va = GUEST_DRAM_VA;
+    while va < GUEST_DRAM_VA + GUEST_DRAM_SIZE {
+        let l1 = next_table(l0.add(((va >> L0_SHIFT) & 511) as usize));
+        let l1e = l1.add(((va >> L1_SHIFT) & 511) as usize);
+        assert!(
+            *l1e & pte::VALID == 0 || !pte::is_block(*l1e),
+            "the guest DRAM window overlaps a block mapping at {va:#x}"
+        );
+        next_table(l1e);
+        va += 1 << L1_SHIFT;
+    }
+    crate::arch::memory_barrier();
+}
+
+/// Map one owned RAM frame at `va` in the guest DRAM window: write-back,
+/// supervisor-only, never executable (ARM code is data to x86).
+///
+/// # Safety
+/// `reserve_guest_dram_window` has run, `pa` is an owned 4 KiB RAM frame
+/// that stays allocated while mapped, and only one task maps this window.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn map_guest_dram(va: u64, pa: u64) -> bool {
+    if va < GUEST_DRAM_VA || va >= GUEST_DRAM_VA + GUEST_DRAM_SIZE || (va | pa) & 4095 != 0 {
+        return false;
+    }
+    let l0 = table_of(kernel_address_space()) as *mut u64;
+    let l1 = (*l0.add(((va >> L0_SHIFT) & 511) as usize) & ADDR) as *mut u64;
+    let e1 = l1.add(((va >> L1_SHIFT) & 511) as usize);
+    if !is_table(*e1) {
+        return false; // reserve_guest_dram_window has not run
+    }
+    let l2 = (*e1 & ADDR) as *mut u64;
+    let l3 = next_table(l2.add(((va >> L2_SHIFT) & 511) as usize));
+    *l3.add(((va >> L3_SHIFT) & 511) as usize) = pa | pte::VALID | pte::WRITABLE | pte::NX;
+    true
+}
+
+/// Remove the mapping at `va` in the guest DRAM window (the caller flushes
+/// TLBs and frees the frame).
+///
+/// # Safety
+/// No code reaches `va` any more.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn unmap_guest_dram(va: u64) {
+    if va < GUEST_DRAM_VA || va >= GUEST_DRAM_VA + GUEST_DRAM_SIZE {
+        return;
+    }
+    let l0 = table_of(kernel_address_space()) as *mut u64;
+    let l1 = (*l0.add(((va >> L0_SHIFT) & 511) as usize) & ADDR) as *mut u64;
+    let e1 = *l1.add(((va >> L1_SHIFT) & 511) as usize);
+    if !is_table(e1) {
+        return;
+    }
+    let e2 = *((e1 & ADDR) as *mut u64).add(((va >> L2_SHIFT) & 511) as usize);
+    if !is_table(e2) {
+        return;
+    }
+    *((e2 & ADDR) as *mut u64).add(((va >> L3_SHIFT) & 511) as usize) = 0;
 }
 
 /// Map physical pages into Linux's window.

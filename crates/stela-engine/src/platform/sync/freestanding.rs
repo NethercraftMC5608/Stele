@@ -33,7 +33,7 @@ fn relax() {
     core::hint::spin_loop();
 }
 
-#[cfg(not(all(target_arch = "x86_64", target_os = "uefi")))]
+#[cfg(not(all(target_arch = "x86_64", stela_ring0)))]
 compile_error!("freestanding metadata locks require the x86-64 ring-0 platform");
 
 pub(crate) struct Mutex<T: ?Sized> {

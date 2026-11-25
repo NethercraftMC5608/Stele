@@ -5,8 +5,7 @@
 //! Consulted only after `x86_to_lkl::translate`'s hand-written arms, which
 //! win. Calls whose arguments or structures differ between the two ABIs are
 //! deliberately absent -- renumbering them would hand a program the wrong
-//! layout with a success code: fstat/newfstatat (struct stat), epoll_ctl/
-//! epoll_pwait/epoll_pwait2 (x86's packed epoll_event), clone/clone3,
+//! layout with a success code: fstat/newfstatat (struct stat), clone/clone3,
 //! rt_sigreturn, mmap, arch_prctl, fork/vfork (nk implements these).
 //!
 //! x86-only calls with no asm-generic number (open, stat, pipe, dup2, ...)

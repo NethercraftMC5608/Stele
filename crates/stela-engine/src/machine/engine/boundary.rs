@@ -574,6 +574,12 @@ pub trait Host {
     }
     /// Progress events for the diagnostic log.
     fn report(&mut self, _event: &Event) {}
+    /// Registers at a user-mode SVC before the exception changes the regime.
+    fn report_user_svc(&mut self, _pc: u64, _immediate: u16, _state: &GuestState) {}
+    /// Keep SVC on the engine path so a host diagnostic sees every call.
+    fn observes_user_svc(&self) -> bool {
+        false
+    }
     /// The persistent translation store blocks are taken from and offered
     /// to, if the host keeps one ([`Translations`]).
     fn translations(&mut self) -> Option<&mut dyn Translations> {

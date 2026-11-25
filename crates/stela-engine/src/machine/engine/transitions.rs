@@ -669,6 +669,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
         ending: u32,
     ) -> Option<u64> {
         let (kind, immediate) = transition_word(word)?;
+        if kind == SUPERVISOR_CALL && self.host.observes_user_svc() {
+            return None;
+        }
         let site = native.len().checked_sub(chain::DIRECT_EXIT_BYTES)?;
         if !chain::is_direct_exit(&native[site..], GuestAddress(pc), ExitKind::System) {
             return None;

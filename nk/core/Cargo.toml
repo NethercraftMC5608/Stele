@@ -11,3 +11,25 @@ license = "GPL-2.0-or-later"
 [[bin]]
 name = "nk"
 path = "src/main.rs"
+
+# Stele's arm64 -> x86-64 translator, linked into nk (ROADMAP Phase 4). Off by
+# default: `--features stela` builds nk with it and runs trusted translated
+# ARM64 execution checks at x86 boot, before SMP and LKL startup.
+[features]
+stela = ["dep:stela-compiler", "dep:stela-engine", "dep:stela-contracts", "dep:stela-crypto", "dep:stela-soc", "dep:stela-soc-data", "dep:stela-runtime", "dep:stela-formats", "dep:stela-loader", "dep:stela-driver-base"]
+
+[dependencies]
+stela-compiler = { path = "../../crates/stela-compiler", default-features = false, optional = true }
+stela-engine = { path = "../../crates/stela-engine", default-features = false, optional = true }
+stela-contracts = { path = "../../crates/stela-contracts", default-features = false, optional = true }
+stela-crypto = { path = "../../crates/stela-crypto", features = ["force-software"], optional = true }
+stela-soc = { path = "../../crates/stela-soc", default-features = false, optional = true }
+# The board mount stela.efi uses (`machine::mount`) and the bundle's formats.
+stela-runtime = { path = "../../crates/stela-runtime", default-features = false, optional = true }
+stela-formats = { path = "../../crates/stela-formats", default-features = false, optional = true }
+stela-loader = { path = "../../crates/stela-loader", default-features = false, optional = true }
+# The block device trait behind the mounted ANS2's sparse disk.
+stela-driver-base = { path = "../../crates/stela-driver-base", optional = true }
+# test-support: the M2-shaped DeviceTree fixture the board probe mounts
+# until a real ADT is read from disk.
+stela-soc-data = { path = "../../crates/stela-soc-data", default-features = false, features = ["test-support"], optional = true }

@@ -44,6 +44,10 @@ without the owner asking.
 | Language | Rust workspace + vendored C (Linux, Mesa, LLVM, xnu submodules) | Rust `no_std` kernel in `kernel/`, Python/shell elsewhere |
 | Licence | GPL-2.0-or-later | `kernel/core` separately licensed; `kernel/linux` GPL-2.0 |
 
+nk was also imported into this repository as `nk/` (`c4cad58`, `207fbb4`);
+continue host work there unless cross-repository changes are needed. It has
+its own Rust workspace and stable toolchain; run its cargo commands in `nk/`.
+
 Code may move from Stele into nk, but anything copied into `kernel/core`
 makes that part GPL-2.0-or-later. Say so in the commit when you do it.
 
@@ -92,19 +96,30 @@ ring 3, static busybox, `fork`/`vfork`/`execve`, signals with handlers and
 `stat` converted between layouts. The harness `/nk-init` script runs to the
 end. Next gaps, in order:
 
-`ls`, `find`, pipelines and file I/O work too (open flags translated); epoll
-records are repacked but no test program has exercised epoll yet.
+`ls`, `find`, pipelines and file I/O work too (open flags translated). The
+epoll probe now passes on nk + LKL with four active QEMU CPUs; see
+`nk/tests/README.md`. x86 LKL already uses packed events, so no repacking.
 
-1. Test epoll and dynamically linked programs (the harness is static busybox).
-2. The same syscall-return-before-signal ordering fix on aarch64 (done on x86).
-3. ACPI (MADT, MCFG), PCI enumeration, MSI-X, then LKL's PCI host ops, so
-   real drivers (NVMe, igc/e1000e, r8169, snd_hda_intel) attach.
+1. Dynamic glibc/Python and `dlopen` now pass with the rebuilt x86 LKL archive
+   (`nk/tests/run-dynamic-x86.py`). x86 file faults use the syscall trampoline
+   and preserve all general registers plus FP/SIMD state.
+2. Eight pthread-backed Python threads pass with `--threads`: distinct glibc
+   errno/TLS pointers, timed waits, lock contention and joins on four QEMU CPUs.
+   Signal return ordering and pre-handler mask
+   restoration now pass on aarch64 and x86 (`nk/tests/run-signal-return.py`).
+3. ACPI/MADT/MCFG discovery and read-only PCI inventory now work in QEMU
+   (`nk/tests/run-platform-x86.py`), including sparse APIC IDs and a bridged
+   NVMe. IOAPIC timer routing plus MSI/MSI-X device delivery now pass in
+   QEMU (`nk/tests/run-pci-irq-x86.py`). Next: LKL's PCI host ops, DMA and
+   Linux IRQ bindings, so real Linux drivers attach. FADT registers are
+   discovered; power operations remain open.
 4. Real hardware via GRUB (Multiboot2). Then VT-x, then the Stele translator on nk.
 
 Build and boot (from `kernel/`):
 
 ```bash
 NK_LKL_LIB="$PWD/ldk/build/lkl-x86_64/libnklkl.a" \
+  NK_SMP=1 NK_AP_LAYER=4 \
   cargo build --release --target x86_64-unknown-none --target-dir target-hx
 qemu-system-x86_64 -M q35 -m 4G -smp 4 \
   -kernel target-hx/x86_64-unknown-none/release/nk \
@@ -114,9 +129,87 @@ qemu-system-x86_64 -M q35 -m 4G -smp 4 \
 
 The x86 build needs `NK_LKL_LIB` (modules are cfg'd out without it). Rebuilding
 LKL needs Docker (`colima start`), then `python3 ldk/ldk.py lkl --arch x86_64`.
+On Apple silicon that cross-compiles natively (`x86_64-linux-gnu-`); a full
+rebuild takes about 90 seconds with Colima at 12 CPUs / 16 GiB. Don't go back
+to the emulated amd64 builder: ~20 minutes and random gcc segfaults.
+`NK_SMP=1` also needs `NK_AP_LAYER=4`: layer zero does not initialize the
+AP scheduler slots and panics on an invalid current-task index.
+The old NETHOS cached x86 archive predates the retained-file ABI fix. The local
+`nk/ldk/build/lkl-x86_64/libnklkl.a` was rebuilt and verified on 2026-11-24;
+use it for dynamic glibc/Python. The reproducer and exact failures are
+documented in `nk/tests/README.md`.
+`python3 nk/ldk/lkl_abi.py <archive>` checks actual private syscall-table
+relocations without Docker. New archive publication and the dynamic runner
+require it to pass; both the rebuilt x86 archive and cached arm64 archive pass.
 
 ## x86 pitfalls already paid for
 
+- **Ordinary translated blocks need the canonical entry thunk.**
+  `stela_compiler::x86_64::block_entry::enter` saves the host stack in
+  `GuestState::exit_rsp`; a plain function-pointer call leaves exits restoring
+  RSP from zero. `nk/core/src/stela_nk.rs` exercises trusted finite blocks
+  before SMP with owned RW/NX -> RX code pages. Its private `host.rs` now runs
+  a real system-mode `Machine`, with bounded MMU-off RAM and idle code patching.
+  System blocks need the pinned entry plus callee-saved host register
+  preservation; ordinary block entry alone is insufficient. Native fault
+  recovery and the existing S5L UART model now pass in the private fixture;
+  general guest isolation and concurrent code remain open. A separate bounded
+  MMU-on fixture now uses ARM tables and a private x86 shadow root.
+- **Native fault recovery is invocation-owned.** The pre-SMP probe runs after
+  IDT/TSS setup with IF masked. Only synchronous faults whose RIP belongs to
+  the active immutable native images are captured; other faults use nk's
+  normal path. `isr_common` passes its FXSAVE image so recovery captures XMM8-15
+  before Rust can change them. No engine/LKL work runs inside the handler.
+  Full spill/extended-register recovery, general shadow paging, guest concurrency
+  and arbitrary guest code remain unsupported. A missing device must raise an ARM
+  abort, never return a fabricated value.
+- **Shadow leaves borrow their backing.** `stela_nk/host/shadow.rs` uses a
+  private low 2 MiB aperture, separate guest physical RAM and Stela's ARM
+  walker. It eagerly rebuilds mappings outside native entry; no table walks
+  or allocations happen in the trap. Supervisor/NX x86 leaves enforce guest
+  data write permissions. CR3 is restored before fault classification; the
+  fresh ARM walk distinguishes permission/translation faults from device PAs.
+  Before destroying the root, remove borrowed leaves without freeing payload
+  frames, then let the RAM owner free them. Guest TLBI permission and unmap
+  tests pass. Nine address-space turns now verify guest MSR TTBR0 switches,
+  distinct code/data at the same VAs, and ASID reuse with explicit TLBI.
+  The host still eagerly rebuilds one root: retained per-ASID roots, scoped
+  invalidation, general demand fills and isolation remain open. MMU-on UART
+  accesses also translate VA to device PA without mapping a RAM leaf.
+- **Guest physical RAM need not be contiguous on the host.** The private
+  `stela_nk/ram.rs` owner reserves a checked guest range and commits zeroed
+  4 KiB frames as needed before native entry. Uncommitted reads return zero;
+  cross-page copies split at backing boundaries. Raw host pointers cover only
+  one resident page. The shadow fixture reserves 4 GiB, with data near its
+  6 GiB upper end backed by an nk frame below 4 GiB. Model DMA ports use the
+  same checked memory interface, including exact partial-transfer progress.
+  This remains pre-SMP: no production memory service, real-device DMA/DART,
+  retained ASID roots or general native demand filling is implied.
+- **Canonical RAM handoff consumes the sparse builder.** Its unsafe
+  `into_registered` path transfers committed frames to the engine's real
+  `RegisteredSystemRam::register` at CPL0 with IF masked. No payload is copied;
+  an immutable keep-alive reclaims frames after the last backing drops.
+  Uncommitted holes stay unregistered. Retire all shadow/direct-writer aliases
+  before handoff, and use only canonical physical/service APIs afterward.
+  The separate probe verifies publication, descriptor CAS, refusal across
+  holes, service exclusion, permanent owner failure and reclamation. Existing
+  translated fixtures still use their older private host; they do not acquire
+  canonical native-execution permission. Keep everything before SMP until the
+  frame allocator and persistent guest ownership are made safe for it.
+- **Set CR0.NE during x86 boot.** PVH left CR0 at `0x80010013`, so the engine's
+  canonical native-target admission correctly refused. BSP and AP setup now
+  enable native x87 exceptions (#MF) rather than the external FERR# route.
+  Do not weaken the engine's control checks to accommodate a missing boot bit.
+- **The engine probe needs a dedicated stack.** A measured 209,320-byte stack
+  footprint corrupted LKL statics below nk's 64 KiB boot stack, despite the
+  engine fixture itself passing. It now runs on an owned 1 MiB pre-SMP stack,
+  checks its bottom canary and reports touched bytes before freeing it.
+- **Dynamic tests must provision entropy.** Python/urandom stalled in Linux's
+  `try_to_generate_entropy` without a seeded CRNG. The dynamic runner now
+  supplies 32 fresh host-CSPRNG bytes to its test image; `seed-entropy-x86.c`
+  credits them with RNDADDENTROPY and requires nonblocking getrandom to fill
+  a buffer before Python starts. This is test provisioning, not a production
+  RNG provider; do not substitute fixed/time-derived seeds or insecure flags.
 - **Shared code assumes aarch64 numbers and layouts.** Clone was dispatched on
   `220` (aarch64) instead of `nr::CLONE` (56 on x86). Clone's last two args are
   swapped between ABIs. Asm-generic structs (`stat`, `epoll_event`) differ from
@@ -124,13 +217,102 @@ LKL needs Docker (`colima start`), then `python3 ldk/ldk.py lkl --arch x86_64`.
 - **LKL uses arm64's open flags** (`patch-lkl.py: arm64_open_flags`), so x86
   `O_DIRECTORY`/`O_DIRECT`/`O_LARGEFILE`/`O_NOFOLLOW` are translated in
   `x86_legacy` (`open_flags_in`/`_out`). Any new call taking open flags needs it.
+- **epoll layout follows the build compiler too.** Linux's UAPI selects a
+  packed 12-byte event under `__x86_64__`, including x86 LKL. Repacking it as
+  an asm-generic 16-byte event corrupts data and multi-event strides. Use
+  `nk/tests/run-epoll-x86.py` to exercise all three wait variants.
+- **Linux PCI drivers go through `lkl_pci_x86.rs`.** LKL hosts exactly one
+  PCI device, named by `lkl_pci=` (nk picks the first NVMe). Config writes go
+  at native width (`Hardware::write8/16/32`) because RMW would clear RW1C
+  status bits. BARs above 4 GiB are mapped in the kernel MMIO window at
+  12 GiB, whose directory must exist before the first process. LKL's PCI
+  host is x86-only (`lkl/nk-x86_64.config`): on aarch64 it would route
+  virtio-mmio DMA through `lkl_dma_ops`.
+- **LKL on x86 is built with `-mno-red-zone`** (`ldk.py`, KCFLAGS and the
+  nk-host.c compile). Linux runs at ring 0 under nk, where interrupts push
+  onto the current stack; with the userspace red zone, device interrupts
+  overwrote driver locals. Rebuilding the archive is required after pulling.
+- **The x86 clock is the TSC** (`timer::time_ns`, `nk_time_ns`). Syscalls run
+  with IF masked, so a tick-based clock froze and LKL's `udelay` spun forever.
+- **Signals Linux raises itself** (itimer SIGALRM, SIGPIPE) are moved to nk on
+  an interrupted return (`user::lkl_interrupted`, draining with
+  `rt_sigtimedwait`), and caught dispositions are mirrored into LKL
+  (`signal::mirror_to_lkl`) so Linux doesn't take the default action. x86
+  only so far; aarch64 has the same gap.
+- **Real PCs boot nk through GRUB (Multiboot2) on UEFI.** `tests/run-uefi-x86.py`
+  builds the same disk image a USB stick needs and boots it under OVMF; use it
+  for anything touching boot info, ACPI discovery or the console. The screen
+  console (`fbcon.rs`) mirrors serial output; GRUB calls GOP's 32-bit pixels
+  24 bpp.
+- **CPU 0 belongs to Linux; dedicated APs belong to one task.** While LKL is
+  active, anything that may run on CPU 0 runs only there; APs run only tasks
+  that exclude CPU 0. `sched::dedicate_cpu` gives an AP to one task (guest
+  vCPUs) and masks its tick. Never give a Linux-ABI task an affinity without
+  CPU 0.
+- **APs must clear CR0.CD/NW, and the frame allocator is locked.** INIT
+  leaves CR0 = 0x60000010 (caches off); the AP trampoline now clears CD and
+  NW, and the engine's native RAM admission refuses a CPU that has them set
+  (`RegistrationError::NativeTarget`). `frames::alloc`/`free` take a
+  spinlock with IF masked: CPU 0 and dedicated APs allocate concurrently.
+- **LKL calls come from CPU 0.** A dedicated core cannot make Linux
+  syscalls; read what it needs (bundle files) before dedicating it.
+- **The SEP needs a machine ECID in the tree.** Prepare bundles with
+  `stela-dev boot prepare --ecid $(cat ~/Stele-assets/nk-machine-ecid.txt)`;
+  an IPSW tree alone has none.
+- **Guest DRAM lives at its own address.** `paging::GUEST_DRAM_VA`
+  (32 GiB, 1 GiB, directory reserved before processes) holds guest DRAM at
+  the M2's physical addresses; `DramHost` reads and runs it there with the
+  MMU off. Back it frame by frame (contiguous runs are scarce; register one
+  range per physical run) and give it back after a probe. nk has ~420 MiB
+  of frames in QEMU and about 180 MiB free once a 127 MiB bundle initrd is
+  unpacked. The user stack arena is reserved at boot
+  (`user::reserve_stack_arena`): freed frames never rebuild contiguity. In zsh write `${f}:stele/${f}`, not `$f:stele` (`:s` is a modifier).
+- **The engine's run budget is a total.** `Machine::run(n)` stops once the
+  cumulative block count reaches `n`; loop with `statistics.blocks + slice`.
+- **Run the SPTM probe under `-cpu max`.** With QEMU's default CPU the
+  engine's target is too old and SPTM dies on `ldapr` (EC 0). Guest DRAM
+  comes from RAM above 4 GiB (`frames::alloc_high`, `--memory 6G`); prepare
+  the bundle with `--dram-size` equal to what nk backs, or SPTM writes past
+  it (external abort at the first unbacked page).
+- **Handoff for the XNU boot work: `nk/docs/HANDOFF-XNU.md`** (state, the
+  Bazzite KVM host `nether@192.168.1.9`, run commands, current panic).
+- **KASLR moves XNU every boot.** Name a dumped PC by finding its bytes in
+  the kernelcache (one page-aligned slide) and the strings it references.
+- **The cacheless M2 memory plan needs `-disable_mcc`** on XNU's command
+  line; nk appends it to the bundle's boot-args patch, as stela.efi does.
+- **Apple's files stay out of the repo.** The M2 IPSW and the bundle
+  `stela-dev boot prepare` makes from it live in `~/Stele-assets`
+  (`bundle-Mac14,2-26B131/devicetree.adt`); tests take them by path
+  (`run-dedicated-x86.py --add HOST:GUEST`). The user-facing `stela` CLI
+  only manages USB sticks; bundle commands are `stela-dev boot ...`.
+- **Take AIC offsets from the parsed layout, never a constant.** The M2's
+  AICv2 has MAX_IRQ 0x1000 (mask-clear array at 0x6600), not the 0x400 of
+  unit-test fixtures; a guest probe with hard-coded offsets unmasks the wrong
+  input and simply never gets an IRQ. `stela-soc-data`'s `test-support`
+  feature works on nk (`no_std`) since `test_chip` needs `std` explicitly.
+- **Host device work reaches a guest as a line plus a kick.** Set the line
+  (an atomic the board's `Devices::lines` forwards into the AIC model), then
+  IPI the dedicated core on vector 0xed. A kick that arrives while the guest
+  runs (IF masked) is delivered when it returns; a PE waiting with no
+  deadline makes `run` return `Stop::Waiting` (`Devices::waits_on_host`).
+- **CPU 0's LAPIC timer carries Linux's one-shots** (`hostops`,
+  `claim_deadline_timer`); the tick is the PIT. On x86 one-shot deadlines are
+  TSC nanoseconds, not ticks. Only touch `TIMERS` on CPU 0 with IF masked,
+  and never arm or cancel the hrtimer from another CPU: elsewhere it may
+  belong to a dedicated core's guest.
+- **Guest WFI sleeps on the dedicated core's hrtimer.** `BootHost::arm_timer`
+  arms `hrtimer::arm_at`; `wait_for_interrupt` opens interrupts only across
+  `sti; hlt; cli`, because `fault::invoke` needs IF masked while guest code
+  runs. Without a claimed hrtimer (pre-SMP probes) it spins on the counter.
 - **The kernel links at 1 GiB on x86** (`linker-x86_64.ld`), because static
   binaries load at 0x400000 and every process owns the low gigabyte. Each
   address space has private copies of the top three page-table levels, exactly
   like aarch64. Don't map anything of the kernel's below 1 GiB.
-- **`LKL_CPU_SEED`** in `main.rs` is a hardcoded address of LKL's `cpu` symbol.
-  Any relink can move it; the boot log says `was stale ... update LKL_CPU_SEED`.
-  Get the new value with `nm <nk> | grep ' b cpu$'`.
+- **LKL CPU state is linker-resolved.** `core/build.rs` and `lkl_archive.rs`
+  copy the input archive into OUT_DIR, export/namespace its BSS `cpu` as
+  `nk_lkl_cpu`, and leave the source archive untouched. Rust references that
+  symbol directly and validates its live layout after LKL initializes it.
+  Keep this path; do not reintroduce hardcoded addresses or memory scans.
 - **Entry asm restores registers before using them as indices.** Read the
   per-CPU slot first, then restore user registers (`syscall_entry`). In
   `resume_user`, `r10` carries the user rsp until the iret frame is pushed.
@@ -140,8 +322,25 @@ LKL needs Docker (`colima start`), then `python3 ldk/ldk.py lkl --arch x86_64`.
   through 32-bit registers around CPUID and zeroed rbx's upper half, so a
   syscall result held in rbx came back as `0xffffffef`. A syscall that "returns
   a positive number but should have failed" smells like this.
+- **APIC IDs are hardware identifiers, not scheduler indices.** MADT can have
+  gaps (QEMU with six CPUs/two sockets uses 0,1,2,4,5,6). `lapic` maps them
+  to dense logical slots for `cpu_id`, AP stacks and outgoing IPIs. Never
+  reintroduce an APIC-ID mask or stop probing at the first numeric gap.
+- **Interrupts must not enter LKL directly.** Device vectors use bounded
+  callbacks to acknowledge hardware and `lklirq::raise` to defer Linux work.
+  `lkl_trigger_irq` can block and belongs only in the IRQ pump. The BSP's PIT
+  uses IOAPIC vector 0x40 when MADT routing is usable; AP timers stay at 0xef.
+- **PCI Command and Status share a dword.** Use native 16-bit Command writes:
+  reflecting the Status half of a read/modify/write clears W1C bits. MSI is
+  itself a bus-master write; QEMU interrupt probes temporarily enable BME
+  and restore it, while leaving packet/disk DMA engines stopped.
 - **Signals on x86:** the restorer goes on the stack at `[rsp]`, arguments in
   rdi (`x[13]`), rsi, rdx, and the frame skips the 128-byte red zone.
+- **Save completed returns and interrupted masks.** Set the syscall result
+  before building a signal frame (aarch64 needs this too), and save the mask
+  from before adding the handler/self-block bits. Restoring the temporary
+  mask made only the first signal work. Run `run-signal-return.py` on both
+  architectures after signal changes.
 - **Debug by measurement.** lldb can attach to QEMU's gdbstub (`-s -S`,
   `gdb-remote 1234`); write breakpoint callbacks to a file, since batch output
   is lost when the process is killed. QEMU's `-d int -D file` gives the real faulting

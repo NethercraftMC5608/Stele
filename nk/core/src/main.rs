@@ -101,9 +101,9 @@ global_asm!(include_str!("user.s"));
 // defaults to Intel on x86. Without it the first `mov $x, %reg` is a parse
 // error about an unknown token, which names the column and not the cause.
 #[cfg(target_arch = "x86_64")]
-global_asm!(include_str!("boot-x86_64.s"), options(att_syntax));
+global_asm!(include_str!("boot-x86_64.s"), cpu_slots = const sched::MAX_CPUS, options(att_syntax));
 #[cfg(target_arch = "x86_64")]
-global_asm!(include_str!("user-x86_64.s"), options(att_syntax));
+global_asm!(include_str!("user-x86_64.s"), cpu_slots = const sched::MAX_CPUS, options(att_syntax));
 // The ring-3 smoke test, copied verbatim to USER_BASE by `user::spawn`.
 //
 // Not an ELF: spawn copies one page and jumps to its first byte, so the
@@ -135,6 +135,36 @@ global_asm!(include_str!("interrupts-x86_64.s"), options(att_syntax));
 
 #[cfg(target_arch = "x86_64")]
 pub mod bootinfo_x86;
+#[cfg(target_arch = "x86_64")]
+pub mod acpi;
+#[cfg(target_arch = "x86_64")]
+pub mod fbcon;
+#[cfg(target_arch = "x86_64")]
+pub mod hrtimer;
+#[cfg(target_arch = "x86_64")]
+pub mod font8x16;
+#[cfg(target_arch = "x86_64")]
+pub mod pci;
+#[cfg(target_arch = "x86_64")]
+mod platform_x86;
+#[cfg(target_arch = "x86_64")]
+pub mod irq_x86;
+#[cfg(target_arch = "x86_64")]
+pub mod device_irq_x86;
+#[cfg(target_arch = "x86_64")]
+pub mod ioapic;
+#[cfg(target_arch = "x86_64")]
+pub mod pci_irq;
+#[cfg(target_arch = "x86_64")]
+mod pci_irq_test;
+#[cfg(target_arch = "x86_64")]
+mod pci_msix_test;
+#[cfg(all(nk_lkl, target_arch = "x86_64"))]
+mod dedicated_test;
+#[cfg(all(nk_lkl, target_arch = "x86_64"))]
+mod lkl_timer_test;
+#[cfg(all(nk_lkl, target_arch = "x86_64"))]
+pub mod lkl_pci_x86;
 
 /// Where boot-x86_64.s hands over.
 ///
@@ -146,6 +176,7 @@ pub mod bootinfo_x86;
 #[no_mangle]
 pub extern "C" fn rust_main(magic: u64, info: u64) -> ! {
     unsafe { uart_x86::console().init() };
+    unsafe { lapic::discover_base() };
     println!();
     println!("NETHOS kernel (nk) {} -- x86_64", env!("CARGO_PKG_VERSION"));
     println!("  magic: {:#x}  info: {:#x}", magic, info);
@@ -158,12 +189,22 @@ pub extern "C" fn rust_main(magic: u64, info: u64) -> ! {
 
     let boot = match magic as u32 {
         0x50564800 => unsafe { bootinfo_x86::parse_pvh(info) },
+        0x36d76289 => unsafe { bootinfo_x86::parse_multiboot2(info) },
         _ => None,
     };
 
     let Some(boot) = boot else {
         panic!("could not parse boot information from loader");
     };
+    if let Some((address, pitch, width, height, bpp)) = boot.framebuffer {
+        let fb = fbcon::Framebuffer { address, pitch, width, height, bpp };
+        if fbcon::init(fb) {
+            let (cols, rows) = fbcon::size().unwrap_or((0, 0));
+            println!("NETHOS kernel (nk) -- framebuffer console {}x{} at {:#x}, {} x {} text", width, height, address, cols, rows);
+        } else {
+            println!("  fb:     {}x{} {}bpp at {:#x} not usable as a console", width, height, bpp, address);
+        }
+    }
 
     let mut usable = 0u64;
     for &(s, e) in &boot.ram_regions[..boot.ram_region_count] {
@@ -208,7 +249,12 @@ pub extern "C" fn rust_main(magic: u64, info: u64) -> ! {
     // unusable until nk maps high memory.
     const MAPPED_LIMIT: usize = 4 * 1024 * 1024 * 1024;
 
-    let mut reserved = [initrd, linux];
+    // GRUB's ACPI RSDP copy lives inside its info block. Keep that block
+    // intact until firmware discovery, even if the loader placed it in RAM
+    // above nk's image. Frame allocations require page-aligned exclusions.
+    let loader_info = boot.info_range.map(|(s,e)|
+        ((s as usize)&!4095,(e as usize).div_ceil(4096)*4096)).unwrap_or((0,0));
+    let mut reserved = [initrd, linux, loader_info];
     reserved.sort_unstable();
 
     let mut highest_end = 0usize;
@@ -216,6 +262,11 @@ pub extern "C" fn rust_main(magic: u64, info: u64) -> ! {
         // The kernel image sits in the lowest region; skip past it there.
         let lo = (rs as usize).max(ram_start);
         let hi = (re as usize).min(MAPPED_LIMIT);
+        // RAM above the identity map: no use as nk memory, but a guest's
+        // DRAM is reached through its own window, so it can live there.
+        if (re as usize) > MAPPED_LIMIT {
+            unsafe { frames::add_high((rs as usize).max(MAPPED_LIMIT) as u64, re as u64) };
+        }
         if lo >= hi {
             continue;
         }
@@ -260,11 +311,17 @@ pub extern "C" fn rust_main(magic: u64, info: u64) -> ! {
     // Reserve 192MB for the kernel heap, matching the aarch64 heap bump.
     unsafe { heap::init(192) };
 
+    platform_x86::discover(&boot);
+
     // Before any process exists, because every address space nk creates
     // copies the top of the kernel's tables and Linux must be in all of them.
     #[cfg(nk_lkl)]
     unsafe {
-        paging::reserve_linux_window()
+        paging::reserve_linux_window();
+        #[cfg(target_arch = "x86_64")]
+        paging::reserve_mmio_window();
+        #[cfg(all(target_arch = "x86_64", feature = "stela"))]
+        paging::reserve_guest_dram_window();
     };
 
     sched::init();
@@ -287,6 +344,10 @@ pub extern "C" fn rust_main(magic: u64, info: u64) -> ! {
         tss_x86::init(top);
         sched::set_boot_stack_top(top);
     }
+    // Native guest faults need the IDT/TSS, but code rights are changed only
+    // before APs and user address spaces exist, with interrupts still masked.
+    #[cfg(feature = "stela")]
+    stela_nk::smoke();
     unsafe { timer::init(0) };
     // `syscall` is an invalid opcode until EFER.SCE says otherwise, and the
     // MSRs that say where it lands (LSTAR), what it runs as (STAR) and which
@@ -316,6 +377,14 @@ pub extern "C" fn rust_main(magic: u64, info: u64) -> ! {
         lapic::init();
         lapic::calibrate_timer();
     }
+    // The boot CPU ticks from the PIT, so its LAPIC timer is free: Linux's
+    // one-shot timers fire on it at their deadlines (hostops).
+    if hostops::claim_deadline_timer() {
+        println!("  timers: CPU 0 LAPIC one-shot for Linux timers ({})",
+            if hrtimer::tsc_deadline_supported() { "TSC-deadline" } else { "count mode" });
+    }
+
+    ioapic::route_pit();
 
     println!();
     println!("Stage 1 up on x86-64. Unmasking interrupts.");
@@ -367,6 +436,9 @@ pub extern "C" fn rust_main(magic: u64, info: u64) -> ! {
         }
     }
 
+    pci_irq_test::run();
+    pci_msix_test::run();
+
     // Exercise the context switch and timer: two threads alternating
     extern "C" fn test_worker(id: usize) {
         let names = ["ping", "pong"];
@@ -415,6 +487,31 @@ pub extern "C" fn rust_main(magic: u64, info: u64) -> ! {
         if lkl::boot() {
             println!();
             println!("Linux is up on nk (x86-64). Asking it something:");
+            // A dedicated vCPU core while Linux owns CPU 0 (ROADMAP Phase 3).
+            if option_env!("NK_DEDICATED_TEST").is_some() {
+                dedicated_test::run();
+            }
+            // Linux's own timers at their deadlines, not the 10 ms tick.
+            if option_env!("NK_LKL_TIMER_TEST").is_some() {
+                lkl_timer_test::run();
+            }
+            // A guest's generic timer interrupt through nk's hrtimer, on a
+            // dedicated core (ROADMAP Phase 3).
+            #[cfg(feature = "stela")]
+            if option_env!("NK_STELA_TIMER_TEST").is_some() {
+                stela_nk::timer_probe();
+            }
+            // A host device interrupt through the AIC model into a guest.
+            #[cfg(feature = "stela")]
+            if option_env!("NK_STELA_IRQ_TEST").is_some() {
+                stela_nk::irq_probe();
+            }
+            // The M2 board's UART, watchdog and AIC mounted from a
+            // DeviceTree, with a guest taking the UART's RX interrupt.
+            #[cfg(feature = "stela")]
+            if option_env!("NK_STELA_BOARD_TEST").is_some() {
+                stela_nk::board_probe();
+            }
             println!();
             // LKL's numbers, not x86-64's: `ldk lkl` builds with ARCH=lkl on
             // both hosts, so the table is asm-generic wherever nk runs. 172 is
@@ -435,6 +532,28 @@ pub extern "C" fn rust_main(magic: u64, info: u64) -> ! {
                     Ok(n) => println!("  initrd: {} entries unpacked into Linux's rootfs", n),
                     Err(e) => println!("  initrd: {} -- ignored", e),
                 }
+            }
+            // Init's user stack arena before any probe takes large runs of
+            // contiguous frames (see `user::reserve_stack_arena`).
+            if !user::reserve_stack_arena() {
+                println!("  ring3:  no memory for the user stack arena");
+            }
+            // A real ADT (a `stela boot prepare` bundle's devicetree.adt)
+            // read from Linux's filesystem, and the board mounted from it.
+            #[cfg(feature = "stela")]
+            if option_env!("NK_STELA_ADT_TEST").is_some() {
+                stela_nk::adt_probe("/stele/devicetree.adt");
+            }
+            // The whole M2 board, as stela.efi mounts it, from the bundle.
+            #[cfg(feature = "stela")]
+            if option_env!("NK_STELA_MOUNT_TEST").is_some() {
+                stela_nk::mount_probe("/stele");
+            }
+            // macOS 27's first instructions: the bundle loaded and SPTM
+            // entered on the mounted board (MMU off).
+            #[cfg(feature = "stela")]
+            if option_env!("NK_STELA_SPTM_TEST").is_some() {
+                stela_nk::sptm_probe("/stele");
             }
 
             // Ring 3.
@@ -567,7 +686,11 @@ pub extern "C" fn rust_main(dtb: *const u8) -> ! {
     // copies the top of the kernel's tables and Linux must be in all of them.
     #[cfg(nk_lkl)]
     unsafe {
-        paging::reserve_linux_window()
+        paging::reserve_linux_window();
+        #[cfg(target_arch = "x86_64")]
+        paging::reserve_mmio_window();
+        #[cfg(all(target_arch = "x86_64", feature = "stela"))]
+        paging::reserve_guest_dram_window();
     };
 
     sched::init();
@@ -1208,49 +1331,25 @@ struct LklCpu {
     shutdown_sem: *mut u8,
 }
 
-/// The linked address of LKL's `cpu` global (a local symbol: `b cpu`, so it
-/// cannot be named from Rust). Derived with `llvm-nm` on the linked ELF.
-///
-/// This is a hazard: it is a hardcoded address for a symbol the linker is
-/// free to move, and it has gone stale at least once -- an unrelated change
-/// shifted it by 0x800 and nothing said so, because a stale address does not
-/// fault. It reads whatever now lives there as an `LklCpu`, and the wait
-/// graph reports an owner, count and sleeper tally that are entirely
-/// plausible and belong to a different structure.
-///
-/// `check_lkl_cpu_addr` compares it against the offset build.rs read out of
-/// the archive, so a stale constant is reported at boot instead of being
-/// believed.
-///
-/// Per-architecture: the same symbol in the same archive lands at a
-/// different address because nk's own sections are sized differently.
-#[cfg(all(nk_lkl, target_arch = "aarch64"))]
-const LKL_CPU_SEED: usize = 0x0000000040e29eb8;
-#[cfg(all(nk_lkl, target_arch = "x86_64"))]
-const LKL_CPU_SEED: usize = 0x0000000040e7ca60;
-
-/// Where `cpu` actually is, once `check_lkl_cpu_addr` has confirmed it.
-///
-/// The seed above is only a starting guess. Any edit to nk relinks the image
-/// and moves every file-local bss symbol with it, so a constant is stale the
-/// moment the next build runs -- and a stale one does not fault, it reports a
-/// wait graph belonging to whatever else now lives there. The search below
-/// finds the real one at boot and everything after reads it from here.
+// build.rs exposes LKL's file-local cpu under a namespaced global in a
+// private archive. The linker supplies the address after layout/relocation.
 #[cfg(nk_lkl)]
-static mut LKL_CPU_FOUND: usize = LKL_CPU_SEED;
+unsafe extern "C" {
+    static nk_lkl_cpu: LklCpu;
+}
 
 #[cfg(nk_lkl)]
 #[inline]
 fn lkl_cpu_addr() -> usize {
-    unsafe { *(&raw const LKL_CPU_FOUND) }
+    &raw const nk_lkl_cpu as usize
 }
 
 /// Does `addr` hold something shaped like LKL's `cpu`?
 ///
 /// Called after `lkl_start_kernel`, so both semaphores are allocated and
 /// nk's own allocator is the one that made them: a pointer it does not
-/// recognise is not a semaphore, which is a far stronger test than "not
-/// null" and is what makes scanning for the structure safe.
+/// recognise is not a semaphore. This validates layout/initialization at
+/// the linked address without searching unrelated memory.
 #[cfg(nk_lkl)]
 fn looks_like_lkl_cpu(addr: usize) -> bool {
     if addr & 7 != 0 {
@@ -1264,44 +1363,14 @@ fn looks_like_lkl_cpu(addr: usize) -> bool {
         && c.sleepers < 1_000_000
 }
 
-/// Verify `LKL_CPU_ADDR` still names LKL's `cpu`.
-///
-/// build.rs records the symbol's offset within lkl.o's bss. The linked
-/// address must sit that far above the start of the bss region LKL's objects
-/// contributed -- not an exact test, since nk's own bss is in there too, but
-/// it catches the case that actually happens: the constant left behind by a
-/// relink while everything else moved.
+/// Validate the live layout once Linux initialized its semaphores. The
+/// symbol address is exact; an incompatible layout is an error, not a reason
+/// to sweep unrelated kernel memory for something that looks plausible.
 #[cfg(nk_lkl)]
 fn check_lkl_cpu_addr() {
-    let off = option_env!("NK_LKL_CPU_BSS_OFFSET")
-        .and_then(|o| usize::from_str_radix(o.trim_start_matches("0x"), 16).ok())
-        .unwrap_or(0);
-
-    // The seed first: when the constant is still right this costs one read.
-    if looks_like_lkl_cpu(LKL_CPU_SEED) {
-        unsafe { LKL_CPU_FOUND = LKL_CPU_SEED };
-        println!("  lkl cpu: address {LKL_CPU_SEED:#x} verified (bss offset {off:#x})");
-        return;
-    }
-
-    // It moved. Sweep outwards from the seed rather than over all of memory:
-    // the symbol travels with nk's bss, which grows and shrinks by kilobytes
-    // between builds, not megabytes -- and a bounded search cannot wander
-    // into a device window and read a register.
-    const REACH: usize = 8 << 20;
-    for delta in (8..REACH).step_by(8) {
-        for addr in [LKL_CPU_SEED.wrapping_add(delta), LKL_CPU_SEED.wrapping_sub(delta)] {
-            if looks_like_lkl_cpu(addr) {
-                unsafe { LKL_CPU_FOUND = addr };
-                println!(
-                    "  lkl cpu: seed {LKL_CPU_SEED:#x} was stale, found at {addr:#x} \
-                     (bss offset {off:#x}) -- update LKL_CPU_SEED"
-                );
-                return;
-            }
-        }
-    }
-    println!("  lkl cpu: !! no `cpu` found near {LKL_CPU_SEED:#x} -- re-derive with llvm-nm");
+    let address = lkl_cpu_addr();
+    assert!(looks_like_lkl_cpu(address), "linked LKL cpu layout/initialization mismatch at {address:#x}");
+    println!("  lkl cpu: linked address {address:#x} verified");
 }
 
 #[cfg(nk_lkl)]
@@ -1776,3 +1845,6 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     raw_println!("   {}", info.message());
     halt();
 }
+
+#[cfg(all(feature = "stela", target_arch = "x86_64"))]
+mod stela_nk;

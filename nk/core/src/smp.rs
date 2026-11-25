@@ -14,7 +14,7 @@
 use crate::println;
 
 /// Maximum APs to start. Matches MAX_CPUS in sched and the GDT/TSS tables.
-pub const MAX_APS: usize = 7;
+pub const MAX_APS: usize = crate::sched::MAX_CPUS - 1;
 
 /// How many CPUs bring-up actually found online, recorded at the end of
 /// `bring_up`. The torture compares the scheduler's count against this: an
@@ -48,9 +48,9 @@ unsafe extern "C" {
     static ap_trampoline_src: u64;
     static ap_trampoline_len: u64;
     static ap_prot: u8;
-    static mut ap_stack: [u64; 8];
-    static mut ap_ready: [u64; 8];
-    static mut ap_go: [u64; 8];
+    static mut ap_stack: [u64; crate::sched::MAX_CPUS];
+    static mut ap_ready: [u64; crate::sched::MAX_CPUS];
+    static mut ap_go: [u64; crate::sched::MAX_CPUS];
     static mut ap_slot: u64;
     static ap_gdt_ptr: u8;
     static mut ap_gdt_base: u32;
@@ -170,7 +170,7 @@ pub unsafe extern "C" fn rust_ap_main(cpu: u64) -> ! {
         // state an AP is in from birth.
         let idle = crate::sched::spawn("idle", ap_idle, cpu);
         crate::sched::set_class(idle, crate::schedpolicy::Class::Background);
-        crate::sched::set_affinity(idle, 1u8 << cpu.min(7));
+        crate::sched::set_affinity(idle, 1u16 << cpu);
         // The AP's idle loop runs on the stack the trampoline set up, not on
         // the pool allocation `spawn` gave the placeholder task, so record
         // the stack that is really in use. See `sched::set_task_stack`.
@@ -269,7 +269,7 @@ fn at_copy(off: usize) -> usize {
 
 #[cfg(target_arch = "x86_64")]
 fn ap_stack_top(cpu: usize) -> u64 {
-    unsafe { (&raw const AP_STACKS[cpu.min(MAX_APS - 1)].0 as u64) + 16384 }
+    unsafe { (&raw const AP_STACKS[cpu.saturating_sub(1).min(MAX_APS - 1)].0 as u64) + 16384 }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -351,20 +351,13 @@ unsafe fn bring_up_x86() {
         }
     }
 
-    let bsp_id = crate::arch::cpu_id();
     let mut started = 0;
-    // Stop at the first CPU that does not answer. QEMU's q35 numbers APIC
-    // IDs densely from 0, so a gap means there are no more -- continuing
-    // would spend the full timeout on every absent ID in turn, which is
-    // what made an early version look like a hung boot.
-    for apic in 0..8u32 {
-        if apic as usize == bsp_id {
-            continue;
-        }
-        // The logical slot is the loop's own counter, not the APIC ID: see
-        // the note at `ap_slot` in boot-x86_64.s. They happen to coincide
-        // on QEMU's q35 and must not be assumed to in general.
-        let cpu = started + 1;
+    // MADT supplies the targets: physical APIC IDs need not be dense, and
+    // a missing/disabled slot is not the end of the processor list.
+    for cpu in 1..crate::lapic::cpu_count() {
+        let Some(apic) = crate::lapic::apic_id(cpu) else { continue };
+        // Pass the dense topology slot to the trampoline, never the APIC
+        // ID. Even QEMU's q35 has gaps with non-power-of-two core counts.
         ap_stack[cpu] = ap_stack_top(cpu);
         ap_ready[cpu] = 0;
         ap_go[cpu] = 0;
@@ -377,11 +370,11 @@ unsafe fn bring_up_x86() {
             println!("  smp:    cpu{} reached 64-bit mode and halted", cpu);
         } else {
             println!(
-                "  smp:    cpu{} did not answer (ready={}) -- assuming no more CPUs",
+                "  smp:    cpu{} did not answer (ready={}) -- skipping this MADT target",
                 cpu,
                 core::ptr::read_volatile(&raw const ap_ready[cpu]),
             );
-            break;
+            continue;
         }
         if started >= MAX_APS {
             break;
@@ -650,7 +643,7 @@ pub unsafe extern "C" fn rust_ap_main_arm(cpu: u64) -> ! {
     crate::sched::init_secondary(cpu);
     let idle = crate::sched::spawn("idle", idle_entry, cpu);
     crate::sched::set_class(idle, crate::schedpolicy::Class::Background);
-    crate::sched::set_affinity(idle, 1u8 << cpu.min(7));
+    crate::sched::set_affinity(idle, 1u16 << cpu);
     // The AP's idle loop runs on the stack `secondary_entry` set up, not on
     // the pool allocation `spawn` gave the placeholder task, so record the
     // stack that is really in use. See `sched::set_task_stack`.

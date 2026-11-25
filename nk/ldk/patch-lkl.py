@@ -1,10 +1,3 @@
-C_LINES = ['', '#include <linux/fs.h>', '#include <linux/file.h>', '', '/* Take a reference to the open file behind `fd`; the handle is opaque. */', 'SYSCALL_DEFINE1(nk_file_get, long, fd)', '{', '\tstruct file *f = fget((unsigned)fd);',
-'\tstruct file *g = fget_raw((unsigned)fd);', '', '\tif (f)',
-'\t\treturn (long)f;',
-'\tif (g)',
-'\t\treturn (long)g;',
-'\treturn -EBADF;', '}', '', '/* Read one page at an explicit offset into a kernel buffer. */', 'SYSCALL_DEFINE4(nk_file_pread, unsigned long, handle, unsigned long, buf,', '\t\tunsigned long, len, unsigned long long, off)', '{', '\tstruct file *f = (struct file *)handle;', '\tloff_t pos;', '', '\tif (!f)', '\t\treturn -EINVAL;', '\tpos = (loff_t)off;', '\treturn kernel_read(f, (void *)buf, len, &pos);', '}', '', '/* Drop the reference. */', 'SYSCALL_DEFINE1(nk_file_put, unsigned long, handle)', '{', '\tif (handle)', '\t\tfput((struct file *)handle);', '\treturn 0;', '}', '']
-
 #!/usr/bin/env python3
 """What nk needs changed in arch/lkl, and why.
 
@@ -19,8 +12,41 @@ translation layer on nk's side -- a translation layer is a table with an entry
 per system call, which is the thing this project exists to avoid writing.
 """
 import os
+import re
 import shutil
 import sys
+
+# Exactly one retained reference; do not fget_raw a second reference on the
+# success path, and do not emit literal backslash-t tokens into C source.
+C_LINES = """
+#include <linux/fs.h>
+#include <linux/file.h>
+
+/* Retain the open file, independently of later close/dup/reuse of its fd. */
+SYSCALL_DEFINE1(nk_file_get, long, fd)
+{
+    struct file *f = fget((unsigned)fd);
+    return f ? (long)f : -EBADF;
+}
+
+SYSCALL_DEFINE4(nk_file_pread, unsigned long, handle, unsigned long, buf,
+               unsigned long, len, unsigned long long, off)
+{
+    struct file *f = (struct file *)handle;
+    loff_t pos = (loff_t)off;
+    if (!f)
+        return -EINVAL;
+    return kernel_read(f, (void *)buf, len, &pos);
+}
+
+SYSCALL_DEFINE1(nk_file_put, unsigned long, handle)
+{
+    if (handle)
+        fput((struct file *)handle);
+    return 0;
+}
+""".splitlines()
+
 
 # Four gigabytes of virtual address space for Linux's vmalloc arena, starting
 # at four. nk's paging reserves the same window; the two have to agree.
@@ -330,24 +356,18 @@ def file_backing(shim):
     """
     uapi = "arch/lkl/include/uapi/asm/unistd.h"
     s = open(uapi).read()
-    # +4 is exec_files'; the retained-file calls take +5, +6 and +7.
-    s = s.replace("#define __NR_nk_file_get\t\t(__NR_arch_specific_syscall + 4)",
-                  "#define __NR_nk_file_get\t\t(__NR_arch_specific_syscall + 5)")
-    s = s.replace("#define __NR_nk_file_pread\t(__NR_arch_specific_syscall + 5)",
-                  "#define __NR_nk_file_pread\t(__NR_arch_specific_syscall + 6)")
-    s = s.replace("#define __NR_nk_file_put\t\t(__NR_arch_specific_syscall + 6)",
-                  "#define __NR_nk_file_put\t\t(__NR_arch_specific_syscall + 7)")
+    # exec_files already owns +4. Normalize both fresh and previously
+    # patched trees in one pass: the old code inserted +4/+5/+6 on a fresh
+    # tree and only corrected them on the *next* build, overwriting exec's
+    # syscall slot in the first archive.
+    for name, offset in [("nk_file_get", 5), ("nk_file_pread", 6), ("nk_file_put", 7)]:
+        define = f"#define __NR_{name}\t(__NR_arch_specific_syscall + {offset})"
+        pattern = rf"^#define[ \t]+__NR_{name}[^\n]*$"
+        if re.search(pattern, s, re.MULTILINE):
+            s = re.sub(pattern, lambda _: define, s, flags=re.MULTILINE)
+        else:
+            s += "\n" + define + "\n"
     open(uapi, "w").write(s)
-    s = open(uapi).read()
-    if "__NR_nk_file_get" not in s:
-        s = s.replace(
-            "#define __NR_device_page (__NR_arch_specific_syscall + 3)",
-            "#define __NR_device_page (__NR_arch_specific_syscall + 3)\n"
-            "#define __NR_nk_file_get\t\t(__NR_arch_specific_syscall + 4)\n"
-            "#define __NR_nk_file_pread\t(__NR_arch_specific_syscall + 5)\n"
-            "#define __NR_nk_file_put\t\t(__NR_arch_specific_syscall + 6)",
-            1)
-        open(uapi, "w").write(s)
     tbl = "arch/lkl/include/asm/unistd.h"
     s = open(tbl).read()
     if "sys_nk_file_get" not in s:
@@ -1242,6 +1262,119 @@ static int pid_maps_open(struct inode *inode, struct file *file)
          'static int nk_stack_maps_show')
 
 
+def multi_pci_devices():
+    """LKL's PCI host takes a list of devices, one root bus each.
+
+    arch/lkl/drivers/pci.c hosts exactly one device, named by lkl_pci=, and
+    says so ("The PCI driver supports only one PCI device"). nk needs at
+    least a disk and a network card at once. Every per-device path already
+    goes through bus->sysdata / dev->sysdata (config space, BAR override,
+    DMA, MSI), so the only change is here: parse a comma-separated list and
+    scan each device on its own root bus number, with its own host handle.
+    """
+    path = 'arch/lkl/drivers/pci.c'
+    edit(path,
+         'static char *pcidev_name;\n'
+         '\n'
+         'static int __init setup_pci_device(char *str)\n'
+         '{\n'
+         '\tif (pcidev_name) {\n'
+         '\t\tpr_info("The PCI driver supports only one PCI device.");\n'
+         '\t\tpr_info("\'%s\' will be discarded.", str);\n'
+         '\t\treturn -1;\n'
+         '\t}\n'
+         '\tpcidev_name = str;\n'
+         '\treturn 0;\n'
+         '}',
+         '/* nk: lkl_pci=a,b,c -- one root bus per device. */\n'
+         '#define LKL_PCI_MAX_DEVICES 8\n'
+         'static char *pcidev_names[LKL_PCI_MAX_DEVICES];\n'
+         'static int pcidev_count;\n'
+         'static struct pci_bus *pcidev_buses[LKL_PCI_MAX_DEVICES];\n'
+         '\n'
+         'static int __init setup_pci_device(char *str)\n'
+         '{\n'
+         '\twhile (str && *str) {\n'
+         '\t\tchar *comma = strchr(str, \',\');\n'
+         '\n'
+         '\t\tif (comma)\n'
+         '\t\t\t*comma = \'\\0\';\n'
+         '\t\tif (pcidev_count == LKL_PCI_MAX_DEVICES) {\n'
+         '\t\t\tpr_info("lkl_pci: more than %d devices; \'%s\' discarded\\n",\n'
+         '\t\t\t\tLKL_PCI_MAX_DEVICES, str);\n'
+         '\t\t\treturn -1;\n'
+         '\t\t}\n'
+         '\t\tpcidev_names[pcidev_count++] = str;\n'
+         '\t\tstr = comma ? comma + 1 : NULL;\n'
+         '\t}\n'
+         '\treturn 0;\n'
+         '}',
+         'LKL_PCI_MAX_DEVICES')
+    edit(path,
+         '\tif (!lkl_ops->pci_ops || !pcidev_name)\n'
+         '\t\treturn -1;\n'
+         '\n'
+         '\tdev = lkl_ops->pci_ops->add(pcidev_name, (void *)memory_start,\n'
+         '\t\t\t\t    memory_end - memory_start);\n'
+         '\tif (!dev)\n'
+         '\t\treturn -1;\n'
+         '\n'
+         '\tbus = pci_scan_bus(0, &lkl_pci_root_ops, (void *)dev);\n'
+         '\tif (!bus) {\n'
+         '\t\tlkl_ops->pci_ops->remove(dev);\n'
+         '\t\treturn -1;\n'
+         '\t}\n'
+         '\tpci_walk_bus(bus, lkl_pci_override_resource, NULL);\n'
+         '\tpci_bus_add_devices(bus);\n'
+         '\tdev_set_drvdata(&pdev->dev, bus);\n'
+         '\n'
+         '\treturn 0;',
+         '\tint i, found = 0;\n'
+         '\n'
+         '\tif (!lkl_ops->pci_ops || !pcidev_count)\n'
+         '\t\treturn -1;\n'
+         '\n'
+         '\t/* nk: each device on its own root bus; one the host refuses is\n'
+         '\t * skipped rather than costing the others. */\n'
+         '\tfor (i = 0; i < pcidev_count; i++) {\n'
+         '\t\tdev = lkl_ops->pci_ops->add(pcidev_names[i],\n'
+         '\t\t\t\t\t    (void *)memory_start,\n'
+         '\t\t\t\t\t    memory_end - memory_start);\n'
+         '\t\tif (!dev)\n'
+         '\t\t\tcontinue;\n'
+         '\n'
+         '\t\tbus = pci_scan_bus(i, &lkl_pci_root_ops, (void *)dev);\n'
+         '\t\tif (!bus) {\n'
+         '\t\t\tlkl_ops->pci_ops->remove(dev);\n'
+         '\t\t\tcontinue;\n'
+         '\t\t}\n'
+         '\t\tpci_walk_bus(bus, lkl_pci_override_resource, NULL);\n'
+         '\t\tpci_bus_add_devices(bus);\n'
+         '\t\tpcidev_buses[i] = bus;\n'
+         '\t\tfound++;\n'
+         '\t}\n'
+         '\tif (!found)\n'
+         '\t\treturn -1;\n'
+         '\tdev_set_drvdata(&pdev->dev, pcidev_buses);\n'
+         '\n'
+         '\treturn 0;',
+         'each device on its own root bus')
+    edit(path,
+         '\tstruct pci_bus *bus = (struct pci_bus *)dev_get_drvdata(&pdev->dev);\n'
+         '\n'
+         '\tif (bus)\n'
+         '\t\tpci_walk_bus(bus, lkl_pci_remove_devices, NULL);',
+         '\tint i;\n'
+         '\n'
+         '\t/* nk: every root bus probe created. */\n'
+         '\tfor (i = 0; i < pcidev_count; i++)\n'
+         '\t\tif (pcidev_buses[i])\n'
+         '\t\t\tpci_walk_bus(pcidev_buses[i], lkl_pci_remove_devices,\n'
+         '\t\t\t\t     NULL);',
+         'every root bus probe created')
+    say("arch/lkl: lkl_pci= takes a list, one root bus per device")
+
+
 if __name__ == '__main__':
     shim = sys.argv[1] if len(sys.argv) > 1 else '/shim'
     arm64_open_flags()
@@ -1261,3 +1394,4 @@ if __name__ == '__main__':
     exit_jb_gate()
     quiet_exit_probe()
     input_event_probe()
+    multi_pci_devices()
