@@ -413,6 +413,15 @@ What Stela's runtime needs from the kernel underneath it.
         "iBoot version:", then spins at 0xfffffe003abc41ec (180 s run,
         71.8 M blocks, 131,104 shadow fills, 2026-11-25). No Phase 0
         reference to compare with yet.
+  - [x] That spin is XNU's boot progress bar laying itself out from
+        `boot_args.Video`, which nk leaves zero (no framebuffer yet). Booted
+        with `-noprogress` (`--boot-args=`), XNU starts IOKit: AppleImage4,
+        AMFI (model Mac14,2), Sandbox, Quarantine, Endpoint Security,
+        IOGraphics power, AppleARMBacklight, IOThunderboltFamily,
+        AppleCredentialManager, AppleSEPKeyStore, CoreAnalyticsHub: 218
+        console lines and still moving after 150 s (138 M blocks).
+  - [ ] A guest framebuffer filling `boot_args.Video` and `/vram`, as
+        `stela.efi` does, so the boot screen draws without `-noprogress`.
 - [ ] Get as far as the root filesystem mount on the reference timeline.
 
 ## Phase 6: device bridges (fake Apple device → Linux)

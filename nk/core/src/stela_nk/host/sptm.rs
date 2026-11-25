@@ -192,6 +192,12 @@ fn release_dram(frames: &[u64]) {
     }
 }
 
+impl DramHost {
+    fn counter_now(&self) -> u64 {
+        guest_count(self.tsc_base)
+    }
+}
+
 impl Host for DramHost {
     fn read_ram(&mut self, at: u64, out: &mut [u8]) -> bool {
         if !Self::in_ram(at, out.len()) {
@@ -813,6 +819,43 @@ fn run_board(p: Prepared) -> bool {
     }
     if let Some((sctlr, at)) = machine.host.mmu {
         crate::println!("STELA_SPTM: SPTM turned its MMU on (SCTLR {:#x}) after {} native runs", sctlr, at);
+    }
+    // Where the guest is: its registers and the code around its PC, read
+    // through its own translation, to disassemble on the host.
+    if let Some(shadow) = machine.host.shadow.as_ref() {
+        use stela_engine::machine::system::Register as R;
+        let st = &machine.cpu.state;
+        for row in 0..8 {
+            let i = row * 4;
+            crate::println!(
+                "STELA_SPTM: x{:<2} {:#018x} {:#018x} {:#018x} {:#018x}",
+                i, st.x[i], st.x[i + 1], st.x[i + 2], if i + 3 < 31 { st.x[i + 3] } else { 0 }
+            );
+        }
+        let r = &machine.cpu.registers;
+        crate::println!(
+            "STELA_SPTM: CNTV_CTL {:#x} CNTV_CVAL {:#x} CNTP_CTL {:#x} CNTP_CVAL {:#x} counter {:#x}; DAIF {:#x}",
+            r.get(R::CNTV_CTL_EL0, 0), r.get(R::CNTV_CVAL_EL0, 0),
+            r.get(R::CNTP_CTL_EL0, 0), r.get(R::CNTP_CVAL_EL0, 0),
+            machine.host.counter_now(), machine.cpu.pstate.daif
+        );
+        let pc = machine.cpu.pc;
+        let from = (pc & !3).saturating_sub(0x60);
+        if let mmu::Outcome::Mapped(t) = shadow.translate(from, false) {
+            let mut words = [0u32; 48];
+            for (n, w) in words.iter_mut().enumerate() {
+                let pa = (t.physical & !4095) + ((from & 4095) + n as u64 * 4);
+                if DramHost::in_ram(pa, 4) {
+                    *w = unsafe { core::ptr::read_volatile(pa as *const u32) };
+                }
+            }
+            crate::println!("STELA_SPTM: code from {:#x} (PA {:#x}):", from, t.physical);
+            for chunk in words.chunks(8) {
+                let line: alloc::vec::Vec<alloc::string::String> =
+                    chunk.iter().map(|w| alloc::format!("{:08x}", w)).collect();
+                crate::println!("STELA_SPTM:   {}", line.join(" "));
+            }
+        }
     }
     if let Some(shadow) = machine.host.shadow.as_ref() {
         crate::println!(
