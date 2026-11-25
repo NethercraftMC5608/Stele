@@ -64,6 +64,8 @@ def main():
     parser.add_argument("--output", type=Path, default=Path("target-dedicated-run"))
     parser.add_argument("--qemu", default="qemu-system-x86_64")
     parser.add_argument("--timeout", type=float, default=150)
+    parser.add_argument("--cpu", help="QEMU -cpu model (default: QEMU's own)")
+    parser.add_argument("--memory", default="4G", help="QEMU -m (default 4G)")
     parser.add_argument("--add", action="append", default=[], metavar="HOST:GUEST",
                         help="add a host file to the initrd at a guest path")
     parser.add_argument("--require", action="append", default=[],
@@ -79,7 +81,8 @@ def main():
                  for host, guest in (spec.split(":", 1) for spec in args.add)]
         initrd = out / "initrd.cpio"
         initrd.write_bytes(with_files(args.initrd.read_bytes(), files))
-    proc = subprocess.Popen([args.qemu, "-M", "q35", "-m", "4G", "-smp", "4",
+    cpu = ["-cpu", args.cpu] if args.cpu else []
+    proc = subprocess.Popen([args.qemu, "-M", "q35", "-m", args.memory, "-smp", "4", *cpu,
                              "-kernel", str(args.kernel.resolve(strict=True)),
                              "-initrd", str(initrd),
                              "-display", "none", "-serial", f"file:{log}",

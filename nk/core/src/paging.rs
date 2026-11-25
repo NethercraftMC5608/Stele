@@ -452,12 +452,12 @@ pub unsafe fn map_mmio_high(phys: u64, len: u64) -> Option<u64> {
 
 /// Guest DRAM for translated ARM64 guests, at the guest's own physical
 /// addresses: the M2's DRAM starts at 32 GiB, which nk's map leaves free
-/// (identity 0-4 GiB, Linux 4-8 GiB, MMIO 12-13 GiB). Native guest code
+/// (identity 0-4 GiB, Linux 4-8 GiB, MMIO 12-13 GiB); 8 GiB of window. Native guest code
 /// then reaches guest RAM with the MMU off at the address the guest uses.
 #[cfg(target_arch = "x86_64")]
 pub const GUEST_DRAM_VA: u64 = 0x8_0000_0000;
 #[cfg(target_arch = "x86_64")]
-pub const GUEST_DRAM_SIZE: u64 = 1 << 30;
+pub const GUEST_DRAM_SIZE: u64 = 8 << 30;
 
 /// Create the guest DRAM window's directory before any process exists, for
 /// the same reason as `reserve_mmio_window`.
@@ -467,14 +467,17 @@ pub const GUEST_DRAM_SIZE: u64 = 1 << 30;
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn reserve_guest_dram_window() {
     let l0 = table_of(kernel_address_space()) as *mut u64;
-    let va = GUEST_DRAM_VA;
-    let l1 = next_table(l0.add(((va >> L0_SHIFT) & 511) as usize));
-    let l1e = l1.add(((va >> L1_SHIFT) & 511) as usize);
-    assert!(
-        *l1e & pte::VALID == 0 || !pte::is_block(*l1e),
-        "the guest DRAM window overlaps a block mapping at {va:#x}"
-    );
-    next_table(l1e);
+    let mut va = GUEST_DRAM_VA;
+    while va < GUEST_DRAM_VA + GUEST_DRAM_SIZE {
+        let l1 = next_table(l0.add(((va >> L0_SHIFT) & 511) as usize));
+        let l1e = l1.add(((va >> L1_SHIFT) & 511) as usize);
+        assert!(
+            *l1e & pte::VALID == 0 || !pte::is_block(*l1e),
+            "the guest DRAM window overlaps a block mapping at {va:#x}"
+        );
+        next_table(l1e);
+        va += 1 << L1_SHIFT;
+    }
     crate::arch::memory_barrier();
 }
 

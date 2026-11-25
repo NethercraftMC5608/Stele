@@ -51,7 +51,15 @@ struct Recovery {
     count: usize,
     fault: Option<Captured>,
     shadow_window: Option<(u64, u64)>,
+    fill: Option<Filler>,
 }
+
+/// A shadow fill a host offers the #PF path: `(fill, context)`. `fill` runs
+/// in the trap, IF masked, on the faulting core, with the not-present
+/// address and whether it was a write; true means the shadow now maps the
+/// page and the faulting instruction is retried natively. It must not block
+/// or call the engine.
+pub(super) type Filler = (unsafe fn(*mut (), u64, bool) -> bool, *mut ());
 static ACTIVE: AtomicPtr<Recovery> = AtomicPtr::new(core::ptr::null_mut());
 
 /// # Safety
@@ -64,6 +72,19 @@ pub(super) unsafe fn invoke(
     ranges: impl Iterator<Item = (u64, u64)>,
     ram: u64,
     shadow_window: Option<(u64, u64)>,
+) -> Result<u128, Captured> {
+    invoke_filling(thunk, entry, state, ranges, ram, shadow_window, None)
+}
+
+/// [`invoke`] with a demand shadow fill for not-present faults.
+pub(super) unsafe fn invoke_filling(
+    thunk: *const u8,
+    entry: usize,
+    state: &mut GuestState,
+    ranges: impl Iterator<Item = (u64, u64)>,
+    ram: u64,
+    shadow_window: Option<(u64, u64)>,
+    fill: Option<Filler>,
 ) -> Result<u128, Captured> {
     let flags: u64;
     core::arch::asm!("pushfq", "pop {}", out(reg) flags);
@@ -80,6 +101,7 @@ pub(super) unsafe fn invoke(
         count: 0,
         fault: None,
         shadow_window,
+        fill,
     };
     for range in ranges {
         assert!(recovery.count < recovery.ranges.len());
@@ -133,6 +155,15 @@ pub(crate) unsafe fn recover_native_fault(f: &mut TrapFrame, fp: *const u8) -> b
     } else {
         0
     };
+    // A not-present data access the host's shadow can fill: map it and
+    // retry the instruction natively, as the host's own #PF gate would.
+    if f.vector == 14 && f.error & 0b1_1001 == 0 {
+        if let Some((fill, context)) = active.fill {
+            if fill(context, address, f.error & 2 != 0) {
+                return true;
+            }
+        }
+    }
     let shadow = active
         .shadow_window
         .is_some_and(|(s, e)| s <= address && address < e);

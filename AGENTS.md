@@ -267,6 +267,13 @@ require it to pass; both the rebuilt x86 archive and cached arm64 archive pass.
   of frames in QEMU and about 180 MiB free once a 127 MiB bundle initrd is
   unpacked. The user stack arena is reserved at boot
   (`user::reserve_stack_arena`): freed frames never rebuild contiguity. In zsh write `${f}:stele/${f}`, not `$f:stele` (`:s` is a modifier).
+- **The engine's run budget is a total.** `Machine::run(n)` stops once the
+  cumulative block count reaches `n`; loop with `statistics.blocks + slice`.
+- **Run the SPTM probe under `-cpu max`.** With QEMU's default CPU the
+  engine's target is too old and SPTM dies on `ldapr` (EC 0). Guest DRAM
+  comes from RAM above 4 GiB (`frames::alloc_high`, `--memory 6G`); prepare
+  the bundle with `--dram-size` equal to what nk backs, or SPTM writes past
+  it (external abort at the first unbacked page).
 - **Apple's files stay out of the repo.** The M2 IPSW and the bundle
   `stela-dev boot prepare` makes from it live in `~/Stele-assets`
   (`bundle-Mac14,2-26B131/devicetree.adt`); tests take them by path

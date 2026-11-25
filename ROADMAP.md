@@ -377,13 +377,27 @@ What Stela's runtime needs from the kernel underneath it.
         initrd (~127 MiB), and nk backs 168 MiB of DRAM: about all its 2 GiB
         identity map leaves in QEMU. Init's user stack arena is now reserved
         at boot, because it needs contiguous frames a probe could use up.
-  - [ ] Slice 2: shadow page tables after SMP, so SPTM's MMU-on code runs
-        natively instead of faulting into the engine (1675 of 1840 native
-        runs faulted after the MMU came on).
+  - [x] Slice 2: shadow page tables after SMP. The guest's core runs on a
+        private PML4 (nk's entries below index 264 shared, the guest's upper
+        range `[0xffff840000000000, 2^64)` private); a not-present native
+        access there is filled in nk's #PF path from the guest's own tables
+        and retried (`fault::invoke_filling`), and other faults become the
+        engine's cause after a fresh walk. Guest DRAM now comes from RAM above
+        nk's 4 GiB identity map (`frames::alloc_high`; the window is 8 GiB):
+        2 GiB backed, bundle prepared with `--dram-size 0x80000000`. Under
+        QEMU `-cpu max -m 6G`: SPTM, TXM and XNU run, 14.1 M blocks in
+        120 s, 23,040 shadow fills, 15 native faults left; XNU prints its
+        first console output (2026-11-25). QEMU's default `qemu64` CPU makes
+        SPTM take an undefined-instruction exception on `ldapr`; a PC new
+        enough for Stela does not need `-cpu max`.
   - [ ] Slice 3: native fault recovery and MMIO with the MMU on, to TXM and
         XNU. Slice 4: all 8 PEs on dedicated cores.
 - [ ] Hand off to the macOS 27 kernel. Done when: XNU's first serial output
       matches the Phase 0 reference.
+  - [x] XNU's first serial output on nk: a panic, `Expected 256 seed bytes
+        from bootloader, but got 0` (prng_random.c), kernel text base
+        0xfffffe003a280000. The bootloader's `/chosen/random-seed` is not
+        filled yet; no Phase 0 reference to compare with.
 - [ ] Get as far as the root filesystem mount on the reference timeline.
 
 ## Phase 6: device bridges (fake Apple device → Linux)

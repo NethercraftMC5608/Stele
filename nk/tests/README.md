@@ -686,6 +686,13 @@ python3 tests/run-dedicated-x86.py --kernel target-stela-sptm/x86_64-unknown-non
   --initrd /path/to/initrd.cpio "$@" --require STELA_SPTM_PASS --output target-stela-sptm-run --timeout 900
 ```
 
+Prepare the bundle with `--dram-size 0x80000000` (the 2 GiB nk backs by
+default, `NK_STELA_SPTM_DRAM_MIB`), and run with `--cpu max --memory 6G`;
+`NK_STELA_SPTM_SECONDS` sets the run length (60 s default). With the shadow
+page tables (slice 2) SPTM hands over to TXM and XNU, whose console output is
+printed as `GUEST|` lines: today a panic asking for the bootloader's random
+seed.
+
 nk loads the bundle's regions into guest DRAM mapped at 0x800000000,
 mounts the board over the same frames, and starts PE 0 at EL2, MMU off, at
 SPTM's entry. The host has no shadow tables yet, so the run ends when SPTM

@@ -262,6 +262,11 @@ pub extern "C" fn rust_main(magic: u64, info: u64) -> ! {
         // The kernel image sits in the lowest region; skip past it there.
         let lo = (rs as usize).max(ram_start);
         let hi = (re as usize).min(MAPPED_LIMIT);
+        // RAM above the identity map: no use as nk memory, but a guest's
+        // DRAM is reached through its own window, so it can live there.
+        if (re as usize) > MAPPED_LIMIT {
+            unsafe { frames::add_high((rs as usize).max(MAPPED_LIMIT) as u64, re as u64) };
+        }
         if lo >= hi {
             continue;
         }

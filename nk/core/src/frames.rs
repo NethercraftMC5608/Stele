@@ -103,6 +103,56 @@ pub unsafe fn add(start: usize, end: usize) {
     f.total += (end - start) / PAGE;
 }
 
+// --- RAM above nk's identity map ------------------------------------------
+
+/// Physical RAM nk cannot reach through its identity map. Frames from here
+/// have no kernel virtual address: they are only for memory something maps
+/// itself, such as a translated guest's DRAM (`paging::map_guest_dram`).
+/// Bump-only and never returned: there is nowhere to thread a free list
+/// through pages nk cannot see.
+static mut HIGH: [Region; MAX_REGIONS] = [Region { next: 0, end: 0 }; MAX_REGIONS];
+static mut HIGH_REGIONS: usize = 0;
+
+/// Record `[start, end)` as high RAM.
+///
+/// # Safety
+/// Real RAM nothing else owns, at boot.
+pub unsafe fn add_high(start: u64, end: u64) {
+    let start = align_up(start as usize, PAGE);
+    let end = end as usize & !(PAGE - 1);
+    let regions = &mut *(&raw mut HIGH);
+    if end <= start || HIGH_REGIONS == MAX_REGIONS {
+        return;
+    }
+    regions[HIGH_REGIONS] = Region { next: start, end };
+    HIGH_REGIONS += 1;
+}
+
+/// The physical address of one high frame, NOT zeroed (nk cannot see it:
+/// the caller zeroes it once mapped), or None when none is left.
+pub fn alloc_high() -> Option<u64> {
+    let _held = Held::take();
+    unsafe {
+        let regions = &mut *(&raw mut HIGH);
+        for r in &mut regions[..HIGH_REGIONS] {
+            if r.next < r.end {
+                let frame = r.next;
+                r.next += PAGE;
+                return Some(frame as u64);
+            }
+        }
+    }
+    None
+}
+
+/// High RAM left, in bytes.
+pub fn high_free() -> u64 {
+    let _held = Held::take();
+    unsafe {
+        (&*(&raw const HIGH))[..HIGH_REGIONS].iter().map(|r| (r.end - r.next) as u64).sum()
+    }
+}
+
 /// One zeroed frame, or None when memory is gone.
 ///
 /// Zeroed unconditionally. Page tables require it, Linux's `kzalloc` sits on
