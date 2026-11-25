@@ -73,6 +73,14 @@ Branch `nk-x86-userland` in the NETHOS repo.
       address. Live layout checks and QEMU boots pass on both architectures;
       `nk/tests/lkl-archive.rs` tests x86/arm64 fixtures and input immutability
       (2026-11-24; uncommitted).
+- [x] `SA_RESTART` (x86-64): a call Linux interrupts with -ERESTART*
+      keeps its code; delivery rewinds the saved context onto the
+      `syscall` instruction (rax = the number again) when Linux would --
+      ERESTARTSYS with SA_RESTART, ERESTARTNOINTR always, any of them when no
+      handler runs -- so `rt_sigreturn` re-runs it. A pipe read interrupted
+      by SIGALRM returns its byte with SA_RESTART and -EINTR without
+      (`init/restart-x86.c`, 2026-11-25). aarch64 never records a code yet
+      (`lkl_interrupted` is x86-only), so it still sees EINTR.
 - [ ] Merge `nk-x86-userland` with `nk-initrd-builder` and push.
 
 ## Phase 2: nk on a real PC

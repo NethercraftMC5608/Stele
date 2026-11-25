@@ -27,6 +27,12 @@ def main():
     parser.add_argument("--smp", default="4")
     parser.add_argument("--qemu-arg", action="append", default=[])
     parser.add_argument("--timeout", type=float, default=60)
+    parser.add_argument("--source", type=Path,
+                        help="another freestanding /nk-init (default init/epoll-x86.c)")
+    parser.add_argument("--marker", default="EPOLL",
+                        help="its marker prefix: <MARKER>_PASS / <MARKER>_FAIL")
+    parser.add_argument("--expect", action="append", default=None,
+                        help="markers required with the PASS line")
     args = parser.parse_args()
     kernel = args.kernel.resolve(strict=True)
     out = args.output.resolve()
@@ -38,7 +44,11 @@ def main():
         if len(candidates) != 1:
             parser.error("pass --linker with the path to an ELF lld")
         linker = str(candidates[0])
-    source = Path(__file__).resolve().parents[1] / "init/epoll-x86.c"
+    source = (args.source.resolve(strict=True) if args.source
+              else Path(__file__).resolve().parents[1] / "init/epoll-x86.c")
+    marker = args.marker
+    expect = args.expect if args.expect is not None else (
+        ["EPOLL_WAIT_OK", "EPOLL_PWAIT_OK", "EPOLL_PWAIT2_OK"] if marker == "EPOLL" else [])
     subprocess.run([args.clang, "--target=x86_64-unknown-linux-gnu", "-O2", "-Wall", "-Wextra",
                     "-Werror", "-ffreestanding", "-fno-stack-protector", "-fno-pie", "-mno-red-zone",
                     "-c", str(source), "-o", str(out / "probe.o")], check=True)
@@ -58,10 +68,10 @@ def main():
             deadline = time.monotonic() + args.timeout
             while time.monotonic() < deadline:
                 text = log.read_text(errors="replace")
-                if any(marker in text for marker in ("EPOLL_FAIL", "PCI_IRQ_FAIL", "kernel panic", "PANIC", "no init to run:")):
+                if any(m in text for m in (f"{marker}_FAIL", "PCI_IRQ_FAIL", "kernel panic", "PANIC", "no init to run:")):
                     break
-                if "EPOLL_PASS\n" in text:
-                    passed = all(marker in text for marker in ("EPOLL_WAIT_OK", "EPOLL_PWAIT_OK", "EPOLL_PWAIT2_OK"))
+                if f"{marker}_PASS\n" in text:
+                    passed = all(m in text for m in expect)
                     break
                 if process.poll() is not None:
                     break
@@ -76,7 +86,7 @@ def main():
                     process.wait()
     text = log.read_text(errors="replace")
     print("\n".join(text.splitlines()[-35:]) if not passed else
-          "\n".join(line for line in text.splitlines() if line.startswith("EPOLL_")))
+          "\n".join(line for line in text.splitlines() if line.startswith(f"{marker}_") or line.startswith("phase")))
     print(f"{'PASS' if passed else 'FAIL'}: serial log: {log}")
     return 0 if passed else 1
 

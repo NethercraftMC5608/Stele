@@ -497,8 +497,75 @@ pub fn deliver(frame: &mut crate::user::Frame) -> bool {
         handler_mask |= bit(sig);
     }
     sched::set_signal_mask(me, handler_mask);
+    // An interrupted syscall the handler should not see as EINTR: rewind the
+    // context the frame saves, so `rt_sigreturn` re-runs the call. Linux's
+    // rules (`arch/*/kernel/signal.c`, `handle_signal`): ERESTARTSYS only
+    // with SA_RESTART, ERESTARTNOINTR always, ERESTARTNOHAND and
+    // ERESTART_RESTARTBLOCK never once a handler runs.
+    let restart = RESTART[me.min(sched::MAX_TASKS - 1)].swap(0, Ordering::AcqRel);
+    if restart == ERESTARTNOINTR || (restart == ERESTARTSYS && act.flags & SA_RESTART != 0) {
+        rewind(frame, me);
+    }
     build_frame(frame, me, sig, &act, saved_mask);
     true
+}
+
+// --- SA_RESTART ------------------------------------------------------------
+
+pub const ERESTARTSYS: i64 = -512;
+pub const ERESTARTNOINTR: i64 = -513;
+pub const ERESTARTNOHAND: i64 = -514;
+pub const ERESTART_RESTARTBLOCK: i64 = -516;
+
+use core::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+/// Per task: the restart code the current syscall came back with (0: none),
+/// and its first argument, which the return value overwrites in `x0`.
+static RESTART: [AtomicI64; sched::MAX_TASKS] = [const { AtomicI64::new(0) }; sched::MAX_TASKS];
+static ARG0: [AtomicU64; sched::MAX_TASKS] = [const { AtomicU64::new(0) }; sched::MAX_TASKS];
+
+/// A syscall is starting on task `me`: forget an old restart, keep `x0`.
+pub fn syscall_begin(me: usize, frame: &crate::user::Frame) {
+    let me = me.min(sched::MAX_TASKS - 1);
+    RESTART[me].store(0, Ordering::Relaxed);
+    ARG0[me].store(frame.x[0], Ordering::Relaxed);
+}
+
+/// The current syscall came back from Linux with restart code `code`
+/// (-512..=-516); the caller returns EINTR unless delivery restarts it.
+pub fn note_restart(code: i64) {
+    let me = sched::current_id().min(sched::MAX_TASKS - 1);
+    RESTART[me].store(code, Ordering::Release);
+}
+
+/// Put `frame` back on its syscall instruction with its arguments, so the
+/// return re-executes the call. x86-64 returns `x0` in rax, where the
+/// syscall number goes, and keeps rdi in its own slot; aarch64 returns
+/// `x0` in x0, the first argument, and keeps the number in x8.
+fn rewind(frame: &mut crate::user::Frame, me: usize) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let _ = me;
+        frame.x[0] = frame.x[8];
+        frame.elr -= 2; // `syscall` is 0f 05
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        frame.x[0] = ARG0[me.min(sched::MAX_TASKS - 1)].load(Ordering::Relaxed);
+        frame.elr -= 4; // `svc #0`
+    }
+}
+
+/// After a syscall delivered no handler: a call Linux interrupted restarts,
+/// as Linux restarts it when no handler runs (the signal was ignored or had
+/// a default action that does not terminate). True when rewound.
+pub fn restart_unhandled(frame: &mut crate::user::Frame) -> bool {
+    let me = sched::current_id();
+    let code = RESTART[me.min(sched::MAX_TASKS - 1)].swap(0, Ordering::AcqRel);
+    if matches!(code, ERESTARTSYS | ERESTARTNOINTR | ERESTARTNOHAND | ERESTART_RESTARTBLOCK) {
+        rewind(frame, me);
+        return true;
+    }
+    false
 }
 
 /// Build the `rt_sigframe` on the user's stack and redirect the frame.

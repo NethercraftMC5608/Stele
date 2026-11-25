@@ -699,6 +699,20 @@ SPTM's entry. The host has no shadow tables yet, so the run ends when SPTM
 turns its MMU on, or after 60 s. `STELA_SPTM_PASS` needs more than 100 blocks
 of SPTM run and an end at the MMU or the budget, not a host refusal.
 
+### SA_RESTART
+
+```sh
+python3 tests/run-epoll-x86.py --kernel target-hx/x86_64-unknown-none/release/nk \
+  --source init/restart-x86.c --marker RESTART \
+  --expect RESTART_SA_RESTART_OK --expect RESTART_EINTR_OK --output target-restart
+```
+
+`run-epoll-x86.py` now builds any freestanding `/nk-init` (`--source`) and
+checks its `<MARKER>_PASS`. The probe blocks reading a pipe a child fills after
+400 ms while a 100 ms itimer fires: with `SA_RESTART` the read returns the
+byte after the handler ran once; without it the read returns -EINTR and a
+second read gets the byte. nk's ELF loader wants a 4-byte-aligned entry.
+
 ### Linux timers at their deadlines
 
 ```sh

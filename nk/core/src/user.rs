@@ -510,6 +510,8 @@ fn handle_syscall(frame: &mut Frame) {
         }
         return;
     }
+    #[cfg(nk_lkl)]
+    crate::signal::syscall_begin(crate::sched::current_id(), frame);
 
     // The ABI split. A native NETHOS program arrives here through exactly
     // the same instruction and the same frame as a Linux one -- what differs
@@ -684,6 +686,8 @@ fn handle_syscall(frame: &mut Frame) {
     if crate::signal::deliver(frame) {
         return;
     }
+    #[cfg(nk_lkl)]
+    crate::signal::restart_unhandled(frame);
 }
 
 /// Write `clock_gettime`'s answer without entering Linux, if nk has it.
@@ -931,7 +935,8 @@ fn forward(nr: u64, args: &[u64; 6]) -> i64 {
 /// nk's set (where `deliver` runs the handler on the way back to user space)
 /// and dequeue it on LKL's side. And never let -ERESTART* (-512..-516) escape:
 /// those are kernel-internal, and -512 is nk's own "frame already set"
-/// sentinel for rt_sigreturn. They become -EINTR; SA_RESTART is not honoured.
+/// sentinel for rt_sigreturn. They become -EINTR, with the code noted for
+/// delivery (`signal::note_restart`): SA_RESTART then re-runs the call.
 ///
 /// x86-64 only for now; aarch64 has the same gap.
 #[cfg(all(nk_lkl, target_arch = "x86_64"))]
@@ -957,7 +962,10 @@ fn lkl_interrupted(rc: i64) -> i64 {
         let _ = crate::signal::post(lpid, sig as u64);
     }
     crate::sched::set_user_syscall(was);
-    if rc == -4 { rc } else { -4 }
+    if rc != -4 {
+        crate::signal::note_restart(rc);
+    }
+    -4
 }
 
 /// # poll(fds, nfds, timeout_ms)
