@@ -396,8 +396,15 @@ What Stela's runtime needs from the kernel underneath it.
       matches the Phase 0 reference.
   - [x] XNU's first serial output on nk: a panic, `Expected 256 seed bytes
         from bootloader, but got 0` (prng_random.c), kernel text base
-        0xfffffe003a280000. The bootloader's `/chosen/random-seed` is not
-        filled yet; no Phase 0 reference to compare with.
+        0xfffffe003a280000, until nk filled the bundle's entropy patches.
+  - [x] Boot-time entropy patches applied from RDRAND (`/chosen`
+        random-seed, cl4-entropy, the hibernation CTRR keys), as `stela.efi`
+        fills them. XNU then prints the Darwin 27.2.0 banner
+        (xnu-13432.41.4, RELEASE_ARM64_T8112), VM bootstrap, scheduler and
+        OSLog setup, TXM's code-signing init (trust cache loaded), and
+        "iBoot version:", then spins at 0xfffffe003abc41ec (180 s run,
+        71.8 M blocks, 131,104 shadow fills, 2026-11-25). No Phase 0
+        reference to compare with yet.
 - [ ] Get as far as the root filesystem mount on the reference timeline.
 
 ## Phase 6: device bridges (fake Apple device → Linux)

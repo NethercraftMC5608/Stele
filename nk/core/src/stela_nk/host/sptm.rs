@@ -550,6 +550,38 @@ fn prepare(dir: &str) -> Result<Prepared, String> {
         pread_into(&alloc::format!("{dir}/{file}"), offset, pa, bytes)?;
         loaded += bytes;
     }
+    // The bundle's boot-time patches a bootloader fills (`stela.efi` does so
+    // at boot): here the required entropy fields -- /chosen random-seed and
+    // cl4-entropy, the hibernation CTRR keys -- from RDRAND, at each patch's
+    // place inside its loaded region. The timebase and DRAM size already
+    // hold this machine's values; framebuffer and NVRAM fields stay unset.
+    let mut seeded = 0usize;
+    for patch in bundle.get("patches").and_then(|p| p.as_array()).into_iter().flatten() {
+        if patch.get("source").and_then(|s| s.as_str()) != Some("entropy") {
+            continue;
+        }
+        let field = patch.get("field").and_then(|f| f.as_str()).unwrap_or("?");
+        let name = patch.get("region").and_then(|r| r.as_str()).ok_or("patch without region")?;
+        let bytes = number(patch, &["bytes"]).ok_or("patch without bytes")? as usize;
+        let at = patch
+            .get("file_offset")
+            .and_then(|o| o.as_u64())
+            .ok_or("patch without file_offset")?;
+        let region = regions
+            .iter()
+            .find(|r| r.get("name").and_then(|n| n.as_str()) == Some(name))
+            .ok_or_else(|| alloc::format!("patch {field}: no region {name}"))?;
+        let base = number(region, &["guest_pa"]).ok_or("region without guest_pa")?;
+        let start = number(region, &["file_offset"]).ok_or("region without file_offset")?;
+        let pa = base + (at - start);
+        let mut random = vec![0u8; bytes];
+        super::mount::rdrand_fill(&mut random)
+            .map_err(|e| alloc::format!("patch {field}: {e:?}"))?;
+        unsafe { core::ptr::copy_nonoverlapping(random.as_ptr(), pa as *mut u8, bytes) };
+        seeded += bytes;
+        crate::println!("STELA_SPTM: patched {} ({} random bytes at {:#x})", field, bytes, pa);
+    }
+    let _ = seeded;
     crate::println!(
         "STELA_SPTM: {} regions, {} MiB loaded into guest DRAM at {:#x} ({} MiB backed)",
         regions.len(), loaded >> 20, DRAM, RAM_BYTES >> 20
