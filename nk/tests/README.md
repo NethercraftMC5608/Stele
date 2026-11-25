@@ -673,6 +673,25 @@ its `DEVICES` lines report PMGR power states, the native MCC, the AIC's 1152
 inputs, 7 DARTs and AES. The SSD is an empty sparse disk and the display a
 headless scanout; the bundle needs a machine ECID for the SEP.
 
+### SPTM entered on nk (host port slice 1)
+
+```sh
+NK_STELA_SPTM_TEST=1 NK_SMP=1 NK_AP_LAYER=4 NK_LKL_LIB=$PWD/ldk/build/lkl-x86_64/libnklkl.a \
+  cargo build --release --features stela --target x86_64-unknown-none --target-dir target-stela-sptm
+B=bundle-Mac14,2-26B131-nk; set --
+for f in bundle.json devicetree.adt USB-C_HPM,46-P01-AP.bin boot-manifest.im4m txm.img \
+         trustcache.bin kernelcache.img sptm.img bootargs.bin; do
+  set -- "$@" --add "${B}/${f}:stele/${f}"; done
+python3 tests/run-dedicated-x86.py --kernel target-stela-sptm/x86_64-unknown-none/release/nk \
+  --initrd /path/to/initrd.cpio "$@" --require STELA_SPTM_PASS --output target-stela-sptm-run --timeout 900
+```
+
+nk loads the bundle's regions into guest DRAM mapped at 0x800000000,
+mounts the board over the same frames, and starts PE 0 at EL2, MMU off, at
+SPTM's entry. The host has no shadow tables yet, so the run ends when SPTM
+turns its MMU on, or after 60 s. `STELA_SPTM_PASS` needs more than 100 blocks
+of SPTM run and an end at the MMU or the budget, not a host refusal.
+
 ### Linux timers at their deadlines
 
 ```sh

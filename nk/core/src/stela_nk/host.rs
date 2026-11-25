@@ -13,8 +13,10 @@ mod board;
 mod irq;
 mod mount;
 mod shadow;
+mod sptm;
 pub(crate) use board::{adt_probe, board_probe};
 pub(crate) use mount::mount_probe;
+pub(crate) use sptm::sptm_probe;
 pub(crate) use irq::{irq_probe, kicked};
 
 // The pinned system-mode ABI borrows callee-saved host registers. Keep them

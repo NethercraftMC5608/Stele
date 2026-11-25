@@ -259,6 +259,14 @@ require it to pass; both the rebuilt x86 archive and cached arm64 archive pass.
 - **The SEP needs a machine ECID in the tree.** Prepare bundles with
   `stela-dev boot prepare --ecid $(cat ~/Stele-assets/nk-machine-ecid.txt)`;
   an IPSW tree alone has none.
+- **Guest DRAM lives at its own address.** `paging::GUEST_DRAM_VA`
+  (32 GiB, 1 GiB, directory reserved before processes) holds guest DRAM at
+  the M2's physical addresses; `DramHost` reads and runs it there with the
+  MMU off. Back it frame by frame (contiguous runs are scarce; register one
+  range per physical run) and give it back after a probe. nk has ~420 MiB
+  of frames in QEMU and about 180 MiB free once a 127 MiB bundle initrd is
+  unpacked. The user stack arena is reserved at boot
+  (`user::reserve_stack_arena`): freed frames never rebuild contiguity. In zsh write `${f}:stele/${f}`, not `$f:stele` (`:s` is a modifier).
 - **Apple's files stay out of the repo.** The M2 IPSW and the bundle
   `stela-dev boot prepare` makes from it live in `~/Stele-assets`
   (`bundle-Mac14,2-26B131/devicetree.adt`); tests take them by path

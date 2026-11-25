@@ -450,6 +450,80 @@ pub unsafe fn map_mmio_high(phys: u64, len: u64) -> Option<u64> {
     Some(MMIO_VA_BASE + off + (phys - lo))
 }
 
+/// Guest DRAM for translated ARM64 guests, at the guest's own physical
+/// addresses: the M2's DRAM starts at 32 GiB, which nk's map leaves free
+/// (identity 0-4 GiB, Linux 4-8 GiB, MMIO 12-13 GiB). Native guest code
+/// then reaches guest RAM with the MMU off at the address the guest uses.
+#[cfg(target_arch = "x86_64")]
+pub const GUEST_DRAM_VA: u64 = 0x8_0000_0000;
+#[cfg(target_arch = "x86_64")]
+pub const GUEST_DRAM_SIZE: u64 = 1 << 30;
+
+/// Create the guest DRAM window's directory before any process exists, for
+/// the same reason as `reserve_mmio_window`.
+///
+/// # Safety
+/// The frame allocator is up and no process exists yet.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn reserve_guest_dram_window() {
+    let l0 = table_of(kernel_address_space()) as *mut u64;
+    let va = GUEST_DRAM_VA;
+    let l1 = next_table(l0.add(((va >> L0_SHIFT) & 511) as usize));
+    let l1e = l1.add(((va >> L1_SHIFT) & 511) as usize);
+    assert!(
+        *l1e & pte::VALID == 0 || !pte::is_block(*l1e),
+        "the guest DRAM window overlaps a block mapping at {va:#x}"
+    );
+    next_table(l1e);
+    crate::arch::memory_barrier();
+}
+
+/// Map one owned RAM frame at `va` in the guest DRAM window: write-back,
+/// supervisor-only, never executable (ARM code is data to x86).
+///
+/// # Safety
+/// `reserve_guest_dram_window` has run, `pa` is an owned 4 KiB RAM frame
+/// that stays allocated while mapped, and only one task maps this window.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn map_guest_dram(va: u64, pa: u64) -> bool {
+    if va < GUEST_DRAM_VA || va >= GUEST_DRAM_VA + GUEST_DRAM_SIZE || (va | pa) & 4095 != 0 {
+        return false;
+    }
+    let l0 = table_of(kernel_address_space()) as *mut u64;
+    let l1 = (*l0.add(((va >> L0_SHIFT) & 511) as usize) & ADDR) as *mut u64;
+    let e1 = l1.add(((va >> L1_SHIFT) & 511) as usize);
+    if !is_table(*e1) {
+        return false; // reserve_guest_dram_window has not run
+    }
+    let l2 = (*e1 & ADDR) as *mut u64;
+    let l3 = next_table(l2.add(((va >> L2_SHIFT) & 511) as usize));
+    *l3.add(((va >> L3_SHIFT) & 511) as usize) = pa | pte::VALID | pte::WRITABLE | pte::NX;
+    true
+}
+
+/// Remove the mapping at `va` in the guest DRAM window (the caller flushes
+/// TLBs and frees the frame).
+///
+/// # Safety
+/// No code reaches `va` any more.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn unmap_guest_dram(va: u64) {
+    if va < GUEST_DRAM_VA || va >= GUEST_DRAM_VA + GUEST_DRAM_SIZE {
+        return;
+    }
+    let l0 = table_of(kernel_address_space()) as *mut u64;
+    let l1 = (*l0.add(((va >> L0_SHIFT) & 511) as usize) & ADDR) as *mut u64;
+    let e1 = *l1.add(((va >> L1_SHIFT) & 511) as usize);
+    if !is_table(e1) {
+        return;
+    }
+    let e2 = *((e1 & ADDR) as *mut u64).add(((va >> L2_SHIFT) & 511) as usize);
+    if !is_table(e2) {
+        return;
+    }
+    *((e2 & ADDR) as *mut u64).add(((va >> L3_SHIFT) & 511) as usize) = 0;
+}
+
 /// Map physical pages into Linux's window.
 ///
 /// EL1 only: this is Linux's memory, not a process's, and a process that

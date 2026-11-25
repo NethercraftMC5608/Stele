@@ -16,7 +16,7 @@ path = "src/main.rs"
 # default: `--features stela` builds nk with it and runs trusted translated
 # ARM64 execution checks at x86 boot, before SMP and LKL startup.
 [features]
-stela = ["dep:stela-compiler", "dep:stela-engine", "dep:stela-contracts", "dep:stela-crypto", "dep:stela-soc", "dep:stela-soc-data", "dep:stela-runtime", "dep:stela-formats", "dep:stela-driver-base"]
+stela = ["dep:stela-compiler", "dep:stela-engine", "dep:stela-contracts", "dep:stela-crypto", "dep:stela-soc", "dep:stela-soc-data", "dep:stela-runtime", "dep:stela-formats", "dep:stela-driver-base", "dep:serde_json"]
 
 [dependencies]
 stela-compiler = { path = "../../crates/stela-compiler", default-features = false, optional = true }
@@ -29,6 +29,8 @@ stela-runtime = { path = "../../crates/stela-runtime", default-features = false,
 stela-formats = { path = "../../crates/stela-formats", default-features = false, optional = true }
 # The block device trait behind the mounted ANS2's sparse disk.
 stela-driver-base = { path = "../../crates/stela-driver-base", optional = true }
+# bundle.json, the region layout `stela-dev boot prepare` writes.
+serde_json = { version = "1", default-features = false, features = ["alloc"], optional = true }
 # test-support: the M2-shaped DeviceTree fixture the board probe mounts
 # until a real ADT is read from disk.
 stela-soc-data = { path = "../../crates/stela-soc-data", default-features = false, features = ["test-support"], optional = true }

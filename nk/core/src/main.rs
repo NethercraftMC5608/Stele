@@ -314,7 +314,9 @@ pub extern "C" fn rust_main(magic: u64, info: u64) -> ! {
     unsafe {
         paging::reserve_linux_window();
         #[cfg(target_arch = "x86_64")]
-        paging::reserve_mmio_window()
+        paging::reserve_mmio_window();
+        #[cfg(all(target_arch = "x86_64", feature = "stela"))]
+        paging::reserve_guest_dram_window();
     };
 
     sched::init();
@@ -526,6 +528,11 @@ pub extern "C" fn rust_main(magic: u64, info: u64) -> ! {
                     Err(e) => println!("  initrd: {} -- ignored", e),
                 }
             }
+            // Init's user stack arena before any probe takes large runs of
+            // contiguous frames (see `user::reserve_stack_arena`).
+            if !user::reserve_stack_arena() {
+                println!("  ring3:  no memory for the user stack arena");
+            }
             // A real ADT (a `stela boot prepare` bundle's devicetree.adt)
             // read from Linux's filesystem, and the board mounted from it.
             #[cfg(feature = "stela")]
@@ -536,6 +543,12 @@ pub extern "C" fn rust_main(magic: u64, info: u64) -> ! {
             #[cfg(feature = "stela")]
             if option_env!("NK_STELA_MOUNT_TEST").is_some() {
                 stela_nk::mount_probe("/stele");
+            }
+            // macOS 27's first instructions: the bundle loaded and SPTM
+            // entered on the mounted board (MMU off).
+            #[cfg(feature = "stela")]
+            if option_env!("NK_STELA_SPTM_TEST").is_some() {
+                stela_nk::sptm_probe("/stele");
             }
 
             // Ring 3.
@@ -670,7 +683,9 @@ pub extern "C" fn rust_main(dtb: *const u8) -> ! {
     unsafe {
         paging::reserve_linux_window();
         #[cfg(target_arch = "x86_64")]
-        paging::reserve_mmio_window()
+        paging::reserve_mmio_window();
+        #[cfg(all(target_arch = "x86_64", feature = "stela"))]
+        paging::reserve_guest_dram_window();
     };
 
     sched::init();

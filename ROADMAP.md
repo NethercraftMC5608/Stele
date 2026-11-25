@@ -362,6 +362,26 @@ What Stela's runtime needs from the kernel underneath it.
         and nk's frame allocator had no lock after SMP; both fixed.
 - [ ] `stela-loader`: load the boot bundle and kernelcache that `stela-cli`
       prepares for macOS 27 from a disk LKL reads.
+  - [x] Slice 1 of the host port: SPTM entered on nk, MMU off
+        (`core/src/stela_nk/host/sptm.rs`). CPU 0 reads `bundle.json` and
+        the 20 regions (122 MiB) through LKL into guest DRAM: nk frames, one
+        per page, mapped at the guest's own addresses in a new 1 GiB window
+        at 32 GiB (`paging::GUEST_DRAM_VA`), and registered (332 physical
+        runs) as the canonical RAM the mounted board's memory owners check,
+        with CTRR-A over the read-only run. On CPU 3 `DramHost` (4 MiB code
+        arena) runs PE 0 from EL2 at SPTM's entry 0x80777c388, x0
+        0x809ff8000. SPTM turned its MMU on after 61 native runs (SCTLR
+        0x100000101d) and reached PC 0xfffffe001577d200 within 2000 blocks.
+        Guest DRAM is given back afterwards and the boot reaches init, 3/3
+        runs (`NK_STELA_SPTM_TEST`, 2026-11-25). The bundle comes in the
+        initrd (~127 MiB), and nk backs 168 MiB of DRAM: about all its 2 GiB
+        identity map leaves in QEMU. Init's user stack arena is now reserved
+        at boot, because it needs contiguous frames a probe could use up.
+  - [ ] Slice 2: shadow page tables after SMP, so SPTM's MMU-on code runs
+        natively instead of faulting into the engine (1675 of 1840 native
+        runs faulted after the MMU came on).
+  - [ ] Slice 3: native fault recovery and MMIO with the MMU on, to TXM and
+        XNU. Slice 4: all 8 PEs on dedicated cores.
 - [ ] Hand off to the macOS 27 kernel. Done when: XNU's first serial output
       matches the Phase 0 reference.
 - [ ] Get as far as the root filesystem mount on the reference timeline.

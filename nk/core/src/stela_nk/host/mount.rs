@@ -29,16 +29,16 @@ const DRAM: u64 = 0x8_0000_0000;
 const RAM_BYTES: u64 = 2 << 20;
 /// The sparse disk behind the ANS2: 256 GiB of 4 KiB blocks, like the
 /// smallest MacBook Air M2 SSD.
-const SSD_BLOCKS: u64 = 256 << 18;
+pub(super) const SSD_BLOCKS: u64 = 256 << 18;
 
 /// An internal SSD that stores only the blocks written; the rest read as
 /// zeros. The stand-in until a disk Linux drives backs the ANS2.
-struct SparseDisk {
+pub(super) struct SparseDisk {
     identity: stela_driver_base::block::Identity,
     blocks: alloc::collections::BTreeMap<u64, Box<[u8; 4096]>>,
 }
 impl SparseDisk {
-    fn new(blocks: u64) -> Self {
+    pub(super) fn new(blocks: u64) -> Self {
         use stela_driver_base::block::{Features, Identity, Transport};
         Self {
             identity: Identity {
@@ -155,7 +155,7 @@ pub(crate) fn mount_probe(dir: &str) -> bool {
 }
 
 /// Hardware entropy for the SEP model: RDRAND when the CPU has it.
-fn rdrand_fill(bytes: &mut [u8]) -> stela_soc::Result<()> {
+pub(super) fn rdrand_fill(bytes: &mut [u8]) -> stela_soc::Result<()> {
     let ecx: u32;
     unsafe {
         core::arch::asm!("mov {t}, rbx", "cpuid", "xchg {t}, rbx", t = out(reg) _,

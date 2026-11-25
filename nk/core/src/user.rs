@@ -200,6 +200,22 @@ const USER_STACK_ARENA_PAGES: usize = 8192;      // 32 MiB, 128 stacks
 static mut USER_STACK_ARENA: usize = 0;
 static mut USER_STACK_ARENA_NEXT: usize = 0;
 
+/// Take the user stack arena now. It is physically contiguous, so it comes
+/// from the frame allocator's never-used run, which a large early allocation
+/// (a guest's DRAM) can exhaust; freed frames return to the single-frame list
+/// and cannot rebuild it. Call before such allocations.
+pub fn reserve_stack_arena() -> bool {
+    unsafe {
+        if USER_STACK_ARENA == 0 {
+            match frames::alloc_contiguous(USER_STACK_ARENA_PAGES) {
+                Some(arena) => USER_STACK_ARENA = arena as usize,
+                None => return false,
+            }
+        }
+    }
+    true
+}
+
 fn alloc_user_stack() -> Option<*mut u8> {
     unsafe {
         if USER_STACK_ARENA == 0 {
