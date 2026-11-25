@@ -699,6 +699,17 @@ SPTM's entry. The host has no shadow tables yet, so the run ends when SPTM
 turns its MMU on, or after 60 s. `STELA_SPTM_PASS` needs more than 100 blocks
 of SPTM run and an end at the MMU or the budget, not a host refusal.
 
+### Watching XNU boot live
+
+```sh
+tests/xnu-live.sh [BUNDLE] [SECONDS]
+```
+
+Builds the SPTM probe with a long guest run (default 3600 s), boots it under
+`--cpu max --memory 6G`, and streams the guest's console as XNU prints it,
+with nk's progress lines (blocks, PC) in grey every 10 s. The default bundle
+is `~/Stele-assets/bundle-Mac14,2-26B131-nk2g-np` (2 GiB, `-noprogress`).
+
 ### SA_RESTART
 
 ```sh
